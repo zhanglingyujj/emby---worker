@@ -1,6 +1,7 @@
 name = "emby-worker-proxy"
 main = "worker.js"
 compatibility_date = "2026-03-06"
+keep_vars = true
 
 [[d1_databases]]
 binding = "EMBY_D1"
