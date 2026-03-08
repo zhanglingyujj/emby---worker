@@ -5,4 +5,4 @@ compatibility_date = "2026-03-06"
 [[d1_databases]]
 binding = "EMBY_D1"
 database_name = "emby-proxy"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "76e45249-6dec-4af8-afc6-345a699474f6"
