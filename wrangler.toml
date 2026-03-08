@@ -1,4 +1,4 @@
-name = "emby-worker"
+name = "emby-worker-proxy"
 main = "worker.js"
 compatibility_date = "2026-03-06"
 
