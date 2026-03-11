@@ -229,7 +229,7 @@ const Auth = {
   check(request, env) {
     const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     const now = Date.now();
-    const win = 10 * 60 * 1000; // 10分钟
+    const win = 10 * 60 * 1000; // 10鍒嗛挓
     const maxFail = 20;
     let rec = GLOBALS.AuthFail.get(ip);
     if (!rec || now - rec.ts > win) rec = { n: 0, ts: now };
@@ -272,121 +272,65 @@ const Validators = {
       .toLowerCase();
   },
   validateName(v) {
-    const name = this.normaliz      const slice = hasMore ? arr.slice(0, lim) : arr;
-
-      return {
-        keys: slice.map((r) => ({ name: r.k })),
-        list_complete: !hasMore,
-        cursor: hasMore ? String(off + lim) : undefined,
-      };
-    },
-  };
-}
-function safeEqual(a, b) {
-  a = String(a || "");
-  b = String(b || "");
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-const Auth = {
-  extractToken(request) {
-    const auth = request.headers.get("Authorization") || "";
-    if (/^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim();
-    const x = request.headers.get("X-Admin-Token");
-    return String(x || "").trim();
-  },
-
-  unauthorized() {
-    return {
-      ok: false,
-      uid: "",
-      role: "",
-      response: new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json;charset=utf-8" },
-      }),
-    };
-  },
-
-  check(request, env) {
-    const got = this.extractToken(request);
-    if (!got) return this.unauthorized();
-
-    const admin = String(env.ADMIN_TOKEN || "").trim();
-    if (admin && safeEqual(got, admin)) {
-      return { ok: true, uid: "admin", role: "admin", response: null };
-    }
-
-    return this.unauthorized();
-  },
-};
-
-const Validators = {
-  NAME_RE: /^[a-z0-9_-]{1,32}$/i,
-  SECRET_RE: /^[^\/?#\s]{0,128}$/,
-
-  normalizeName(v) {
-    return String(v || "")
-      .trim()
-      .toLowerCase();
-  },
-
-  validateName(v) {
     const name = this.normalizeName(v);
     if (!this.NAME_RE.test(name)) {
       return {
         ok: false,
-        error: "name 非法：仅允许 a-z / 0-9 / _ / -，长度 1~32",
+        error: "name 闈炴硶锛氫粎鍏佽 a-z / 0-9 / _ / -锛岄暱搴� 1~32",
       };
     }
     return { ok: true, value: name };
   },
-
+  splitTargets(v) {
+    return String(v || "")
+      .split(/\r?\n|[;,锛岋紱|]+/g)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  },
   validateTarget(v) {
-    const target = String(v || "").trim();
-    if (!target) return { ok: false, error: "target 不能为空" };
-    if (target.length > 2048) return { ok: false, error: "target 过长" };
-    try {
-      const u = new URL(target);
-      if (!/^https?:$/i.test(u.protocol))
-        return { ok: false, error: "target 只允许 http/https" };
-
-      // 不用 u.toString()，否则默认端口会被自动去掉（:80/:443）
-      const value = target.replace(/\/+$/, ""); // 仅去掉末尾 /
-      return { ok: true, value };
-    } catch {
-      return { ok: false, error: "target 不是合法 URL" };
+    const arr = this.splitTargets(v);
+    if (!arr.length) return { ok: false, error: "target 涓嶈兘涓虹┖" };
+    if (arr.length > 20)
+      return { ok: false, error: "target 鏁伴噺杩囧锛堟渶澶�20锛�" };
+    const out = [];
+    for (const t of arr) {
+      if (t.length > 2048) return { ok: false, error: "target 杩囬暱" };
+      try {
+        const u = new URL(t);
+        if (!/^https?:$/i.test(u.protocol)) {
+          return { ok: false, error: "target 鍙厑璁� http/https" };
+        }
+        out.push(t.replace(/\/+$/, ""));
+      } catch {
+        return { ok: false, error: "target 涓嶆槸鍚堟硶 URL锛�" + t };
+      }
     }
+    return { ok: true, value: [...new Set(out)].join("\n") };
   },
   validateMode(v) {
     const m = String(v || "")
       .trim()
       .toLowerCase();
-    // 兼容老入参，但统一落为 split（反代）
     if (m && m !== "normal" && m !== "split") {
-      return { ok: false, error: "mode 仅支持 normal/split" };
+      return { ok: false, error: "mode 浠呮敮鎸� normal/split" };
     }
-    return { ok: true, value: "split" };
+    return { ok: true, value: m || "split" };
   },
   validateSecret(v) {
     const secret = String(v || "").trim();
     if (!this.SECRET_RE.test(secret)) {
       return {
         ok: false,
-        error: "secret 非法：不能包含 / ? # 或空白字符，最长128",
+        error: "secret 闈炴硶锛氫笉鑳藉寘鍚� / ? # 鎴栫┖鐧藉瓧绗︼紝鏈€闀�128",
       };
     }
     return { ok: true, value: secret };
   },
-
   validateTag(v) {
     let tag = String(v || "").trim();
     if (tag.length > 64) tag = tag.slice(0, 64);
     return { ok: true, value: tag };
   },
-
   validateNote(v) {
     let note = String(v || "").trim();
     if (note.length > 64) note = note.slice(0, 64);
@@ -401,28 +345,24 @@ const Validators = {
   },
   validateNodeInput(n) {
     if (!n || typeof n !== "object" || Array.isArray(n)) {
-      return { ok: false, error: "节点项不是对象" };
+      return { ok: false, error: "鑺傜偣椤逛笉鏄璞�" };
     }
-
     const rn = this.validateName(n.name);
     if (!rn.ok) return { ok: false, error: rn.error };
-
     const rt = this.validateTarget(n.target);
     if (!rt.ok) return { ok: false, error: rt.error };
-
     const rm = this.validateMode(n.mode);
     if (!rm.ok) return { ok: false, error: rm.error };
-
-    // 统一禁用推流地址：split 也不使用 streamTarget
-    const streamTarget = "";
-
+    const streamTarget = String(n.streamTarget || "").trim();
     const rs = this.validateSecret(n.secret || "");
     if (!rs.ok) return { ok: false, error: rs.error };
-
     const rg = this.validateTag(n.tag || "");
     const rn2 = this.validateNote(n.note || "");
     const rd = this.validateDisplayName(n.displayName || "");
-
+    let embyUser = String(n.embyUser || "").trim();
+    let embyPass = String(n.embyPass || "").trim();
+    if (embyUser.length > 128) embyUser = embyUser.slice(0, 128);
+    if (embyPass.length > 256) embyPass = embyPass.slice(0, 256);
     return {
       ok: true,
       value: {
@@ -436,28 +376,27 @@ const Validators = {
         secret: rs.value,
         tag: rg.value,
         note: rn2.value,
+        embyUser,
+        embyPass,
+        directExternal: !!n.directExternal,
       },
     };
   },
 };
-
 const Database = {
   PREFIX: "node:",
-  // 标准前缀方法
   nodePrefix(uid = "admin") {
     uid = String(uid || "admin")
       .trim()
       .toLowerCase();
-    return "u:" + uid + ":" + this.PREFIX; // u:admin:node:
+    return "u:" + uid + ":" + this.PREFIX;
   },
-  // 兼容旧调用
   userPrefix(uid = "admin") {
     return this.nodePrefix(uid);
   },
   nodeKey(uid, name) {
     return this.nodePrefix(uid) + String(name || "").toLowerCase();
   },
-  // 关键：你缺的就是这个
   memKey(uid, name) {
     return (
       String(uid || "admin").toLowerCase() +
@@ -481,30 +420,32 @@ const Database = {
   },
   packNode(n) {
     const o = { t: String(n?.target || "").trim() };
-    if (n?.mode && n.mode !== "normal") o.m = String(n.mode);
+    if (n?.mode) o.m = String(n.mode);
+    if (n?.streamTarget) o.st = String(n.streamTarget).trim();
     if (n?.fav) o.f = 1;
     if (Number.isFinite(Number(n?.rank))) o.r = Number(n.rank);
     if (n?.secret) o.s = String(n.secret);
     if (n?.tag) o.g = String(n.tag);
     if (n?.note) o.n = String(n.note);
-    if (n?.displayName) o.d = String(n.displayName); // 新增
+    if (n?.displayName) o.d = String(n.displayName);
+    if (n?.embyUser) o.eu = String(n.embyUser);
+    if (n?.embyPass) o.ep = String(n.embyPass);
+    if (n?.directExternal) o.de = 1;
     return JSON.stringify(o);
   },
-
   unpackNode(name, raw) {
     if (!raw || typeof raw !== "object") return null;
-
     const target = String(raw.t ?? raw.target ?? "").trim();
     if (!target) return null;
-
-    // 历史数据统一按反代模式运行
-    const mode = "split";
-    const streamTarget = "";
+    const rm = Validators.validateMode(raw.m ?? raw.mode ?? "");
+    if (!rm.ok) return null;
+    const mode = rm.value;
+    const streamTarget = String(raw.st ?? raw.streamTarget ?? "").trim();
     return {
       name: String(name || "")
         .trim()
         .toLowerCase(),
-      displayName: String(raw.d ?? raw.displayName ?? ""), // 新增（兼容旧格式）
+      displayName: String(raw.d ?? raw.displayName ?? ""),
       target,
       mode,
       streamTarget,
@@ -515,20 +456,20 @@ const Database = {
       secret: String(raw.s ?? raw.secret ?? ""),
       tag: String(raw.g ?? raw.tag ?? ""),
       note: String(raw.n ?? raw.note ?? ""),
+      embyUser: String(raw.eu ?? raw.embyUser ?? ""),
+      embyPass: String(raw.ep ?? raw.embyPass ?? ""),
+      directExternal: !!(raw.de ?? raw.directExternal ?? false),
     };
   },
   async getNode(nodeName, env, ctx, uid = "admin") {
     nodeName = String(nodeName || "").toLowerCase();
     uid = String(uid || "admin").toLowerCase();
-
     const kv = this.getKV(env);
     if (!kv) return null;
-
     const now = Date.now();
     const mk = this.memKey(uid, nodeName);
     const mem = GLOBALS.NodeCache.get(mk);
     if (mem && mem.exp > now) return mem.data;
-
     const cache = caches.default;
     const cacheUrl = new URL(this.cacheUrl(uid, nodeName));
     const cached = await cache.match(cacheUrl);
@@ -537,7 +478,6 @@ const Database = {
       GLOBALS.NodeCache.set(mk, { data, exp: now + Config.Defaults.CacheTTL });
       return data;
     }
-
     const raw = await kv.get(this.nodeKey(uid, nodeName), { type: "json" });
     const nodeData = this.unpackNode(nodeName, raw);
     if (nodeData) {
@@ -549,13 +489,11 @@ const Database = {
           },
         }),
       );
-
       if (ctx && typeof ctx.waitUntil === "function") {
         ctx.waitUntil(putPromise);
       } else {
         putPromise.catch(() => {});
       }
-
       GLOBALS.NodeCache.set(mk, {
         data: nodeData,
         exp: now + Config.Defaults.CacheTTL,
@@ -564,50 +502,40 @@ const Database = {
     }
     return null;
   },
-  async listAllNodes(env, uid = "admin") {
+  async listAllNodes(env, uid = "admin", ttlOverride) {
     uid = String(uid || "admin").toLowerCase();
-
     const kv = this.getKV(env);
     if (!kv) return [];
-
     const key = this.listCacheKey(uid);
     const now = Date.now();
-    const ttl = Number(Config?.Defaults?.ListCacheTTL || 15000);
-
-    // 1) 命中列表缓存
+    const ttl =
+      typeof ttlOverride === "number"
+        ? Math.max(0, ttlOverride)
+        : Number(Config?.Defaults?.ListCacheTTL || 15000);
     const hit = GLOBALS.NodeListCache.get(key);
     if (hit && hit.exp > now) return hit.data;
-
-    // 2) 并发去重
     const inflight = GLOBALS.NodeListInflight.get(key);
     if (inflight) {
-      if (hit?.data) return hit.data; // 有旧值就直接先返回
+      if (hit?.data) return hit.data;
       return await inflight;
     }
-
     const task = (async () => {
       const prefix = this.nodePrefix(uid);
       let cursor = undefined;
       const allKeys = [];
       do {
-        const list = await kv.list(
-          /** @type {any} */ ({ prefix, cursor, limit: 1000 }),
-        );
+        const list = await kv.list({ prefix, cursor, limit: 1000 });
         if (Array.isArray(list?.keys)) allKeys.push(...list.keys);
         cursor = list?.list_complete ? undefined : list?.cursor;
       } while (cursor);
-
       const now2 = Date.now();
-
       const nodes = await Promise.all(
         allKeys.map(async (k) => {
           const name = String(k?.name || "").replace(prefix, "");
           if (!name) return null;
-
           const mk = this.memKey(uid, name);
           const mem = GLOBALS.NodeCache.get(mk);
           let v = mem && mem.exp > now2 ? mem.data : null;
-
           if (!v) {
             const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
             v = this.unpackNode(name, raw);
@@ -617,22 +545,17 @@ const Database = {
                 exp: now2 + Config.Defaults.CacheTTL,
               });
           }
-
           return v;
         }),
       );
-
       const out = nodes.filter(Boolean);
       out.sort((a, b) => {
-        // 用你真实字段 fav；并避免布尔值做减法
         const af = !!a?.fav;
         const bf = !!b?.fav;
-        if (af !== bf) return af ? -1 : 1; // 收藏优先（af=true 排前）
-
+        if (af !== bf) return af ? -1 : 1;
         const ar = Number.isFinite(Number(a?.rank)) ? Number(a.rank) : 1e9;
         const br = Number.isFinite(Number(b?.rank)) ? Number(b.rank) : 1e9;
-        if (ar !== br) return ar - br; // rank 小的在前
-
+        if (ar !== br) return ar - br;
         return String(a?.name || "").localeCompare(
           String(b?.name || ""),
           "zh-Hans-CN",
@@ -644,19 +567,14 @@ const Database = {
     })().finally(() => {
       GLOBALS.NodeListInflight.delete(key);
     });
-
     GLOBALS.NodeListInflight.set(key, task);
-
-    // 有旧值先回旧值，后台刷新
     if (hit?.data) return hit.data;
-
     return await task;
   },
   async checkOne(target, timeoutMs = 4500) {
     const start = Date.now();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-
     try {
       const r = await fetch(String(target || ""), {
         method: "GET",
@@ -664,11 +582,9 @@ const Database = {
         signal: ctrl.signal,
         headers: { "User-Agent": "cf-emby-proxy-check/1.0" },
       });
-
       const rt = Date.now() - start;
       clearTimeout(timer);
-
-      const ok = r.status >= 200 && r.status < 500; // 4xx 也算可达
+      const ok = r.status >= 200 && r.status < 500;
       return {
         ok,
         online: ok,
@@ -691,7 +607,6 @@ const Database = {
       };
     }
   },
-
   async handleApi(request, env) {
     const auth = Auth.check(request, env);
     if (!auth.ok) return auth.response;
@@ -699,14 +614,13 @@ const Database = {
     const kv = this.getKV(env);
     if (!kv) {
       return new Response(
-        JSON.stringify({ error: "D1未绑定! 请检查 EMBY_D1 / D1 / DB" }),
+        JSON.stringify({ error: "D1鏈粦瀹�! 璇锋鏌� EMBY_D1 / D1 / DB" }),
         {
           status: 500,
           headers: { "Content-Type": "application/json;charset=utf-8" },
         },
       );
     }
-
     let data = {};
     try {
       data = await request.json();
@@ -716,7 +630,6 @@ const Database = {
         headers: { "Content-Type": "application/json;charset=utf-8" },
       });
     }
-
     const cache = caches.default;
     const invalidate = async (name) => {
       GLOBALS.NodeCache.delete(this.memKey(uid, name));
@@ -725,12 +638,11 @@ const Database = {
       const lk = this.listCacheKey(uid);
       GLOBALS.NodeListCache.delete(lk);
       GLOBALS.NodeListInflight.delete(lk);
-
       await cache.delete(this.cacheUrl(uid, name));
     };
     switch (data.action) {
       case "list": {
-        const nodes = await this.listAllNodes(env, uid);
+        const nodes = await this.listAllNodes(env, uid, 0);
         return new Response(JSON.stringify({ nodes, uid }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -747,16 +659,14 @@ const Database = {
         const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
         const node = this.unpackNode(name, raw);
         if (!node) {
-          return new Response(JSON.stringify({ error: "节点不存在" }), {
+          return new Response(JSON.stringify({ error: "鑺傜偣涓嶅瓨鍦�" }), {
             status: 404,
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
         }
-
         node.fav = !node.fav;
         await kv.put(this.nodeKey(uid, name), this.packNode(node));
         await invalidate(name);
-
         return new Response(
           JSON.stringify({ success: true, name, fav: node.fav }),
           {
@@ -764,7 +674,6 @@ const Database = {
           },
         );
       }
-
       case "saveOrder": {
         const names = Array.isArray(data.names) ? data.names : [];
         if (!names.length) {
@@ -772,94 +681,75 @@ const Database = {
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
         }
-
         let saved = 0;
         for (let i = 0; i < names.length; i++) {
           const vn = Validators.validateName(names[i]);
           if (!vn.ok) continue;
-
           const name = vn.value;
           const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
           const node = this.unpackNode(name, raw);
           if (!node) continue;
-
           node.rank = i + 1;
           await kv.put(this.nodeKey(uid, name), this.packNode(node));
           await invalidate(name);
           saved++;
         }
-
         return new Response(JSON.stringify({ success: true, saved }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
       }
-
       case "save":
       case "import": {
         const items = data.action === "save" ? [data] : data.nodes;
         if (!Array.isArray(items)) {
-          return new Response(JSON.stringify({ error: "nodes 必须为数组" }), {
+          return new Response(JSON.stringify({ error: "nodes 蹇呴』涓烘暟缁�" }), {
             status: 400,
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
         }
-
         let saved = 0;
         const errors = [];
-
         for (const raw of items) {
           const v = Validators.validateNodeInput(raw);
           if (!v.ok) {
             errors.push({ name: raw?.name || "", error: v.error });
             continue;
           }
-
-          /** @type {{name:string,displayName?:string,target:string,mode?:string,streamTarget?:string,fav?:boolean,rank?:number,secret:string,tag:string,note:string}} */
           const n = v.value;
-
           const oldNameRaw = String(raw?.oldName || "")
             .trim()
             .toLowerCase();
           const oldName = Validators.NAME_RE.test(oldNameRaw) ? oldNameRaw : "";
           const newKey = this.nodeKey(uid, n.name);
-
           if (data.action === "save") {
             const exists = await kv.get(newKey);
             if (!oldName && exists) {
               errors.push({
                 name: n.name,
-                error: "请求路径重复：该节点已存在",
+                error: "璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦�",
               });
               continue;
             }
             if (oldName && oldName !== n.name && exists) {
               errors.push({
                 name: n.name,
-                error: "请求路径重复：该节点已存在",
+                error: "璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦�",
               });
               continue;
             }
           }
-
-          // 关键：编辑时若未传 rank，继承旧 rank，避免编辑后跑到最后
           let toSave = n;
-
           if (data.action === "save") {
             const prevName = oldName || n.name;
             const prevRaw = await kv.get(this.nodeKey(uid, prevName), {
               type: "json",
             });
             const prevNode = this.unpackNode(prevName, prevRaw);
-
             const hasFavInPayload =
               raw && Object.prototype.hasOwnProperty.call(raw, "fav");
             const hasRankInPayload =
               raw && Object.prototype.hasOwnProperty.call(raw, "rank");
-
-            // fav：如果前端没传，就继承旧值
             const keepFav = hasFavInPayload ? !!n.fav : !!prevNode?.fav;
-
-            // rank：如果前端没传，就继承旧值
             let keepRank;
             if (hasRankInPayload) {
               keepRank = Number.isFinite(Number(n.rank))
@@ -870,19 +760,16 @@ const Database = {
                 ? Number(prevNode.rank)
                 : undefined;
             }
-
             toSave = { ...n, fav: keepFav, rank: keepRank };
           }
           await kv.put(newKey, this.packNode(toSave));
           await invalidate(n.name);
-
           if (data.action === "save" && oldName && oldName !== n.name) {
             await kv.delete(this.nodeKey(uid, oldName));
             await invalidate(oldName);
           }
           saved++;
         }
-
         return new Response(
           JSON.stringify({
             success: true,
@@ -895,7 +782,6 @@ const Database = {
           },
         );
       }
-
       case "delete": {
         const vn = Validators.validateName(data.name);
         if (!vn.ok) {
@@ -911,7 +797,6 @@ const Database = {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
       }
-
       case "batchDelete": {
         const names = Array.isArray(data.names) ? data.names : [];
         let count = 0;
@@ -927,12 +812,10 @@ const Database = {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
       }
-
       case "batchTag": {
         const names = Array.isArray(data.names) ? data.names : [];
         const tag = Validators.validateTag(data.tag || "").value;
         let count = 0;
-
         for (const n of names) {
           const vn = Validators.validateName(n);
           if (!vn.ok) continue;
@@ -947,7 +830,6 @@ const Database = {
             count++;
           }
         }
-
         return new Response(JSON.stringify({ success: true, count }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -957,9 +839,7 @@ const Database = {
         const limit = Math.max(1, Math.min(1000, Number(data.limit) || 500));
         const cursor = data.cursor ? String(data.cursor) : undefined;
         const dryRun = !!data.dryRun;
-        const list = await kv.list(
-          /** @type {any} */ ({ prefix, cursor, limit }),
-        );
+        const list = await kv.list({ prefix, cursor, limit });
         let scanned = 0,
           rewritten = 0,
           skipped = 0,
@@ -967,14 +847,12 @@ const Database = {
         for (const k of list.keys || []) {
           scanned++;
           const name = k.name.slice(prefix.length);
-
           const raw = await kv.get(k.name, { type: "json" });
           const node = this.unpackNode(name, raw);
           if (!node) {
             invalid++;
             continue;
           }
-
           const isOldFormat =
             raw &&
             typeof raw === "object" &&
@@ -982,19 +860,16 @@ const Database = {
               "secret" in raw ||
               "tag" in raw ||
               "note" in raw);
-
           if (!isOldFormat) {
             skipped++;
             continue;
           }
-
           if (!dryRun) {
             await kv.put(k.name, this.packNode(node));
             await invalidate(name);
           }
           rewritten++;
         }
-
         const done = !!list.list_complete;
         return new Response(
           JSON.stringify({
@@ -1012,37 +887,29 @@ const Database = {
           },
         );
       }
-
       case "checkStatus": {
         try {
           let target = [];
-
           if (Array.isArray(data.names) && data.names.length > 0) {
             const names = data.names
               .map((x) => Validators.validateName(x))
               .filter((x) => x.ok)
               .map((x) => x.value);
-
             const uniq = [...new Set(names)];
             const got = await Promise.all(
               uniq.map((n) => this.getNode(n, env, null, uid)),
             );
             target = got.filter(Boolean);
           } else {
-            // 只有“检测全部”才全量 list
             target = await this.listAllNodes(env, uid);
           }
-
           const results = [];
-          const origin = new URL(request.url).origin;
           const concurrency = 6;
           let idx = 0;
-
           const worker = async () => {
             while (idx < target.length) {
               const i = idx++;
               const n = target[i];
-
               if (!n || !n.name) {
                 results.push({
                   name: n?.name || "",
@@ -1055,13 +922,21 @@ const Database = {
                 });
                 continue;
               }
-
-              const nodeNameEnc = encodeURIComponent(String(n.name || ""));
-              const secretEnc = String(n.secret || "").trim()
-                ? "/" + encodeURIComponent(String(n.secret || "").trim())
-                : "";
-              const proxyPath = `/${nodeNameEnc}${secretEnc}/`;
-              const urlToCheck = origin + proxyPath; // 改为检测代理地址
+              const targets = Validators.splitTargets(String(n.target || ""));
+              const urlToCheck = String(targets[0] || "").trim();
+              if (!urlToCheck) {
+                results.push({
+                  name: n.name || "",
+                  ok: false,
+                  online: false,
+                  status: 0,
+                  rt: 0,
+                  latency: 0,
+                  checked: "",
+                  error: "NO_TARGET",
+                });
+                continue;
+              }
               const r = await this.checkOne(urlToCheck, 4500);
               results.push({
                 name: n.name || "",
@@ -1075,14 +950,12 @@ const Database = {
               });
             }
           };
-
           await Promise.all(
             Array.from(
               { length: Math.min(concurrency, Math.max(1, target.length)) },
               () => worker(),
             ),
           );
-
           return new Response(JSON.stringify({ success: true, results }), {
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
@@ -1094,7 +967,7 @@ const Database = {
               error: "CHECK_STATUS_FAIL: " + (e?.message || String(e)),
             }),
             {
-              status: 200, // 改这里
+              status: 200,
               headers: { "Content-Type": "application/json;charset=utf-8" },
             },
           );
@@ -1104,43 +977,38 @@ const Database = {
         return new Response("Invalid Action", { status: 400 });
     }
   },
-
   getHostIndexTTL() {
-    return 6 * 60 * 60 * 1000; // 6小时（节点几乎不变场景）
+    return 6 * 60 * 60 * 1000;
   },
-
   async rebuildHostIndex(env, uid = "admin") {
     uid = String(uid || "admin").toLowerCase();
-
     const nodes = await this.listAllNodes(env, uid);
     const hostMap = new Map();
-
     for (const n of nodes) {
-      if (!n || !n.target) continue;
-      try {
-        const h = new URL(n.target).host.toLowerCase();
-        if (!hostMap.has(h))
-          hostMap.set(h, { uid, name: n.name, secret: n.secret || "" });
-      } catch {}
+      const targets = String(n?.target || "")
+        .split(/\r?\n|[;,锛岋紱|]+/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const t of targets) {
+        try {
+          const h = new URL(t).host.toLowerCase();
+          if (!hostMap.has(h)) {
+            hostMap.set(h, { uid, name: n.name, secret: n.secret || "" });
+          }
+        } catch {}
+      }
     }
-
     GLOBALS.NodeHostIndexCache.set(uid, {
       hostMap,
       exp: Date.now() + this.getHostIndexTTL(),
     });
-
     return hostMap;
   },
-
   async getHostIndex(env, uid = "admin") {
     uid = String(uid || "admin").toLowerCase();
     const now = Date.now();
     const hit = GLOBALS.NodeHostIndexCache.get(uid);
-
-    // 1) 未过期直接返回
     if (hit && hit.exp > now) return hit.hostMap;
-
-    // 2) 过期但有旧数据：先返回旧数据，同时后台刷新
     if (hit && hit.hostMap) {
       if (!GLOBALS.NodeHostIndexInflight.has(uid)) {
         const p = this.rebuildHostIndex(env, uid).finally(() => {
@@ -1150,8 +1018,6 @@ const Database = {
       }
       return hit.hostMap;
     }
-
-    // 3) 没缓存：并发去重，避免同时 list
     let p = GLOBALS.NodeHostIndexInflight.get(uid);
     if (!p) {
       p = this.rebuildHostIndex(env, uid).finally(() => {
@@ -1162,15 +1028,20 @@ const Database = {
     return await p;
   },
 };
-
 const ProxyHandler = {
+  getNodeTargets(node) {
+    return String(node?.target || "")
+      .split(/\r?\n|[;,锛岋紱|]+/g)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  },
   buildRawAllowHosts(node, env) {
     const set = new Set();
-
-    try {
-      set.add(new URL(node.target).host.toLowerCase());
-    } catch {}
-    // 可选额外白名单：env.RAW_ALLOW_HOSTS=host1,host2
+    for (const t of this.getNodeTargets(node)) {
+      try {
+        set.add(new URL(t).host.toLowerCase());
+      } catch {}
+    }
     const extra = String(env.RAW_ALLOW_HOSTS || "").trim();
     if (extra) {
       for (const h of extra.split(",")) {
@@ -1178,28 +1049,23 @@ const ProxyHandler = {
         if (v) set.add(v);
       }
     }
-
     return set;
   },
   routePrefix(name, key, uid = "admin") {
     const n = encodeURIComponent(String(name || ""));
     const k = String(key || "");
     const u = String(uid || "admin").toLowerCase();
-
     const base =
       u && u !== "admin" ? `/u/${encodeURIComponent(u)}/${n}` : `/${n}`;
-
     return k ? `${base}/${encodeURIComponent(k)}` : base;
   },
   sameHost(a, b) {
     try {
       const ua = new URL(a);
       const ub = new URL(b);
-
       const ha = ua.hostname.toLowerCase();
       const hb = ub.hostname.toLowerCase();
       if (ha !== hb) return false;
-
       const pa = ua.port || (ua.protocol === "https:" ? "443" : "80");
       const pb = ub.port || (ub.protocol === "https:" ? "443" : "80");
       return pa === pb;
@@ -1207,20 +1073,229 @@ const ProxyHandler = {
       return false;
     }
   },
-
+  isEmosNode(node, targetUrl, env) {
+    const tag = String(node?.tag || "").toLowerCase();
+    if (tag.includes("emos")) return true;
+    const hosts = String(env.EMOS_MATCH_HOSTS || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    let h = "";
+    try {
+      h = String(targetUrl?.hostname || "").toLowerCase();
+    } catch {}
+    return !!h && hosts.includes(h);
+  },
+  applyEmosHeaders(h, request, env) {
+    const pid = String(env.EMOS_PROXY_ID || "").trim();
+    const pname = String(env.EMOS_PROXY_NAME || "").trim();
+    if (pid) h.set("EMOS-PROXY-ID", pid);
+    if (pname) h.set("EMOS-PROXY-NAME", pname);
+    const cip =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("X-Forwarded-For") ||
+      request.headers.get("X-Real-IP") ||
+      "";
+    if (cip) h.set("X-FORWARDED-FOR", cip);
+    const rg = request.headers.get("Range");
+    if (rg) h.set("Range", rg);
+  },
+  isPanUrl(urlLike) {
+    try {
+      const u = typeof urlLike === "string" ? new URL(urlLike) : urlLike;
+      const hay = `${u.host}${u.pathname}${u.search}`.toLowerCase();
+      return FIXED_PROXY_RULES.WANGPAN_KEYWORDS.some((k) =>
+        hay.includes(String(k).toLowerCase()),
+      );
+    } catch {
+      return false;
+    }
+  },
+  getDirectAdapter(urlLike) {
+    try {
+      const u = typeof urlLike === "string" ? new URL(urlLike) : urlLike;
+      const hay = `${u.host}${u.pathname}${u.search}`.toLowerCase();
+      for (const a of DIRECT_RULES.ADAPTERS) {
+        if (
+          (a.keywords || []).some((k) => hay.includes(String(k).toLowerCase()))
+        ) {
+          return a;
+        }
+      }
+      return {
+        name: this.isPanUrl(u) ? "generic-pan" : "generic",
+        forceProxy: !!FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY,
+        referer: FIXED_PROXY_RULES.WANGPAN_REFERER || "",
+        keepOrigin: false,
+        keepReferer: false,
+      };
+    } catch {
+      return {
+        name: "generic",
+        forceProxy: !!FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY,
+        referer: "",
+        keepOrigin: false,
+        keepReferer: false,
+      };
+    }
+  },
+  shouldProxyDirectUrl(urlLike) {
+    const adapter = this.getDirectAdapter(urlLike);
+    if (adapter && typeof adapter.forceProxy === "boolean") {
+      return adapter.forceProxy;
+    }
+    return !!FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY;
+  },
+  isNodeDirectExternal(node) {
+    return !!node?.directExternal;
+  },
+  buildDirectOutboundHeaders(
+    request,
+    targetUrl,
+    env,
+    node = null,
+    mode = "normal",
+  ) {
+    const u = typeof targetUrl === "string" ? new URL(targetUrl) : targetUrl;
+    const adapter = this.getDirectAdapter(u);
+    const h = new Headers(request.headers);
+    this.stripClientIpHeaders(h);
+    [
+      "cf-connecting-ip",
+      "cf-ipcountry",
+      "cf-ray",
+      "cf-visitor",
+      "cf-worker",
+      "x-forwarded-for",
+      "x-real-ip",
+      "x-forwarded-proto",
+      "x-forwarded-host",
+      "x-forwarded-port",
+      "forwarded",
+      "sec-fetch-site",
+      "sec-fetch-mode",
+      "sec-fetch-dest",
+      "sec-fetch-user",
+      "connection",
+      "content-length",
+      "origin",
+      "referer",
+    ].forEach((k) => h.delete(k));
+    h.set("Host", u.host);
+    const ua = h.get("User-Agent") || "";
+    if (!ua || /mpv|ffmpeg|lavf|dart|okhttp/i.test(ua)) {
+      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+    }
+    const rg = request.headers.get("Range");
+    if (rg) h.set("Range", rg);
+    const ifRange = request.headers.get("If-Range");
+    if (ifRange) h.set("If-Range", ifRange);
+    if (adapter.keepReferer && adapter.referer) {
+      h.set("Referer", adapter.referer);
+    }
+    if (adapter.keepOrigin && adapter.referer) {
+      try {
+        h.set("Origin", new URL(adapter.referer).origin);
+      } catch {}
+    }
+    if (mode === "retry-no-origin") {
+      h.delete("Origin");
+      h.delete("Referer");
+    }
+    if (mode === "retry-browserish") {
+      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+      if (!h.get("Referer") && adapter.keepReferer && adapter.referer) {
+        h.set("Referer", adapter.referer);
+      }
+    }
+    const isEmos = this.isEmosNode(node, u, env);
+    if (isEmos) this.applyEmosHeaders(h, request, env);
+    return h;
+  },
+  buildCleanProxyHeaders(request, targetUrl) {
+    const h = new Headers(request.headers);
+    [
+      "cf-connecting-ip",
+      "cf-ipcountry",
+      "cf-ray",
+      "cf-visitor",
+      "cf-worker",
+      "x-forwarded-for",
+      "x-real-ip",
+      "x-forwarded-proto",
+      "x-forwarded-host",
+      "x-forwarded-port",
+      "forwarded",
+      "true-client-ip",
+      "origin",
+      "referer",
+      "sec-fetch-site",
+      "sec-fetch-mode",
+      "sec-fetch-dest",
+      "sec-fetch-user",
+      "connection",
+      "content-length",
+    ].forEach((k) => h.delete(k));
+    h.set("Host", targetUrl.host);
+    const ua = h.get("User-Agent") || "";
+    if (!ua || /mpv|ffmpeg|lavf|dart|okhttp/i.test(ua)) {
+      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+    }
+    const rg = request.headers.get("Range");
+    if (rg) h.set("Range", rg);
+    const ifRange = request.headers.get("If-Range");
+    if (ifRange) h.set("If-Range", ifRange);
+    return h;
+  },
+  stripClientIpHeaders(h) {
+    if (!h) return h;
+    h.delete("CF-Connecting-IP");
+    h.delete("X-Forwarded-For");
+    h.delete("X-Real-IP");
+    h.delete("True-Client-IP");
+    h.delete("Forwarded");
+    h.delete("X-Forwarded-Proto");
+    h.delete("X-Forwarded-Host");
+    h.delete("X-Forwarded-Port");
+    return h;
+  },
   async handle(request, node, path, name, key, env, uid = "admin") {
+    const targets = this.getNodeTargets(node);
+    if (!targets.length) {
+      return new Response("Invalid node target", { status: 500 });
+    }
+    let lastRes = null;
+    for (const t of targets) {
+      try {
+        const nodeTry = { ...node, target: t };
+        const res = await this.handleOneTarget(
+          request,
+          nodeTry,
+          path,
+          name,
+          key,
+          env,
+          uid,
+        );
+        if (res && res.status < 500) return res;
+        lastRes = res;
+      } catch (e) {}
+    }
+    return (
+      lastRes ||
+      new Response("Proxy Error: all targets failed", { status: 502 })
+    );
+  },
+  async handleOneTarget(request, node, path, name, key, env, uid = "admin") {
     let base = new URL(node.target);
-
+    const isEmos = this.isEmosNode(node, base, env);
     const ua = request.headers.get("User-Agent") || "";
     const isCapy = /CapyPlayer|Dart/i.test(ua);
-
     let forwardPath = path || "/";
-    // 默认不去掉 /emby，避免前后端分离 403
     const capyStrip = String(env.CAPY_STRIP_EMBY || "0") === "1";
     if (capyStrip && isCapy && /^\/emby(\/|$)/i.test(forwardPath)) {
       forwardPath = forwardPath.replace(/^\/emby/i, "") || "/";
     }
-    // 分离模式但未填写 streamTarget：允许通过 /__raw__/ 走反代兜底
     if (
       node.mode === "split" &&
       !node.streamTarget &&
@@ -1230,7 +1305,6 @@ const ProxyHandler = {
       try {
         raw = decodeURIComponent(raw);
       } catch {}
-
       let u;
       try {
         u = new URL(raw);
@@ -1239,31 +1313,19 @@ const ProxyHandler = {
       }
       if (!/^https?:$/i.test(u.protocol))
         return new Response("Forbidden", { status: 403 });
-
       const allowHosts = this.buildRawAllowHosts(node, env);
-
-      // split 且未填写 streamTarget：为了保证可用性，允许 __raw__ 透传任意 http(s) host
-      // 如需收紧，把下面 true 改成读取 env 开关
-      const allowAnyWhenSplitNoStream = true;
-      if (
-        !allowHosts.has(u.host.toLowerCase()) &&
-        !(
-          node.mode === "split" &&
-          !node.streamTarget &&
-          allowAnyWhenSplitNoStream
-        )
-      ) {
+      const allowAnyWhenSplitNoStream =
+        String(env.RAW_ALLOW_ANY || "0") === "1";
+      if (!allowHosts.has(u.host.toLowerCase()) && !allowAnyWhenSplitNoStream) {
         return new Response("Forbidden raw host", { status: 403 });
       }
-      return this.handleDirect(request, raw, env);
+      return this.handleDirect(request, raw, env, node);
     }
-
+    const reqUrl = new URL(request.url);
     const finalUrl = new URL(forwardPath, base);
-
-    finalUrl.search = new URL(request.url).search;
-
+    finalUrl.search = reqUrl.search;
     if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
-      return this.handleWebSocket(finalUrl, request);
+      return await this.handleWebSocket(finalUrl, request);
     }
     if (request.method === "OPTIONS") return this.renderCors(request, env);
     const isStreaming = GLOBALS.Regex.Streaming.test(forwardPath);
@@ -1271,38 +1333,28 @@ const ProxyHandler = {
       (GLOBALS.Regex.StaticExt.test(forwardPath) ||
         GLOBALS.Regex.EmbyImages.test(forwardPath)) &&
       request.method === "GET";
-
     const h = new Headers(request.headers);
-    const reqUrl = new URL(request.url);
-    const reqProto = reqUrl.protocol.replace(":", "");
-    const reqHost = reqUrl.host;
-    const reqPort = reqUrl.port || (reqProto === "https" ? "443" : "80");
-
     const p = finalUrl.pathname.toLowerCase();
-
     const isAuthApi = p.includes("/users/authenticatebyname");
     const isPlaybackApi =
-      p.includes("/items/") ||
       p.includes("/videos/") ||
       p.includes("/playback/") ||
-      p.includes("/sessions/playing");
-    const needCompatOrigin = isAuthApi;
-    // Capy 登录兼容：清 token 冲突，但不要删 Referer/Origin
+      p.includes("/sessions/playing") ||
+      /\.m3u8$/i.test(p) ||
+      /\.mpd$/i.test(p) ||
+      /\.mkv$/i.test(p) ||
+      /\.mp4$/i.test(p);
+    const needCompatOrigin = isAuthApi || isPlaybackApi;
     if (isCapy && isAuthApi) {
       h.delete("X-Emby-Token");
       h.delete("X-MediaBrowser-Token");
       h.delete("X-Authorization");
-
       const az = h.get("Authorization") || "";
       if (/^(Bearer|Token)\s+/i.test(az)) h.delete("Authorization");
-
       if (!h.get("Content-Type"))
         h.set("Content-Type", "application/json;charset=utf-8");
     }
-
     h.set("Host", base.host);
-
-    // Emby 授权头双向兼容
     const authz = h.get("Authorization") || "";
     const xEmby = h.get("X-Emby-Authorization") || "";
     if (!isAuthApi && /^MediaBrowser\s+/i.test(authz) && !xEmby) {
@@ -1311,35 +1363,33 @@ const ProxyHandler = {
     if (!isAuthApi && !authz && xEmby) {
       h.set("Authorization", xEmby);
     }
-
-    // 前后端分离兼容：补后端期望头（不要删除）
     if (needCompatOrigin) {
-      // 不强塞上游域名，优先沿用客户端来源
-      if (!h.get("Origin")) h.set("Origin", reqUrl.origin);
-      if (!h.get("Referer")) h.set("Referer", reqUrl.origin + "/");
-      if (!h.get("Accept"))
-        h.set("Accept", "application/json, text/plain, */*");
-      if (isAuthApi && !h.get("X-Requested-With"))
-        h.set("X-Requested-With", "XMLHttpRequest");
+      if (isPlaybackApi) {
+        h.delete("Origin");
+        h.delete("Referer");
+        h.delete("Sec-Fetch-Site");
+        h.delete("Sec-Fetch-Mode");
+        h.delete("Sec-Fetch-Dest");
+        h.delete("Sec-Fetch-User");
+        h.set("Accept", "*/*");
+      } else {
+        if (!h.get("Origin")) h.set("Origin", reqUrl.origin);
+        if (!h.get("Referer")) h.set("Referer", reqUrl.origin + "/");
+        if (!h.get("Accept"))
+          h.set("Accept", "application/json, text/plain, */*");
+        if (isAuthApi && !h.get("X-Requested-With")) {
+          h.set("X-Requested-With", "XMLHttpRequest");
+        }
+      }
     }
-
-    if (!h.get("User-Agent")) {
-      h.set(
-        "User-Agent",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile",
-      );
+    const currentUa = h.get("User-Agent") || "";
+    if (
+      isPlaybackApi ||
+      !currentUa ||
+      /mpv|ffmpeg|lavf|dart|okhttp/i.test(currentUa)
+    ) {
+      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
     }
-
-    h.set("X-Forwarded-Proto", reqProto);
-    h.set("X-Forwarded-Host", reqHost);
-    h.set("X-Forwarded-Port", reqPort);
-
-    const ip = request.headers.get("cf-connecting-ip");
-    if (ip) {
-      h.set("X-Real-IP", ip);
-      h.set("X-Forwarded-For", ip);
-    }
-
     [
       "cf-connecting-ip",
       "cf-ipcountry",
@@ -1347,8 +1397,17 @@ const ProxyHandler = {
       "cf-visitor",
       "cf-worker",
     ].forEach((x) => h.delete(x));
+    if (isPlaybackApi) {
+      [
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        "sec-fetch-user",
+        "priority",
+      ].forEach((x) => h.delete(x));
+    }
     if (isStatic) h.delete("Range");
-
+    if (isEmos) this.applyEmosHeaders(h, request, env);
     let cf = { cacheEverything: false, cacheTtl: 0 };
     if (isStatic) {
       const ck = new URL(finalUrl.toString());
@@ -1369,13 +1428,71 @@ const ProxyHandler = {
         cacheTtlByStatus: { "200-299": 86400 * 30, 404: 60, "500-599": 0 },
       };
     }
+    if (isEmos) {
+      const pp = finalUrl.pathname.toLowerCase();
+      if (/^\/emby\/items\/.+\/images\//i.test(pp)) {
+        cf = { ...(cf || {}), cacheEverything: true, cacheTtl: 600 };
+      }
+      if (pp === "/emby/system/ping") {
+        cf = { ...(cf || {}), cacheEverything: true, cacheTtl: 30 };
+      }
+      if (pp.startsWith("/emby/sessions/playing/progress")) {
+        cf = { ...(cf || {}), cacheEverything: false, cacheTtl: 0 };
+      }
+    }
     try {
       const method = request.method.toUpperCase();
       const replayBody =
         method === "GET" || method === "HEAD"
           ? null
           : await request.clone().arrayBuffer();
-
+      const isImageApi = /\/emby\/items\/.+\/images\//i.test(finalUrl.pathname);
+      const isAdditionalPartsApi = /\/emby\/videos\/.+\/additionalparts/i.test(
+        finalUrl.pathname,
+      );
+      const nodeDirect = this.isNodeDirectExternal(node);
+      if (
+        nodeDirect &&
+        (isPlaybackApi || isImageApi || isAdditionalPartsApi) &&
+        (request.method === "GET" || request.method === "HEAD")
+      ) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: finalUrl.toString(),
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      if (
+        !nodeDirect &&
+        (isPlaybackApi || isImageApi || isAdditionalPartsApi)
+      ) {
+        const hClean = this.buildCleanProxyHeaders(request, finalUrl);
+        const method = request.method.toUpperCase();
+        const body =
+          method === "GET" || method === "HEAD"
+            ? null
+            : replayBody
+              ? replayBody.slice(0)
+              : null;
+        const resClean = await this.fetchWithProtocolFallback(finalUrl, {
+          method: request.method,
+          headers: hClean,
+          body,
+          redirect: "follow",
+          cf,
+        });
+        const headersClean = new Headers(resClean.headers);
+        const aoClean = this.pickAllowOrigin(request, env);
+        headersClean.set("Access-Control-Allow-Origin", aoClean);
+        if (aoClean !== "*") headersClean.set("Vary", "Origin");
+        return new Response(resClean.body, {
+          status: resClean.status,
+          statusText: resClean.statusText,
+          headers: headersClean,
+        });
+      }
       let res = await this.fetchWithProtocolFallback(finalUrl, {
         method: request.method,
         headers: h,
@@ -1383,14 +1500,12 @@ const ProxyHandler = {
         redirect: "manual",
         cf,
       });
-
-      // 403 二次重试：某些源站要求 Origin=反代域名
       if (res.status === 403 && needCompatOrigin) {
         const h2 = new Headers(h);
+        if (isEmos) this.applyEmosHeaders(h2, request, env);
         const reqOrigin = new URL(request.url).origin;
         h2.set("Origin", reqOrigin);
         h2.set("Referer", reqOrigin + "/");
-
         res = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: h2,
@@ -1399,36 +1514,22 @@ const ProxyHandler = {
           cf,
         });
       }
-
-      // 403 三次兜底：使用“直连风格头”再试一次
-      let h3 = null;
       if (res.status === 403) {
-        h3 = new Headers(request.headers);
-        [
-          "cf-connecting-ip",
-          "cf-ipcountry",
-          "cf-ray",
-          "cf-visitor",
-          "cf-worker",
-          "x-forwarded-for",
-          "x-real-ip",
-          "x-forwarded-proto",
-          "x-forwarded-host",
-          "x-forwarded-port",
-          "forwarded",
-          "origin",
-          "referer",
-          "sec-fetch-site",
-          "sec-fetch-mode",
-          "sec-fetch-dest",
-          "sec-fetch-user",
-        ].forEach((k) => h3.delete(k));
-
+        const h3 = new Headers(h);
+        this.stripClientIpHeaders(h3);
         h3.set("Host", base.host);
-        h3.set("X-Forwarded-Proto", reqProto);
-        h3.set("X-Forwarded-Host", reqHost);
-        h3.set("X-Forwarded-Port", reqPort);
-
+        h3.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+        const rg = request.headers.get("Range");
+        if (rg) h3.set("Range", rg);
+        const ifRange = request.headers.get("If-Range");
+        if (ifRange) h3.set("If-Range", ifRange);
+        h3.delete("Origin");
+        h3.delete("Referer");
+        h3.delete("Sec-Fetch-Site");
+        h3.delete("Sec-Fetch-Mode");
+        h3.delete("Sec-Fetch-Dest");
+        h3.delete("Sec-Fetch-User");
+        if (isEmos) this.applyEmosHeaders(h3, request, env);
         res = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: h3,
@@ -1436,38 +1537,61 @@ const ProxyHandler = {
           redirect: "manual",
           cf,
         });
-      }
-
-      // 403 四次兜底：在三次基础上再做“极简来源头”
-      if (res.status === 403) {
-        const h4 = new Headers(h3 || h);
-        h4.set("Host", base.host);
-        h4.set("X-Forwarded-Proto", reqProto);
-        h4.set("X-Forwarded-Host", reqHost);
-        h4.set("X-Forwarded-Port", reqPort);
-
-        h4.delete("Origin");
-        h4.delete("Referer");
-        h4.delete("Sec-Fetch-Site");
-        h4.delete("Sec-Fetch-Mode");
-        h4.delete("Sec-Fetch-Dest");
-        h4.delete("Sec-Fetch-User");
-
-        res = await this.fetchWithProtocolFallback(finalUrl, {
-          method: request.method,
-          headers: h4,
-          body: replayBody ? replayBody.slice(0) : null,
-          redirect: "manual",
-          cf,
-        });
+        if (res.status === 403) {
+          const h4 = new Headers(h3);
+          this.stripClientIpHeaders(h4);
+          h4.set("Host", base.host);
+          h4.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+          h4.set("Referer", base.origin + "/");
+          h4.set("Origin", base.origin);
+          const rg2 = request.headers.get("Range");
+          if (rg2) h4.set("Range", rg2);
+          const ifRange2 = request.headers.get("If-Range");
+          if (ifRange2) h4.set("If-Range", ifRange2);
+          h4.delete("Sec-Fetch-Site");
+          h4.delete("Sec-Fetch-Mode");
+          h4.delete("Sec-Fetch-Dest");
+          h4.delete("Sec-Fetch-User");
+          if (isEmos) this.applyEmosHeaders(h4, request, env);
+          res = await this.fetchWithProtocolFallback(finalUrl, {
+            method: request.method,
+            headers: h4,
+            body: replayBody ? replayBody.slice(0) : null,
+            redirect: "manual",
+            cf,
+          });
+          if (res.status === 403) {
+            const h5 = new Headers(h4);
+            this.stripClientIpHeaders(h5);
+            h5.set("Host", base.host);
+            h5.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+            h5.set("Referer", base.origin + "/");
+            h5.set("Origin", base.origin);
+            const rg3 = request.headers.get("Range");
+            if (rg3) h5.set("Range", rg3);
+            const ifRange3 = request.headers.get("If-Range");
+            if (ifRange3) h5.set("If-Range", ifRange3);
+            h5.delete("Sec-Fetch-Site");
+            h5.delete("Sec-Fetch-Mode");
+            h5.delete("Sec-Fetch-Dest");
+            h5.delete("Sec-Fetch-User");
+            if (isEmos) this.applyEmosHeaders(h5, request, env);
+            res = await this.fetchWithProtocolFallback(finalUrl, {
+              method: request.method,
+              headers: h5,
+              body: replayBody ? replayBody.slice(0) : null,
+              redirect: "manual",
+              cf,
+            });
+          }
+        }
       }
       const headers = new Headers(res.headers);
       const ao = this.pickAllowOrigin(request, env);
       headers.set("Access-Control-Allow-Origin", ao);
-      if (ao !== "*") headers.set("Vary", "Origin"); // 用 set 避免重复追加
-
+      if (ao !== "*") headers.set("Vary", "Origin");
       if (isStatic) {
-        headers.set("Access-Control-Allow-Origin", "*"); // 静态固定 *
+        headers.set("Access-Control-Allow-Origin", "*");
         headers.delete("Vary");
         headers.delete("Set-Cookie");
         headers.set(
@@ -1478,15 +1602,12 @@ const ProxyHandler = {
         headers.set("Cache-Control", "no-store");
       }
       let splitLocHit = false;
-
-      // 预取 host 索引
       let hostMap = null;
       try {
         hostMap = await Database.getHostIndex(env, uid);
       } catch {
         hostMap = null;
       }
-
       if (res.status >= 300 && res.status < 400) {
         const location = headers.get("Location");
         if (location) {
@@ -1496,41 +1617,48 @@ const ProxyHandler = {
             const selfPrefixNoSlash = selfPrefix.endsWith("/")
               ? selfPrefix.slice(0, -1)
               : selfPrefix;
-            const splitMode = true; // 反代：统一按 split 逻辑处理
-            // 1) 相对重定向
+            const splitMode = node?.mode === "split";
             if (location.startsWith("/")) {
               const alreadyPrefixed =
                 location === selfPrefixNoSlash ||
                 location.startsWith(selfPrefixNoSlash + "/");
               if (!splitMode) {
-                // no-op
               } else if (!alreadyPrefixed) {
                 headers.set("Location", origin + selfPrefix + location);
               }
             } else {
-              // 2) 绝对重定向
               const loc = new URL(location);
               const locHost = loc.host.toLowerCase();
               const baseHost = String(base.host || "").toLowerCase();
-
               const alreadyPrefixed =
                 loc.pathname === selfPrefixNoSlash ||
                 loc.pathname.startsWith(selfPrefixNoSlash + "/");
-
               if (!alreadyPrefixed) {
-                // split 且无 streamTarget：外域走 __raw__
                 if (splitMode && !node?.streamTarget && locHost !== baseHost) {
-                  headers.set(
-                    "Location",
-                    origin +
-                      selfPrefix +
-                      "/__raw__/" +
-                      encodeURIComponent(loc.toString()),
-                  );
-                  splitLocHit = true;
-                }
-                // 外域尝试映射到已配置节点
-                else if (locHost !== baseHost) {
+                  const shouldProxy = this.shouldProxyDirectUrl(loc);
+                  const nodeDirect = this.isNodeDirectExternal(node);
+                  if (nodeDirect || !shouldProxy) {
+                    headers.set("Location", loc.toString());
+                  } else {
+                    if (!FIXED_PROXY_RULES.PAN_302_DIRECT) {
+                      return await this.handleDirect(
+                        request,
+                        loc.toString(),
+                        env,
+                        node,
+                      );
+                    } else {
+                      headers.set(
+                        "Location",
+                        origin +
+                          selfPrefix +
+                          "/__raw__/" +
+                          encodeURIComponent(loc.toString()),
+                      );
+                      splitLocHit = true;
+                    }
+                  }
+                } else if (locHost !== baseHost) {
                   const match = hostMap ? hostMap.get(locHost) || null : null;
                   if (match) {
                     const prefix = this.routePrefix(
@@ -1543,9 +1671,7 @@ const ProxyHandler = {
                       origin + prefix + loc.pathname + loc.search + loc.hash,
                     );
                   }
-                }
-                // split 且同 host 的绝对地址，补回当前节点前缀
-                else if (splitMode) {
+                } else if (splitMode) {
                   headers.set(
                     "Location",
                     origin + selfPrefix + loc.pathname + loc.search + loc.hash,
@@ -1581,7 +1707,6 @@ const ProxyHandler = {
           headers,
         });
       }
-
       return new Response(res.body, {
         status: res.status,
         statusText: res.statusText,
@@ -1593,29 +1718,22 @@ const ProxyHandler = {
       });
     }
   },
-
   async fetchWithProtocolFallback(urlObj, init = {}) {
     const u1 = new URL(urlObj.toString());
     const u2 = new URL(urlObj.toString());
     u2.protocol = u1.protocol === "https:" ? "http:" : "https:";
-
     const method = String(init.method || "GET").toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD" && init.body != null;
-
     const maxBytes = Number(
       Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
     );
-
-    // 是否允许回退重试（有 body 时受大小限制）
     let allowFallback = true;
     let preparedBody = null;
-
     if (hasBody) {
       const cl = Number(
         (init.headers && new Headers(init.headers).get("content-length")) || 0,
       );
       if (cl > maxBytes) allowFallback = false;
-
       const b = init.body;
       const reusable =
         typeof b === "string" ||
@@ -1624,24 +1742,19 @@ const ProxyHandler = {
         b instanceof URLSearchParams ||
         b instanceof FormData ||
         b instanceof Blob;
-
       if (reusable) {
-        // 可复用类型，尽量估算大小
         let est = 0;
         if (typeof b === "string") est = new TextEncoder().encode(b).byteLength;
         else if (b instanceof ArrayBuffer) est = b.byteLength;
         else if (ArrayBuffer.isView(b)) est = b.byteLength;
         else if (b instanceof Blob) est = b.size;
         if (est > maxBytes) allowFallback = false;
-
         preparedBody = b;
       } else {
-        // ReadableStream 需要读进内存；超限则不允许回退
         preparedBody = await new Response(b).arrayBuffer();
         if (preparedBody.byteLength > maxBytes) allowFallback = false;
       }
     }
-
     const buildInit = () => ({
       ...init,
       headers: new Headers(init.headers || {}),
@@ -1659,7 +1772,6 @@ const ProxyHandler = {
     } catch (e) {
       lastErr = e;
     }
-    // 大 body 不回退，直接返回第一次结果/错误
     if (!allowFallback) {
       if (firstRes) return firstRes;
       throw lastErr || new Error("fetch failed");
@@ -1670,46 +1782,35 @@ const ProxyHandler = {
       throw e2 || lastErr || new Error("fetch failed");
     }
   },
-
   buildDirectCandidates(rawPath, search = "") {
     const p = String(rawPath || "").trim();
     const withQuery = (u) =>
       search ? u + (u.includes("?") ? "&" : "?") + search.slice(1) : u;
-
     if (/^https?:\/\//i.test(p)) return [withQuery(p)];
-
     const hostPart = p.split("/")[0].split("?")[0].split("#")[0];
     if (/:80$/i.test(hostPart))
       return [withQuery(`http://${p}`), withQuery(`https://${p}`)];
     if (/:443$/i.test(hostPart))
       return [withQuery(`https://${p}`), withQuery(`http://${p}`)];
-
     return [withQuery(`https://${p}`), withQuery(`http://${p}`)];
   },
-
-  async handleDirect(request, rawPath, env) {
+  async handleDirect(request, rawPath, env, node = null) {
     const reqUrl = new URL(request.url);
     const candidates = this.buildDirectCandidates(rawPath, reqUrl.search);
     const method = request.method.toUpperCase();
-
     if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
       const first = candidates[0];
       return fetch(first, { headers: request.headers });
     }
-
     const hasBody = method !== "GET" && method !== "HEAD";
     const maxBytes = Number(
       Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
     );
-
     let allowFallback = true;
     let bodyBuf = null;
-
     if (hasBody) {
       const cl = Number(request.headers.get("content-length") || 0);
       if (cl > maxBytes) allowFallback = false;
-
-      // 仅当需要 fallback 才读入内存
       if (allowFallback) {
         bodyBuf = await request.clone().arrayBuffer();
         if (bodyBuf.byteLength > maxBytes) allowFallback = false;
@@ -1717,99 +1818,99 @@ const ProxyHandler = {
     }
     let lastErr = null;
     let lastRes = null;
-    // 若不允许 fallback，只试第一个候选
     const targets = allowFallback ? candidates : candidates.slice(0, 1);
     for (const target of targets) {
       try {
         const u = new URL(target);
-        const h = new Headers(request.headers);
-        [
-          "cf-connecting-ip",
-          "cf-ipcountry",
-          "cf-ray",
-          "cf-visitor",
-          "cf-worker",
-          "x-forwarded-for",
-          "x-real-ip",
-          "x-forwarded-proto",
-          "x-forwarded-host",
-          "x-forwarded-port",
-          "forwarded",
-          "origin",
-          "referer",
-          "sec-fetch-site",
-          "sec-fetch-mode",
-          "sec-fetch-dest",
-          "sec-fetch-user",
-        ].forEach((k) => h.delete(k));
-
-        h.set("Host", u.host);
-        const reqProto2 = reqUrl.protocol.replace(":", "");
-        const reqHost2 = reqUrl.host;
-        const reqPort2 = reqUrl.port || (reqProto2 === "https" ? "443" : "80");
-        h.set("X-Forwarded-Proto", reqProto2);
-        h.set("X-Forwarded-Host", reqHost2);
-        h.set("X-Forwarded-Port", reqPort2);
-
+        const redirectMode = "follow";
+        let h = this.buildDirectOutboundHeaders(
+          request,
+          u,
+          env,
+          node,
+          "normal",
+        );
+        this.stripClientIpHeaders(h);
         let res = await fetch(target, {
           method,
           headers: h,
           body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
-          redirect: "manual",
+          redirect: redirectMode,
         });
-
-        // direct 分支 403 再试一次：去来源头
         if (res.status === 403) {
-          const h2 = new Headers(h);
-          h2.delete("Origin");
-          h2.delete("Referer");
-          h2.delete("Sec-Fetch-Site");
-          h2.delete("Sec-Fetch-Mode");
-          h2.delete("Sec-Fetch-Dest");
-          h2.delete("Sec-Fetch-User");
-
+          const h2 = this.buildDirectOutboundHeaders(
+            request,
+            u,
+            env,
+            node,
+            "retry-no-origin",
+          );
+          this.stripClientIpHeaders(h2);
           res = await fetch(target, {
             method,
             headers: h2,
             body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
-            redirect: "manual",
+            redirect: redirectMode,
           });
         }
-
+        if (res.status === 403) {
+          const h3 = this.buildDirectOutboundHeaders(
+            request,
+            u,
+            env,
+            node,
+            "retry-browserish",
+          );
+          this.stripClientIpHeaders(h3);
+          res = await fetch(target, {
+            method,
+            headers: h3,
+            body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
+            redirect: redirectMode,
+          });
+        }
         if ([525, 526, 530].includes(res.status)) {
           lastRes = res;
           continue;
         }
-
         const rh = new Headers(res.headers);
-
-        // __raw__ 请求下，重写 3xx Location，避免客户端跳出代理
         try {
           const reqU = new URL(request.url);
           const i = reqU.pathname.indexOf("/__raw__/");
           const selfPrefix = i >= 0 ? reqU.pathname.slice(0, i) : "";
-
           if (res.status >= 300 && res.status < 400) {
             const loc = rh.get("Location");
             if (loc && selfPrefix) {
-              const abs = new URL(loc, target); // target 是当前 direct 目标
+              const abs = new URL(loc, target);
               if (/^https?:$/i.test(abs.protocol)) {
-                rh.set(
-                  "Location",
-                  reqU.origin +
-                    selfPrefix +
-                    "/__raw__/" +
-                    encodeURIComponent(abs.toString()),
-                );
+                const shouldProxy = this.shouldProxyDirectUrl(abs);
+                if (!shouldProxy) {
+                  rh.set("Location", abs.toString());
+                } else {
+                  if (!FIXED_PROXY_RULES.PAN_302_DIRECT) {
+                    return await this.handleDirect(
+                      request,
+                      abs.toString(),
+                      env,
+                      node,
+                    );
+                  } else {
+                    rh.set(
+                      "Location",
+                      reqU.origin +
+                        selfPrefix +
+                        "/__raw__/" +
+                        encodeURIComponent(abs.toString()),
+                    );
+                  }
+                }
               }
             }
           }
         } catch {}
-
         const ao2 = this.pickAllowOrigin(request, env);
         rh.set("Access-Control-Allow-Origin", ao2);
         if (ao2 !== "*") rh.set("Vary", "Origin");
-
         return new Response(res.body, {
           status: res.status,
           statusText: res.statusText,
@@ -1824,51 +1925,24 @@ const ProxyHandler = {
       status: 502,
     });
   },
-
-  handleWebSocket(url, request) {
+  async handleWebSocket(url, request) {
     try {
-      const protocols =
-        request.headers.get("Sec-WebSocket-Protocol") || "emby-websocket";
-      const wsTarget = new URL(url);
-      wsTarget.protocol = wsTarget.protocol === "https:" ? "wss:" : "ws:";
-
-      const pair = new WebSocketPair();
-      const client = pair[0];
-      const server = pair[1];
-      server.accept();
-
-      const ws = new WebSocket(wsTarget.toString(), protocols);
-
-      ws.addEventListener("message", (e) => {
-        try {
-          server.send(e.data);
-        } catch {}
+      const u = new URL(url);
+      if (u.protocol === "ws:") u.protocol = "http:";
+      if (u.protocol === "wss:") u.protocol = "https:";
+      const h = new Headers(request.headers);
+      h.set("Connection", "Upgrade");
+      h.set("Upgrade", "websocket");
+      const req = new Request(u.toString(), {
+        method: "GET",
+        headers: h,
+        redirect: "manual",
       });
-      server.addEventListener("message", (e) => {
-        try {
-          ws.send(e.data);
-        } catch {}
-      });
-
-      const close = () => {
-        try {
-          ws.close();
-        } catch {}
-        try {
-          server.close();
-        } catch {}
-      };
-
-      ws.addEventListener("close", close);
-      ws.addEventListener("error", close);
-      server.addEventListener("close", close);
-      server.addEventListener("error", close);
-
-      return new Response(null, {
-        status: 101,
-        webSocket: client,
-        headers: { "Sec-WebSocket-Protocol": protocols },
-      });
+      const resp = await fetch(req);
+      if (resp.status !== 101) {
+        return new Response("WS upstream rejected", { status: 502 });
+      }
+      return resp;
     } catch {
       return new Response("WS Error", { status: 502 });
     }
@@ -1887,23 +1961,21 @@ const ProxyHandler = {
     const urlRe = /https?:\/\/[^\s"'<>\\]+/gi;
     const urls = [...new Set(text.match(urlRe) || [])];
     if (!urls.length) return text;
-
     const map = new Map();
-
     let hostMap = null;
     try {
       hostMap = await Database.getHostIndex(env, uid);
     } catch {
       hostMap = null;
     }
-
-    let curBaseHost = "";
-    try {
-      curBaseHost = new URL(currentNode?.target || "").host.toLowerCase();
-    } catch {}
-
+    const curBaseHosts = new Set();
+    for (const t of this.getNodeTargets(currentNode)) {
+      try {
+        curBaseHosts.add(new URL(t).host.toLowerCase());
+      } catch {}
+    }
     const selfPrefix = this.routePrefix(currentName, currentKey, uid);
-    const splitNoStream = true; // 反代：外域链接统一走 __raw__
+    const splitNoStream = FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY;
     for (const full of urls) {
       let u;
       try {
@@ -1911,34 +1983,34 @@ const ProxyHandler = {
       } catch {
         continue;
       }
-      // B) split + 无 streamTarget：外域绝对地址走 __raw__
       if (
         splitNoStream &&
-        curBaseHost &&
-        u.host.toLowerCase() !== curBaseHost
+        curBaseHosts.size &&
+        !curBaseHosts.has(u.host.toLowerCase())
       ) {
-        map.set(
-          full,
-          origin + selfPrefix + "/__raw__/" + encodeURIComponent(full),
-        );
+        const shouldProxy = this.shouldProxyDirectUrl(u);
+        const nodeDirect = this.isNodeDirectExternal(currentNode);
+        if (nodeDirect || !shouldProxy) {
+          map.set(full, full);
+        } else {
+          map.set(
+            full,
+            origin + selfPrefix + "/__raw__/" + encodeURIComponent(full),
+          );
+        }
         continue;
       }
-
-      // C) 已配置节点 host 映射（这里也要带 uid 前缀）
       const match = hostMap ? hostMap.get(u.host.toLowerCase()) || null : null;
       if (match) {
         const prefix = this.routePrefix(match.name, match.secret || "", uid);
         map.set(full, origin + prefix + u.pathname + u.search + u.hash);
         continue;
       }
-
-      // D) 最后兜底：直连路径包装
       map.set(
         full,
         `${origin}/${u.protocol}//${u.host}${u.pathname}${u.search}${u.hash}`,
       );
     }
-
     let out = text;
     for (const [from, to] of map.entries()) out = out.split(from).join(to);
     return out;
@@ -1946,11 +2018,9 @@ const ProxyHandler = {
   pickAllowOrigin(request, env) {
     const reqOrigin = request.headers.get("Origin") || "";
     const allow = String(env.CORS_ALLOW_ORIGIN || "").trim();
-
     if (!reqOrigin) return "*";
-    if (!allow) return reqOrigin; // 默认回显请求源
+    if (!allow) return reqOrigin;
     if (allow === "*") return "*";
-
     const set = new Set(
       allow
         .split(",")
@@ -1977,7 +2047,7 @@ const UI = {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Emby反代管理系统</title>
+<title>Emby鍙嶄唬绠＄悊绯荤粺</title>
 <style>
 :root{
   --bg:#f3f6fb;
@@ -1991,16 +2061,13 @@ const UI = {
   --intext:#0f172a;
   --inborder:#d8e2f0;
   --blue:#3b82f6;
-
   --brand:#2563eb;
   --brand-soft:#eaf2ff;
-
   --card-bg:#ffffff;
   --card-bg2:#fbfdff;
   --card-text:#1e293b;
   --card-muted:#64748b;
   --card-line:#dbe4f2;
-
   --density-gap:12px;
   --density-card-pad:14px;
   --density-name-size:34px;
@@ -2017,7 +2084,6 @@ body{
 #bgOverlay{position:fixed;inset:0;z-index:-2;pointer-events:none;background:rgba(0,0,0,var(--bg-overlay,0.2));display:none}
 body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .glass{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);background:color-mix(in oklab, var(--panel) 80%, transparent)}
-
 .wrap{max-width:min(96vw,1880px);margin:0 auto;padding:12px 8px 88px}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .title{font-size:40px;font-weight:800;display:flex;gap:8px;align-items:flex-end;color:var(--text2)}
@@ -2035,6 +2101,13 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   letter-spacing:.2px;
 }
 .right-actions{display:flex;gap:2px;align-items:center}
+.top-ver{
+  font-size:12px;
+  color:var(--muted);
+  font-weight:600;
+  margin-right:8px;
+  user-select:none;
+}
 .icon-btn{border:none;background:transparent;color:var(--icon);padding:8px;border-radius:10px;cursor:pointer;line-height:0}
 .icon-btn.is-fav{ color:#f59e0b; }
 .icon-btn:hover{background:rgba(148,163,184,.16)}
@@ -2062,7 +2135,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .controls button{cursor:pointer}
 .controls button:hover{border-color:#bcd0ee;background:#f7fbff}
-/* 行内 + 按钮强制样式，避免被 controls 按钮样式覆盖成空白框 */
 .controls .fab{
   display:flex;
   align-items:center;
@@ -2080,14 +2152,12 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
     line-height:36px;
   }
 }
-
 #tagFilterBtn,#btnCheckSel,#btnCheckAll{color:var(--intext);border-color:var(--inborder)}
 #tagFilterBtn:hover,#btnCheckSel:hover,#btnCheckAll:hover{
   border-color:color-mix(in oklab, var(--inborder) 60%, #93c5fd 40%);
   background:color-mix(in oklab, var(--inbg) 85%, #1d4ed8 15%);
 }
 #searchInput{width:100%;min-width:0;max-width:none}
-
 @media(max-width:900px){
   .controls{grid-template-columns:120px 1fr 140px}
 }
@@ -2096,13 +2166,11 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   .controls{grid-template-columns:1fr 1fr}
   #searchInput{grid-column:1/-1}
 }
-/* ===== 移动端：标题徽章防挤压 ===== */
 @media (max-width: 640px){
   .top{
     align-items:flex-start;
     gap:8px;
   }
-
   .title{
     display:flex;
     flex-wrap:wrap;
@@ -2110,7 +2178,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
     gap:6px;
     line-height:1.08;
     min-width:0;
-    max-width:calc(100vw - 120px); /* 给右侧按钮留空间 */
+    max-width:calc(100vw - 120px); 
   }
   #nodeCount,
   .right-actions{
@@ -2142,12 +2210,9 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   opacity:.75;
   user-select:none;
 }
-/* 卡片拖拽状态 */
 .card[draggable="true"]{ cursor:grab; }
 .card.dragging{ opacity:.55; }
 .card.drag-over{ outline:2px dashed #60a5fa; outline-offset:-2px; }
-
-/* 卡片主体 */
 .card{
   border:1px solid var(--card-line);
   border-radius:10px;
@@ -2162,8 +2227,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   box-shadow:0 6px 18px rgba(37,99,235,.12);
   transform:translateY(-1px);
 }
-
-/* 卡片头布局 */
 .row{
   display:flex;
   justify-content:space-between;
@@ -2185,13 +2248,10 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .selbox{ margin-top:4px; flex:0 0 auto; }
 .selbox input{ width:16px; height:16px; cursor:pointer; }
-
 .info{
   min-width:0;
   flex:1 1 auto;
 }
-
-/* 节点名（防止长名称撑爆） */
 .name{
   margin:0;
   font-size:var(--density-name-size);
@@ -2203,8 +2263,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   text-overflow:ellipsis;
   max-width:100%;
 }
-
-/* /path 小字 */
 .path-tip{
   margin-top:2px;
   font-size:12px;
@@ -2214,8 +2272,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   text-overflow:ellipsis;
   max-width:100%;
 }
-
-/* 右上角按钮 */
 .actions{
   display:flex;
   gap:4px;
@@ -2223,8 +2279,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   margin-left:8px;
 }
 .actions .icon-btn{ padding:6px; }
-
-/* 标签行 */
 .badges{
   display:flex;
   flex-wrap:wrap;
@@ -2242,16 +2296,12 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   font-weight:700;
   white-space:nowrap;
 }
-
-/* 徽章配色 */
 .b-mode-normal{ background:#dbeafe; color:#1d4ed8; }
 .b-green{  background:#dcfce7; color:#166534; }
 .b-blue{   background:#e0f2fe; color:#075985; }
 .b-orange{ background:#ffedd5; color:#9a3412; }
 .b-gray{   background:#e5e7eb; color:#374151; }
 .b-note{   background:#ede9fe; color:#5b21b6; }
-
-/* 状态行 */
 .status{
   margin-top:8px;
   display:flex;
@@ -2279,7 +2329,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   line-height:1.35;
   letter-spacing:0.1px;
 }
-
 .k{
   font-size:12px;
   color:var(--card-muted);
@@ -2292,14 +2341,12 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   color: color-mix(in srgb, var(--card-text) 88%, #000 12%);
   line-height:1.35;
   letter-spacing:0.1px;
-
   cursor:copy;
   white-space:normal;
   word-break:break-all;
   overflow:hidden;
-
   display:-webkit-box;
-  -webkit-line-clamp:2;      /* 最多两行 */
+  -webkit-line-clamp:2;      
   -webkit-box-orient:vertical;
 }
 .mono.muted{
@@ -2328,21 +2375,17 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   background:#eef4ff;
 }
 .app-btn.capy{opacity:.9}
-
 .menu{position:relative;z-index:90}
 .right-actions{position:relative;overflow:visible}
-
 .menu-panel{
   position:absolute;
   right:0;
   left:auto;
   top:calc(100% + 8px);
-
   min-width:190px;
   max-width:min(92vw,280px);
   max-height:min(72vh,520px);
   overflow:auto;
-
   padding:6px;
   border:1px solid var(--line);
   border-radius:10px;
@@ -2350,7 +2393,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   z-index:120;
   box-shadow:0 8px 20px rgba(0,0,0,.08);
 }
-
 @media (max-width:640px){
   .menu-panel{
     right:-4px;
@@ -2361,7 +2403,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .menu-panel button{width:100%;border:none;background:transparent;color:var(--text);text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer}
 .menu-panel button:hover{background:rgba(148,163,184,.14)}
-
 .fab{
   position:fixed;
   right:20px;
@@ -2378,8 +2419,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   box-shadow:0 10px 22px rgba(59,130,246,.35);
   z-index:80;
 }
-
-/* 新增：桌面端行内小按钮（放到“检测全部”旁边） */
 @media (min-width:981px){
   .fab{
     position:static;
@@ -2395,7 +2434,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
     flex:0 0 auto;
   }
 }
-
 .modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:60}
 .modal{
   display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(92vw,560px);
@@ -2406,6 +2444,32 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   width:100%;height:40px;border:1px solid var(--inborder);background:#fff;color:var(--intext);
   border-radius:10px;padding:0 10px;margin-bottom:8px;outline:none
 }
+ .pass-wrap{
+  position:relative;
+  margin-bottom:8px;
+}
+.pass-wrap #inPass{
+  margin-bottom:0;
+  padding-right:64px;
+}
+.pass-eye{
+  position:absolute;
+  right:8px;
+  top:50%;
+  transform:translateY(-50%);
+  border:1px solid var(--inborder);
+  background:#fff;
+  color:var(--muted);
+  border-radius:8px;
+  height:28px;
+  min-width:48px;
+  padding:0 8px;
+  cursor:pointer;
+} 
+ #editor #targetList .target-item{
+  width:100%;
+  display:block;
+} 
 .field-title{
   font-size:15px;
   font-weight:700;
@@ -2418,22 +2482,66 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   font-weight:800;
   margin-right:4px;
 }
-
 .tagbar{position:relative;margin-bottom:8px}
 .tagbar input{margin:0;padding-right:12px}
-/* 隐藏 datalist 输入框右侧原生箭头（Chrome/Edge/Safari） */
 #inTag::-webkit-calendar-picker-indicator{
   opacity:0;
   display:none;
 }
-/* 兼容 Firefox 视觉统一 */
 #inTag{
   appearance:textfield;
   -moz-appearance:textfield;
 }
+.project-links{
+  width: min(1100px, calc(100% - 24px));
+  margin: 10px auto 8px;
+  padding: 0;                 
+  border: none;               
+  background: transparent;    
+  box-shadow: none;           
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--muted);
+}
+.project-links .label{
+  color: var(--muted);
+  margin-right: 2px;
+  font: inherit;              
+}
+.project-links a{
+  text-decoration: none;
+  font: inherit;              
+  font-size: 14px;
+  color: var(--text2);
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 6px 10px;
+  line-height: 1;
+  transition: .15s ease;
+}
+.project-links a:hover{
+  border-color: var(--blue);
+  color: var(--blue);
+  transform: translateY(-1px);
+}
+@media (max-width:768px){
+  .project-links{
+    margin: 8px 12px 6px;
+    font-size: 13px;
+  }
+  .project-links a{
+    font-size: 13px;
+  }
+}
 .disclaimer{
   width: min(1100px, calc(100% - 24px));
-  margin: 16px auto 12px;   /* auto = 水平居中 */
+  margin: 16px auto 12px;   
   padding: 10px 12px;
   border: 1px dashed #cbd5e1;
   border-radius: 10px;
@@ -2441,9 +2549,8 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   line-height: 1.6;
   color: #64748b;
   background: rgba(255,255,255,.55);
-  text-align: center;       /* 文案居中（可删） */
+  text-align: center;       
 }
-
 @media (max-width:768px){
   .disclaimer{ margin: 12px; font-size: 11.5px; }
 }
@@ -2452,7 +2559,6 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .btn-p{background:var(--blue);color:#fff}.btn-g{background:rgba(148,163,184,.2);color:var(--text)}
 .range{display:grid;grid-template-columns:90px 1fr 46px;gap:8px;align-items:center;margin:6px 0}
 .small{font-size:12px;color:var(--muted)}
-
 .tag-list{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}
 .tag-item{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:8px}
 .tag-item:hover{background:#f8fafc}
@@ -2463,16 +2569,13 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   justify-content:flex-start;
   gap:8px;
 }
-
 .tag-item input[type="checkbox"]{
   width:16px;
   height:16px;
   margin:0;
   flex:0 0 auto;
 }
-
 .tag-empty{font-size:13px;color:var(--muted);padding:8px}
-
 .gate{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:70}
 .gate-box{width:min(92vw,360px);background:#fff;border:1px solid #d7dce4;border-radius:14px;padding:16px}
 .gate-box h3{margin:0 0 10px}
@@ -2480,38 +2583,233 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .gate-box button{width:100%;height:42px;border:none;border-radius:10px;background:#111827;color:#fff;cursor:pointer;margin-top:10px}
 .tip{min-height:16px;margin-top:7px;font-size:12px;color:#ef4444}
 .tip.ok{color:#16a34a}
-
 .toast-wrap{position:fixed;right:16px;bottom:16px;z-index:90;display:flex;flex-direction:column;gap:8px}
 .toast{
   min-width:180px;max-width:360px;background:#111827;color:#fff;border-radius:10px;padding:10px 12px;font-size:13px;
   box-shadow:0 8px 18px rgba(0,0,0,.2);opacity:.97
 }
 .toast.success{background:#065f46}.toast.warn{background:#92400e}.toast.error{background:#991b1b}
+:root{
+  --density-name-size: clamp(22px, 2.2vw, 30px);
+  --density-label-size: clamp(14px, 1.2vw, 16px);
+  --density-mono-size: clamp(12px, 1vw, 14px);
+}
+.gate-box,
+.modal,
+.menu-panel{
+  background: var(--panel) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 8px 24px rgba(15,23,42,.08) !important;
+}
+.gate-box input,
+.modal input:not([type="checkbox"]),
+.modal select,
+.modal textarea,
+.menu-panel input,
+.menu-panel select{
+  background: var(--inbg) !important;
+  color: var(--intext) !important;
+  border: 1px solid var(--inborder) !important;
+  border-radius: 10px !important;
+}
+.gate-box button{
+  background: var(--brand) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: 10px !important;
+}
+button:focus-visible,
+.btn:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[role="button"]:focus-visible{
+  outline: 2px solid color-mix(in oklab, var(--brand) 72%, white 28%);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand) 18%, transparent 82%);
+}
+.card,
+.menu-panel,
+.modal,
+button,
+.btn{
+  transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+.card:hover{
+  transform: translateY(-1px);
+  box-shadow: 0 10px 22px rgba(15,23,42,.08);
+}
+button:hover,.btn:hover{
+  transform: translateY(-1px);
+}
+#editor{
+  font-size:14px;
+  line-height:1.45;
+}
+#editor h3{
+  font-size:24px;
+  font-weight:800;
+  line-height:1.2;
+  margin:0 0 14px 0;
+  color:var(--text2);
+}
+#editor .field-title{
+  font-size:18px;
+  font-weight:700;
+  line-height:1.3;
+  margin:10px 0 8px;
+  color:var(--text2);
+}
+#editor .req{
+  font-size:16px;
+  margin-right:4px;
+}
+#editor input:not([type="checkbox"]),
+#editor textarea,
+#editor select{
+  height:42px;
+  font-size:15px;
+  border-radius:10px;
+  padding:0 12px;
+  margin-bottom:8px;
+}
+#editor input::placeholder,
+#editor textarea::placeholder{
+  color:#9aa4b2;
+  font-size:14px;
+}
+#editor .field-help{
+  font-size:12px;
+  line-height:1.5;
+  color:var(--muted);
+  margin:2px 0 10px 24px;
+}
+#editor .check-row{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  margin:6px 0 2px;
+}
+#editor .check-row input[type="checkbox"]{
+  margin-top:3px;
+}
+#editor .check-row span{
+  font-size:15px;
+  line-height:1.4;
+}
+#editor .btn-row{
+  display:flex;
+  gap:8px;
+  margin:4px 0 8px;
+}
+#editor .btn-row .btn{
+  height:36px;
+  padding:0 12px;
+  font-size:14px;
+  border-radius:10px;
+}
+#editor .btns .btn{
+  min-width:80px;
+  height:38px;
+  font-size:15px;
+  font-weight:700;
+}
+#editor .check-row{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:6px 0 4px;
+}
+#editor .check-row input[type="checkbox"]{
+  width:18px;
+  height:18px;
+  margin:0;
+  accent-color: var(--blue);
+  cursor:pointer;
+}
+#editor .check-row span{
+  font-size:16px;
+  line-height:1.25;
+}
+#editor .pass-wrap{
+  position: relative;
+}
+#editor .pass-wrap #inPass{
+  padding-right: 34px; 
+}
+#editor .pass-eye{
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: #7b8798;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  line-height: 1;
+}
+#editor .pass-eye:hover{
+  color: #4b5563;
+}
+#editor .pass-eye:focus{
+  outline: none;
+}
+#editor #togglePassIcon,
+#editor #togglePassIcon svg{
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+#editor .check-row input[type="checkbox"]{
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--blue);
+}
+#editor .pass-eye{
+  width: 24px;
+  height: 24px;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+#editor #togglePassIcon,
+#editor #togglePassIcon svg{
+  width: 22px;
+  height: 22px;
+}
 </style>
 </head>
 <body>
 <div id="bgLayer"></div>
 <div id="bgOverlay"></div>
-
 <div id="gate" class="gate">
   <div class="gate-box">
-    <h3>管理员登录</h3>
-    <input id="gatePwd" type="password" placeholder="请输入 ADMIN_TOKEN" />
-<button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">进入面板</button>
-
-    <div id="gateTip" class="tip">请先在 Worker 环境变量设置 ADMIN_TOKEN</div>
+    <h3>绠＄悊鍛樼櫥褰�</h3>
+    <input id="gatePwd" type="password" placeholder="璇疯緭鍏� ADMIN_TOKEN" />
+<button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">杩涘叆闈㈡澘</button>
+    <div id="gateTip" class="tip">璇峰厛鍦� Worker 鐜鍙橀噺璁剧疆 ADMIN_TOKEN</div>
   </div>
 </div>
-
 <div id="app" style="display:none">
   <div class="wrap">
     <div class="top">
       <div class="title">
-  Emby反代管理系统
-  <small id="nodeCount">0个</small>
+  Emby鍙嶄唬绠＄悊绯荤粺
+  <small id="nodeCount">0涓�</small>
 </div>
       <div class="right-actions">
-        <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
+  <span class="top-ver">v1.3</span>
+  <button class="icon-btn" title="鍒囨崲涓婚" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
         <div class="menu">
@@ -2519,104 +2817,116 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
           </button>
           <div id="menuPanel" class="menu-panel glass">
-            <button onclick="App.exportData()">导出配置</button>
-            <button onclick="document.getElementById('fIn').click()">导入配置</button>
-            <button onclick="App.openBgModal()">背景高级设置</button>
-            <button onclick="App.setDensity('compact')">密度：紧凑</button>
-            <button onclick="App.setDensity('cozy')">密度：舒适</button>
-            <button onclick="App.setPreset('deepblue')">主题：深蓝</button>
-            <button onclick="App.setPreset('graphite')">主题：石墨</button>
-            <button onclick="App.setPreset('light')">主题：浅灰</button>
-            <button onclick="Gate.logout()">退出登录</button>
+            <button onclick="App.exportData()">瀵煎嚭閰嶇疆</button>
+            <button onclick="document.getElementById('fIn').click()">瀵煎叆閰嶇疆</button>
+            <button onclick="App.openBgModal()">鑳屾櫙楂樼骇璁剧疆</button>
+            <button onclick="App.setDensity('compact')">瀵嗗害锛氱揣鍑�</button>
+            <button onclick="App.setDensity('cozy')">瀵嗗害锛氳垝閫�</button>
+            <button onclick="App.setPreset('deepblue')">涓婚锛氭繁钃�</button>
+            <button onclick="App.setPreset('graphite')">涓婚锛氱煶澧�</button>
+            <button onclick="App.setPreset('light')">涓婚锛氭祬鐏�</button>
+            <button onclick="Gate.logout()">閫€鍑虹櫥褰�</button>
             <input type="file" id="fIn" hidden accept=".json" onchange="App.importFile(this)">
           </div>
         </div>
       </div>
     </div>
-
     <div class="controls">
-      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">标签：全部</button>
-<input id="searchInput" class="full-sm glass" placeholder="搜索节点名称、备注..." oninput="App.filter(this.value)">
-      <button id="toggleAllVisBtn" class="glass" onclick="App.toggleAllVisibility()"><span class="state-dot off"></span>显示全部地址</button>
-      <button id="btnCheckSel" class="glass" onclick="App.checkSelectedStatus()">检测选中</button>
-      <button id="btnCheckAll" class="glass" onclick="App.checkAllStatus()">检测全部</button>
+      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">鏍囩锛氬叏閮�</button>
+<input id="searchInput" class="full-sm glass" placeholder="鎼滅储鑺傜偣鍚嶇О銆佸娉�..." oninput="App.filter(this.value)">
+      <button id="toggleAllVisBtn" class="glass" onclick="App.toggleAllVisibility()"><span class="state-dot off"></span>鏄剧ず鍏ㄩ儴鍦板潃</button>
+      <button id="btnCheckSel" class="glass" onclick="App.checkSelectedStatus()">妫€娴嬮€変腑</button>
+      <button id="btnCheckAll" class="glass" onclick="App.checkAllStatus()">妫€娴嬪叏閮�</button>
     </div>
-
     <div id="batchBar" class="batchbar glass">
-      <span class="small">已选 <b id="selCount">0</b> 项</span>
-      <button onclick="App.selectAllFiltered()">全选筛选结果</button>
-      <button onclick="App.clearSelection()">清空选择</button>
-      <input id="batchTagInput" placeholder="批量标签（如 公益服）" />
-      <button onclick="App.applyBatchTag()">批量打标签</button>
-      <button style="color:#ef4444" onclick="App.batchDelete()">批量删除</button>
+      <span class="small">宸查€� <b id="selCount">0</b> 椤�</span>
+      <button onclick="App.selectAllFiltered()">鍏ㄩ€夌瓫閫夌粨鏋�</button>
+      <button onclick="App.clearSelection()">娓呯┖閫夋嫨</button>
+      <input id="batchTagInput" placeholder="鎵归噺鏍囩锛堝 鍏泭鏈嶏級" />
+<button onclick="App.applyBatchTag()">鎵归噺鎵撴爣绛�</button>
+<button onclick="App.applyBatchCred()">鎵归噺璐﹀彿瀵嗙爜</button>
+<button style="color:#ef4444" onclick="App.clearBatchCred()">娓呯┖璐﹀彿瀵嗙爜</button>
+<button style="color:#ef4444" onclick="App.batchDelete()">鎵归噺鍒犻櫎</button>
     </div>
-
     <div id="list" class="grid"></div>
   </div>
-
-  <button class="fab" onclick="App.openEditor()">＋</button>
-
+  <button class="fab" onclick="App.openEditor()">锛�</button>
   <div id="mask" class="modal-mask" onclick="App.closeAllModals()"></div>
-
   <div id="editor" class="modal glass">
-<h3 id="editorTitle">新增节点</h3>
-<div class="field-title"><span class="req">*</span> 请求路径（英文）</div>
-<input id="inName" placeholder="请输入唯一英文路径（a-z0-9_-，1~32）">
-<div class="field-title">显示名称（可中文）</div>
-<input id="inDisplayName" placeholder="自定义">
-<div class="field-title">标签</div>
+<h3 id="editorTitle">鏂板鑺傜偣</h3>
+<div class="field-title"><span class="req">*</span> 璇锋眰璺緞锛堣嫳鏂囷級</div>
+<input id="inName" placeholder="璇疯緭鍏ュ敮涓€鑻辨枃璺緞锛坅-z0-9_-锛�1~32锛�">
+<div class="field-title">鏄剧ず鍚嶇О锛堝彲涓枃锛�</div>
+<input id="inDisplayName" placeholder="鑷畾涔�">
+<div class="field-title">鏍囩</div>
 <div class="tagbar">
-  <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
+  <input id="inTag" list="tagSuggestions" placeholder="鏍囩锛堝 鍏垂鏈� / 鍏泭鏈� / 鐧藉悕鍗� / 绛夛級">
 </div>
 <datalist id="tagSuggestions"></datalist>
-<input id="inNote" placeholder="备注（如 保号规则 / 等）">
-<div class="field-title"><span class="req">*</span> 目标地址</div>
-<input id="inTarget" placeholder="请输入 http(s) 地址">
-<input id="inSec" placeholder="密钥路径（可选，不能含 / ? #）">
-
-    <div class="btns">
-      <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
-      <button class="btn btn-p" onclick="App.save()">保存</button>
-    </div>
+<input id="inNote" placeholder="澶囨敞锛堝 淇濆彿瑙勫垯 / 绛夛級">
+<div class="field-title"><span class="req">*</span> 鐩爣鍦板潃锛堝彲澶氫釜锛�</div>
+<div id="targetList"></div>
+<div style="display:flex;gap:8px;margin-top:8px;">
+<div class="btn-row">
+<button type="button" class="btn btn-g" onclick="App.addTargetInput()">+ 娣诲姞鐩爣鍦板潃</button>
+<button type="button" class="btn btn-g" onclick="App.removeTargetInput()">- 鍒犻櫎涓€鏍�</button>
+</div>
+</div>
+<input id="inSec" placeholder="瀵嗛挜璺緞锛堝彲閫夛紝涓嶈兘鍚� / ? #锛�">
+<div class="field-title">鎾斁绛栫暐</div>
+<label class="check-row">
+  <input id="inDirectExternal" type="checkbox">
+  <span>缃戠洏鎾斁鐩磋繛</span>
+</label>
+<div class="field-help">
+  寮€鍚悗锛岀綉鐩樺閾剧敱鎾斁鍣ㄧ洿鎺ヨ闂紙涓嶇粡 Worker 鍙嶄唬锛夛紝鍙兘鏇村揩浣嗗彈瀹㈡埛绔綉缁滃奖鍝嶃€�
+</div>
+<div class="field-title">Emby 璐﹀彿锛堢敤浜庝竴閿鍏ワ級</div>
+<input id="inUser" placeholder="鐢ㄦ埛鍚嶏紙鍙暀绌猴級">
+<div class="pass-wrap">
+  <input id="inPass" type="password" placeholder="瀵嗙爜锛堝彲鐣欑┖锛�">
+  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="鏄剧ず/闅愯棌瀵嗙爜">
+  <span id="togglePassIcon"></span>
+</button>
+</div>
+<div class="btns">
+  <button class="btn btn-g" onclick="App.closeAllModals()">鍙栨秷</button>
+  <button class="btn btn-p" onclick="App.save()">淇濆瓨</button>
+</div>
   </div>
-
   <div id="tagPicker" class="modal glass">
-    <h3>标签多选筛选</h3>
+    <h3>鏍囩澶氶€夌瓫閫�</h3>
     <div id="tagPickerList" class="tag-list"></div>
     <div class="btns">
-      <button class="btn btn-g" onclick="App.clearTagFilter()">清空</button>
-      <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
-      <button class="btn btn-p" onclick="App.applyTagFilter()">应用</button>
+      <button class="btn btn-g" onclick="App.clearTagFilter()">娓呯┖</button>
+      <button class="btn btn-g" onclick="App.closeAllModals()">鍙栨秷</button>
+      <button class="btn btn-p" onclick="App.applyTagFilter()">搴旂敤</button>
     </div>
   </div>
-
   <div id="bgModal" class="modal glass">
-    <h3>背景高级设置</h3>
-    <input id="bgUrl" placeholder="背景图URL（https://...）">
-    <div class="range"><label>亮度</label><input id="bgBrightness" type="range" min="40" max="140" step="1"><span id="bgBrightnessVal">100%</span></div>
-    <div class="range"><label>模糊</label><input id="bgBlur" type="range" min="0" max="20" step="1"><span id="bgBlurVal">0px</span></div>
-    <div class="range"><label>遮罩</label><input id="bgOverlayRange" type="range" min="0" max="80" step="1"><span id="bgOverlayVal">20%</span></div>
-    <div class="small">建议：深色主题 + 亮度 75~90 + 模糊 4~8</div>
+    <h3>鑳屾櫙楂樼骇璁剧疆</h3>
+    <input id="bgUrl" placeholder="鑳屾櫙鍥綰RL锛坔ttps://...锛�">
+    <div class="range"><label>浜害</label><input id="bgBrightness" type="range" min="40" max="140" step="1"><span id="bgBrightnessVal">100%</span></div>
+    <div class="range"><label>妯＄硦</label><input id="bgBlur" type="range" min="0" max="20" step="1"><span id="bgBlurVal">0px</span></div>
+    <div class="range"><label>閬僵</label><input id="bgOverlayRange" type="range" min="0" max="80" step="1"><span id="bgOverlayVal">20%</span></div>
+    <div class="small">寤鸿锛氭繁鑹蹭富棰� + 浜害 75~90 + 妯＄硦 4~8</div>
     <div class="btns">
-      <button class="btn btn-g" onclick="App.clearBg()">清除背景</button>
-      <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
-      <button class="btn btn-p" onclick="App.saveBg()">保存背景设置</button>
+      <button class="btn btn-g" onclick="App.clearBg()">娓呴櫎鑳屾櫙</button>
+      <button class="btn btn-g" onclick="App.closeAllModals()">鍏抽棴</button>
+      <button class="btn btn-p" onclick="App.saveBg()">淇濆瓨鑳屾櫙璁剧疆</button>
     </div>
   </div>
-
   <div id="toastWrap" class="toast-wrap"></div>
 </div>
-
 <script>
 const $ = (s)=>document.querySelector(s);
 function mountFabToControls(){
   const controls = document.querySelector('.controls');
   const fab = document.querySelector('.fab');
   if (!controls || !fab || fab.dataset.moved === '1') return;
-  controls.appendChild(fab);   // 放到 controls 最后 = 检测全部右侧
+  controls.appendChild(fab);   
   fab.dataset.moved = '1';
 }
-
 const SVG = {
   edit: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>',
   trash: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>',
@@ -2628,7 +2938,6 @@ const SVG = {
   star: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
   starOn: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
 };
-
 const PRESETS = {
   light: {
     "--bg":"#f3f6fb","--panel":"#ffffff","--text":"#1e293b","--text2":"#0f172a","--muted":"#64748b","--line":"#dbe3ef","--icon":"#64748b",
@@ -2646,7 +2955,6 @@ const PRESETS = {
     "--card-bg":"#1b2028","--card-bg2":"#212733","--card-text":"#f3f4f6","--card-muted":"#a6b0bf","--card-line":"#3a4352"
   }
 };
-
 const Gate = {
   key: 'emby_admin_token',
 getToken() { return (sessionStorage.getItem(this.key) || '').trim(); },
@@ -2655,14 +2963,12 @@ clearToken() { sessionStorage.removeItem(this.key); },
 bindEvents() {
   const btn = $('#gateBtn');
   const input = $('#gatePwd');
-
   if (btn) {
     if (!btn.__bound) {
       btn.__bound = true;
       btn.addEventListener('click', () => this.check());
     }
   }
-
   if (input && !input.__bound) {
     input.__bound = true;
     input.addEventListener('keydown', (e) => {
@@ -2672,14 +2978,14 @@ bindEvents() {
 },
 async check() {
   $('#gateTip').classList.remove('ok');
-  $('#gateTip').innerText = '登录中...';
+  $('#gateTip').innerText = '鐧诲綍涓�...';
   const v = ($('#gatePwd').value || '').trim();
-  if (!v) { $('#gateTip').innerText = '请输入 ADMIN_TOKEN'; return; }
+  if (!v) { $('#gateTip').innerText = '璇疯緭鍏� ADMIN_TOKEN'; return; }
   this.setToken(v);
-  const d = await API.listCached({ ttl: 10000 });
+  const d = await API.listCached({ ttl: 0, force: true });
   if (d && !d.error) {
     $('#gateTip').classList.add('ok');
-    $('#gateTip').innerText = '登录成功';
+    $('#gateTip').innerText = '鐧诲綍鎴愬姛';
     $('#gate').style.display='none';
     $('#app').style.display='block';
     App.init(d);
@@ -2687,15 +2993,14 @@ async check() {
   }
   this.clearToken();
   $('#gateTip').classList.remove('ok');
-  if (d && d.error === 'UNAUTHORIZED') $('#gateTip').innerText = '令牌错误';
-  else $('#gateTip').innerText = d?.error || '登录失败';
+  if (d && d.error === 'UNAUTHORIZED') $('#gateTip').innerText = '浠ょ墝閿欒';
+  else $('#gateTip').innerText = d?.error || '鐧诲綍澶辫触';
 },
-
 async boot() {
   this.bindEvents();
     const token = this.getToken();
     if (!token) { $('#gate').style.display='flex'; $('#app').style.display='none'; return; }
-    const d = await API.listCached({ ttl: 10000 });
+    const d = await API.listCached({ ttl: 0, force: true });
     if (d && !d.error) {
       $('#gate').style.display='none';
       $('#app').style.display='block';
@@ -2706,10 +3011,8 @@ async boot() {
       $('#app').style.display='none';
     }
   },
-
   logout() { this.clearToken(); location.reload(); }
 };
-
 const API = {
   _listCache: null,
   _listCacheAt: 0,
@@ -2718,21 +3021,17 @@ const API = {
     const headers = { 'Content-Type':'application/json' };
     const token = Gate.getToken();
     if (token) headers['Authorization'] = 'Bearer ' + token;
-
     let r;
     try {
       r = await fetch('/admin', { method:'POST', headers, body: JSON.stringify(data) });
     } catch {
-      return { error:'网络异常' };
+      return { error:'缃戠粶寮傚父' };
     }
-
     let d = {};
     try { d = await r.json(); } catch {}
-
     if (!r.ok) return { error: d.error || ('HTTP_' + r.status), status: r.status };
     return d;
   },
-  // 10秒内 list 防抖 + 并发去重
   async listCached({ ttl = 10000, force = false } = {}) {
     const now = Date.now();
     if (!force && this._listCache && (now - this._listCacheAt) < ttl) {
@@ -2768,7 +3067,7 @@ const App = {
   expandMap: new Set(),
   statusMap: {},
   editingOldName: null,
-  kThemePreset: 'emby_theme_preset',
+    kThemePreset: 'emby_theme_preset',
   kDensity: 'emby_density',
   kBg: 'emby_bg_cfg',
 async init(prefetchedList = null){
@@ -2792,20 +3091,17 @@ openTagSuggest(){
     this.setDensity(localStorage.getItem(this.kDensity) || 'compact', false);
     this.applyBg(this.getBgCfg());
   },
-
   setPreset(name, needToast=true){
     const p = PRESETS[name] || PRESETS.light;
     Object.keys(p).forEach(k=>document.documentElement.style.setProperty(k,p[k]));
     localStorage.setItem(this.kThemePreset,name);
-    if(needToast) this.toast('主题已切换','success');
+    if(needToast) this.toast('涓婚宸插垏鎹�','success');
   },
-
   quickTheme(){
     const cur = localStorage.getItem(this.kThemePreset) || 'light';
     const next = cur==='light' ? 'deepblue' : (cur==='deepblue' ? 'graphite' : 'light');
     this.setPreset(next,true);
   },
-
   setDensity(mode, needToast=true){
     const compact = mode !== 'cozy';
     document.documentElement.style.setProperty('--density-gap', compact?'12px':'16px');
@@ -2814,24 +3110,19 @@ openTagSuggest(){
     document.documentElement.style.setProperty('--density-label-size', compact?'16px':'17px');
     document.documentElement.style.setProperty('--density-mono-size', compact?'14px':'15px');
     localStorage.setItem(this.kDensity, compact?'compact':'cozy');
-    if(needToast) this.toast('密度已切换','success');
+    if(needToast) this.toast('瀵嗗害宸插垏鎹�','success');
   },
-
   getBgCfg(){ try{return JSON.parse(localStorage.getItem(this.kBg)||'{}');}catch{return {};} },
-
   applyBg(cfg){
     const url = String(cfg.url||'').trim();
     const brightness = Number(cfg.brightness ?? 100);
     const blur = Number(cfg.blur ?? 0);
     const overlay = Number(cfg.overlay ?? 20);
-
     document.documentElement.style.setProperty('--bg-brightness', brightness+'%');
     document.documentElement.style.setProperty('--bg-blur', blur+'px');
     document.documentElement.style.setProperty('--bg-overlay', String(overlay/100));
-
     $('#bgLayer').style.filter = 'brightness('+brightness+'%) blur('+blur+'px)';
     $('#bgOverlay').style.background = 'rgba(0,0,0,'+(Math.max(0,Math.min(80,overlay))/100)+')';
-
     if(url){
       $('#bgLayer').style.backgroundImage='url("'+url.replace(/"/g,'\\\\\\"')+'")';
       document.body.classList.add('has-bg');
@@ -2840,7 +3131,6 @@ openTagSuggest(){
       document.body.classList.remove('has-bg');
     }
   },
-
   openBgModal(){
     const cfg = this.getBgCfg();
     $('#bgUrl').value = cfg.url || '';
@@ -2850,7 +3140,6 @@ openTagSuggest(){
     this.refreshBgRangeText();
     this.openModal('bgModal');
   },
-
   bindBgRangePreview(){
     ['bgBrightness','bgBlur','bgOverlayRange'].forEach(id=>{
       const el = document.getElementById(id);
@@ -2866,13 +3155,11 @@ openTagSuggest(){
       });
     });
   },
-
   refreshBgRangeText(){
     $('#bgBrightnessVal').innerText = ($('#bgBrightness').value || 100)+'%';
     $('#bgBlurVal').innerText = ($('#bgBlur').value || 0)+'px';
     $('#bgOverlayVal').innerText = ($('#bgOverlayRange').value || 20)+'%';
   },
-
   saveBg(){
     const cfg = {
       url: ($('#bgUrl').value || '').trim(),
@@ -2882,20 +3169,19 @@ openTagSuggest(){
     };
     localStorage.setItem(this.kBg, JSON.stringify(cfg));
     this.applyBg(cfg);
-    this.toast('背景设置已保存','success');
+    this.toast('鑳屾櫙璁剧疆宸蹭繚瀛�','success');
     this.closeAllModals();
   },
-
   clearBg(){
     const cfg = this.getBgCfg();
     cfg.url = '';
     localStorage.setItem(this.kBg, JSON.stringify(cfg));
     this.applyBg(cfg);
-    this.toast('背景已清除','warn');
+    this.toast('鑳屾櫙宸叉竻闄�','warn');
   },
 applyListData(d){
   this.nodes = (d.nodes || []).map(n=>({ ...n, tag:n.tag||'', note:n.note||'' }));
-  $('#nodeCount').innerText = this.nodes.length + '个';
+  $('#nodeCount').innerText = this.nodes.length + '涓�';
   this.buildTagFilter();
   this.updateTagSuggestions();
   this.renderList();
@@ -2903,9 +3189,9 @@ applyListData(d){
   this.updateBatchBar();
 },
 async refresh(){
-  const d = await API.listCached({ ttl: 10000 });
+  const d = await API.listCached({ ttl: 0, force: true });
   if(d.error){
-    if (d.error === 'UNAUTHORIZED') { this.toast('登录失效，请重新登录','error'); Gate.logout(); return; }
+    if (d.error === 'UNAUTHORIZED') { this.toast('鐧诲綍澶辨晥锛岃閲嶆柊鐧诲綍','error'); Gate.logout(); return; }
     this.toast(d.error,'error');
     return;
   }
@@ -2916,19 +3202,17 @@ async refresh(){
     this.selectedTags = new Set([...this.selectedTags].filter(t => this.allTags.includes(t)));
     this.updateTagFilterBtn();
   },
-
   updateTagFilterBtn(){
     const btn = $('#tagFilterBtn');
     if(!btn) return;
-    if(this.selectedTags.size===0){ btn.textContent = '标签：全部'; return; }
+    if(this.selectedTags.size===0){ btn.textContent = '鏍囩锛氬叏閮�'; return; }
     const arr = [...this.selectedTags];
-    btn.textContent = arr.length===1 ? ('标签：' + arr[0]) : ('标签：' + arr[0] + ' +' + (arr.length-1));
+    btn.textContent = arr.length===1 ? ('鏍囩锛�' + arr[0]) : ('鏍囩锛�' + arr[0] + ' +' + (arr.length-1));
   },
-
   openTagPicker(){
     const box = $('#tagPickerList');
     if(!this.allTags.length){
-      box.innerHTML = '<div class="tag-empty">暂无标签</div>';
+      box.innerHTML = '<div class="tag-empty">鏆傛棤鏍囩</div>';
     }else{
       box.innerHTML = this.allTags.map((t)=>{
         const ck = this.selectedTags.has(t) ? 'checked' : '';
@@ -2937,7 +3221,6 @@ async refresh(){
     }
     this.openModal('tagPicker');
   },
-
   applyTagFilter(){
     const boxes = document.querySelectorAll('#tagPickerList input[type="checkbox"]');
     const set = new Set();
@@ -2948,7 +3231,6 @@ async refresh(){
     this.renderList();
     this.updateBatchBar();
   },
-
   clearTagFilter(){
     this.selectedTags.clear();
     this.updateTagFilterBtn();
@@ -2959,19 +3241,16 @@ async refresh(){
 updateTagSuggestions(){
   const dl = $('#tagSuggestions');
   if(!dl) return;
-
   const freq = new Map();
   this.nodes.forEach(n => {
     const t = (n.tag || '').trim();
     if (!t) return;
     freq.set(t, (freq.get(t) || 0) + 1);
   });
-
   const tags = [...freq.entries()]
     .sort((a,b)=>(b[1]-a[1]) || a[0].localeCompare(b[0], 'zh-CN'))
     .slice(0, 30)
     .map(x => x[0]);
-
   dl.innerHTML = tags.map(t => '<option value="'+this.escapeHtml(t)+'"></option>').join('');
 },
   getFiltered() {
@@ -2979,101 +3258,81 @@ updateTagSuggestions(){
   return this.nodes.filter((n) => {
     const tag = (n.tag || '').trim();
     const okTag = this.selectedTags.size === 0 || this.selectedTags.has(tag);
-
     const okText =
       !txt ||
       n.name.toLowerCase().includes(txt) ||
       (n.displayName || '').toLowerCase().includes(txt) ||
       (n.note || '').toLowerCase().includes(txt);
-
     return okTag && okText;
   });
 },
   filter(v){ this.filterText=v||''; this.renderList(); this.updateBatchBar(); },
   dragName: '',
-
   sortByOrder(arr) {
     return [...arr].sort((a, b) => {
       const af = !!a.fav, bf = !!b.fav;
-      if (af !== bf) return af ? -1 : 1; // 收藏置顶
+      if (af !== bf) return af ? -1 : 1; 
       const ar = Number.isFinite(a.rank) ? a.rank : 1e9;
       const br = Number.isFinite(b.rank) ? b.rank : 1e9;
       if (ar !== br) return ar - br;
-
       return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
     });
   },
-
 async moveOrder(dragName, targetName) {
   if (!dragName || !targetName || dragName === targetName) return;
-
   const all = this.sortByOrder(this.nodes).map(n => n.name);
   const from = all.indexOf(dragName);
   const to = all.indexOf(targetName);
   if (from < 0 || to < 0) return;
-
   all.splice(from, 1);
   all.splice(to, 0, dragName);
-
-  // 先本地即时更新（视觉上立即换位）
   const rankMap = new Map(all.map((name, i) => [name, i + 1]));
   this.nodes = this.nodes.map(n => ({ ...n, rank: rankMap.get(n.name) ?? n.rank }));
   this.renderList();
-
-  // 再写入后端
   const r = await API.req({ action: 'saveOrder', names: all });
   if (!r.success) {
-    this.toast(r.error || '保存排序失败', 'error');
-    await this.refresh(); // 回滚到后端真实状态
+    this.toast(r.error || '淇濆瓨鎺掑簭澶辫触', 'error');
+    await this.refresh(); 
     return;
   }
-
-  this.toast('排序已保存', 'success');
+  this.toast('鎺掑簭宸蹭繚瀛�', 'success');
 },
 bindCardDrag(card, name) {
   card.setAttribute('draggable', 'true');
-
   card.addEventListener('dragstart', (e) => {
     this.dragName = name;
     card.classList.add('dragging');
     try { e.dataTransfer.setData('text/plain', name); } catch {}
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
   });
-
   card.addEventListener('dragend', () => {
     this.dragName = '';
     card.classList.remove('dragging');
     document.querySelectorAll('.card.drag-over').forEach(el => el.classList.remove('drag-over'));
   });
-
   card.addEventListener('dragenter', (e) => {
     e.preventDefault();
     if (this.dragName && this.dragName !== name) card.classList.add('drag-over');
   });
-
   card.addEventListener('dragover', (e) => {
     e.preventDefault();
     if (this.dragName && this.dragName !== name) card.classList.add('drag-over');
   });
-
   card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
-
   card.addEventListener('drop', async (e) => {
     e.preventDefault();
     e.stopPropagation();
     card.classList.remove('drag-over');
-
     const drag = this.dragName || (e.dataTransfer ? e.dataTransfer.getData('text/plain') : '');
     if (!drag || drag === name) return;
-
     await this.moveOrder(drag, name);
   });
 },
   tagClass(tag){
     const t = (tag||'').toLowerCase();
-    if (t.includes('公益') || t.includes('公费')) return 'b-green';
-    if (t.includes('白名单')) return 'b-blue';
-    if (t.includes('机场')) return 'b-orange';
+    if (t.includes('鍏泭') || t.includes('鍏垂')) return 'b-green';
+    if (t.includes('鐧藉悕鍗�')) return 'b-blue';
+    if (t.includes('鏈哄満')) return 'b-orange';
     return 'b-gray';
   },
 isMobileOS(){
@@ -3082,19 +3341,16 @@ isMobileOS(){
   const isiOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   return isAndroid || isiOS;
 },
-
   statusText(name){
     const s = this.statusMap[name];
-    if(!s) return {cls:'unknown',txt:'未检测'};
-    if(s.online) return {cls:'online',txt:'在线 '+s.latency+'ms'};
-    return {cls:'offline',txt:'离线'};
+    if(!s) return {cls:'unknown',txt:'鏈娴�'};
+    if(s.online) return {cls:'online',txt:'鍦ㄧ嚎 '+s.latency+'ms'};
+    return {cls:'offline',txt:'绂荤嚎'};
   },
-
   escapeHtml(s){
     if(s==null) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
   },
-
   iconBtn(svg, title, onClick, extraStyle){
     const b = document.createElement('button');
     b.className = 'icon-btn';
@@ -3104,7 +3360,6 @@ isMobileOS(){
     b.addEventListener('click', onClick);
     return b;
   },
-
   parseServerInfoFromUrl(fullUrl){
     try{
       const u = new URL(fullUrl);
@@ -3117,17 +3372,62 @@ isMobileOS(){
       return null;
     }
   },
+  buildManualImportText(fullUrl, username, password){
+  const info = this.parseServerInfoFromUrl(fullUrl);
+  if (!info) return '';
+  const scheme = info.https ? 'https' : 'http';
+  const port = info.port;
+  const hasCustomPort =
+    (scheme === 'https' && Number(port) !== 443) ||
+    (scheme === 'http' && Number(port) !== 80);
+  const origin = scheme + '://' + info.host + (hasCustomPort ? (':' + String(port)) : '');
+  const pathOnly = info.path || '/';
+  const NL = String.fromCharCode(10);
+  return (
+    '鍦板潃: ' + origin + NL +
+    '鐢ㄦ埛鍚�: ' + String(username || '') + NL +
+    '瀵嗙爜: ' + String(password || '') + NL +
+    '璺緞: ' + pathOnly
+  );
+},
+  buildHillsImportUrls(fullUrl, username, password){
+  const info = this.parseServerInfoFromUrl(fullUrl);
+  if (!info) return null;
+  const scheme = info.https ? 'https' : 'http';
+  const port = info.port;
+  const pathOnly = info.path || '';
+  const normPath = pathOnly ? (pathOnly.startsWith('/') ? pathOnly : ('/' + pathOnly)) : '';
+  const hasCustomPort =
+    (scheme === 'https' && Number(port) !== 443) ||
+    (scheme === 'http' && Number(port) !== 80);
+  const origin = scheme + '://' + info.host + (hasCustomPort ? (':' + String(port)) : '');
+  const mobileQs = new URLSearchParams({
+    type: 'emby',
+    scheme: String(scheme || ''),
+    host: String(info.host || ''),
+    port: String(port || ''),
+    username: String(username || ''),
+    password: String(password || '')
+  });
+  const mobileUrl = 'hills://import?' + mobileQs.toString();
+  const windowsUrl =
+    'hills://import?type=emby' +
+    '&scheme=' + encodeURIComponent(String(scheme || '')) +
+    '&host=' + encodeURIComponent(String(info.host || '')) +
+    '&port=' + encodeURIComponent(String(port || '')) +
+    '&username=' + encodeURIComponent(String(username || '')) +
+    '&password=' + encodeURIComponent(String(password || ''));
+  return { mobileUrl, windowsUrl, pathOnly };
+},
 buildEmbyImportUrl(app, fullUrl, username, password){
   const info = this.parseServerInfoFromUrl(fullUrl);
   if (!info) return null;
-
   let scheme = info.https ? 'https' : 'http';
   let port = info.port;
   if (app === 'forward') {
     scheme = 'https';
     port = 443;
   }
-
   const qs = new URLSearchParams({
     type: 'emby',
     scheme: String(scheme || ''),
@@ -3136,12 +3436,10 @@ buildEmbyImportUrl(app, fullUrl, username, password){
     username: String(username || ''),
     password: String(password || '')
   });
-
   let prefix = '';
   if (app === 'hills') prefix = 'hills://import?';
   else if (app === 'forward') prefix = 'forward://import?';
   else return null;
-
   return {
     schemeUrl: prefix + qs.toString(),
     pathOnly: info.path || ''
@@ -3150,12 +3448,11 @@ buildEmbyImportUrl(app, fullUrl, username, password){
   openAppScheme(scheme){
     window.location.href = scheme;
   },
-showPathModal(pathOnly, appName, onOpen){
-  if (!pathOnly) { onOpen(); return; }
-
+showPathModal(text, appName, onOpen, opts = {}){
+  if (!text) { onOpen(); return; }
+  const isManual = !!opts.manual;
   const old = document.getElementById('pathModalMask');
   if (old) old.remove();
-
   const mask = document.createElement('div');
   mask.id = 'pathModalMask';
   mask.style.position = 'fixed';
@@ -3166,7 +3463,6 @@ showPathModal(pathOnly, appName, onOpen){
   mask.style.alignItems = 'center';
   mask.style.justifyContent = 'center';
   mask.style.padding = '16px';
-
   const box = document.createElement('div');
   box.style.width = 'min(92vw,420px)';
   box.style.background = 'var(--panel)';
@@ -3174,31 +3470,29 @@ showPathModal(pathOnly, appName, onOpen){
   box.style.border = '1px solid var(--line)';
   box.style.borderRadius = '14px';
   box.style.padding = '14px';
-
   const title = document.createElement('div');
   title.style.fontWeight = '700';
   title.style.marginBottom = '8px';
-  title.textContent = appName + ' 路径填写提示';
-
+  title.textContent = appName + (isManual ? ' 瀵煎叆淇℃伅鎻愮ず' : ' 璺緞濉啓鎻愮ず');
   const sub = document.createElement('div');
   sub.style.fontSize = '13px';
   sub.style.opacity = '.9';
   sub.style.marginBottom = '8px';
-  sub.textContent = '该播放器暂不支持自动写入 Path，请复制后粘贴到 Path：';
-
+  sub.textContent = isManual
+    ? '璇ユ挱鏀惧櫒鍙兘涓嶆敮鎸佽嚜鍔ㄥ鍏ワ紝璇峰鍒朵互涓嬩俊鎭墜鍔ㄥ～鍐欙細'
+    : '璇ユ挱鏀惧櫒鏆備笉鏀寔鑷姩鍐欏叆 Path锛岃澶嶅埗鍚庣矘璐村埌 Path锛�';
   const code = document.createElement('div');
   code.style.padding = '10px';
   code.style.border = '1px dashed #64748b';
   code.style.borderRadius = '10px';
   code.style.wordBreak = 'break-all';
+  code.style.whiteSpace = 'pre-wrap';
   code.style.marginBottom = '12px';
-  code.textContent = pathOnly;
-
+  code.textContent = text;
   const btnRow = document.createElement('div');
   btnRow.style.display = 'flex';
   btnRow.style.gap = '8px';
   btnRow.style.justifyContent = 'flex-end';
-
   function mkBtn(txt, primary){
     const b = document.createElement('button');
     b.textContent = txt;
@@ -3216,29 +3510,23 @@ showPathModal(pathOnly, appName, onOpen){
     }
     return b;
   }
-
-  const btnCancel = mkBtn('取消', false);
-  const btnCopy = mkBtn('复制路径', false);
-  const btnOpen = mkBtn('打开 ' + appName, true);
-
+  const btnCancel = mkBtn('鍙栨秷', false);
+  const btnCopy = mkBtn(isManual ? '澶嶅埗淇℃伅' : '澶嶅埗璺緞', false);
+  const btnOpen = mkBtn('鎵撳紑 ' + appName, true);
   const close = () => mask.remove();
-
   btnCancel.onclick = close;
   btnCopy.onclick = async () => {
-    try { await navigator.clipboard.writeText(pathOnly); } catch {}
-    this.toast('路径已复制：' + pathOnly, 'success');
+    try { await navigator.clipboard.writeText(text); } catch {}
+    this.toast(isManual ? '瀵煎叆淇℃伅宸插鍒�' : '璺緞宸插鍒讹細' + text, 'success');
   };
-btnOpen.onclick = () => {
-  close();
-  onOpen();
-};
-
+  btnOpen.onclick = () => {
+    close();
+    onOpen();
+  };
   mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
-
   btnRow.appendChild(btnCancel);
   btnRow.appendChild(btnCopy);
   btnRow.appendChild(btnOpen);
-
   box.appendChild(title);
   box.appendChild(sub);
   box.appendChild(code);
@@ -3246,87 +3534,159 @@ btnOpen.onclick = () => {
   mask.appendChild(box);
   document.body.appendChild(mask);
 },
-openWithPathModal(app, schemeUrl, pathOnly){
+openWithPathModal(app, schemeUrl, text, opts = {}){
   const nameMap = {
     sen: 'SenPlayer',
     epx: 'EPlayerX',
     hills: 'Hills',
+    rodel: '灏忓够(Win)',
     forward: 'Forward'
   };
   const appName = nameMap[app] || app;
-  this.showPathModal(pathOnly, appName, () => {
+  this.showPathModal(text, appName, () => {
     this.openAppScheme(schemeUrl);
-    this.toast('已打开 ' + appName + '，如需路径请粘贴到 Path', 'warn');
-  });
+    this.toast('宸叉墦寮€ ' + appName, 'success');
+  }, opts);
 },
-
-async quickAddThirdParty(app, fullUrl){
+buildPathQuery(pathOnly){
+  const p = String(pathOnly || '').trim();
+  if (!p) return '';
+  const norm = p.startsWith('/') ? p : ('/' + p);
+  const ep = encodeURIComponent(norm);
+  return '&path=' + ep + '&basePath=' + ep + '&serverPath=' + ep;
+},
+toggleEditorPass(){
+  const ip = $('#inPass');
+  const icon = $('#togglePassIcon');
+  if (!ip) return;
+  const show = ip.type === 'password';
+  ip.type = show ? 'text' : 'password';
+  if (icon) {
+    icon.innerHTML = show ? SVG.eyeOff : SVG.eye;
+  }
+  const btn = $('#togglePassBtn'); if (btn) btn.blur();
+},
+async quickAddThirdParty(app, node, fullUrl){
   const address = String(fullUrl || '').trim();
   if (!address) {
-    this.toast('缺少代理地址', 'error');
+    this.toast('缂哄皯浠ｇ悊鍦板潃', 'error');
     return;
   }
-
-  let base = address;
+  let origin = address;
+  let full = address;
   let pathOnly = '';
-
+  let host = '';
+  let port = '';
+  let scheme = '';
   try {
     const u = new URL(address);
-    base = u.origin; // 只保留协议+主机+端口
+    origin = u.origin;
+    full = u.origin + (u.pathname || '/');
     pathOnly = (u.pathname && u.pathname !== '/') ? u.pathname : '';
+    host = u.hostname || '';
+    scheme = (u.protocol || '').replace(':', '');
+    port = u.port || (u.protocol === 'https:' ? '443' : '80');
   } catch {}
-
-  // Sen / Epx：也弹用户名密码，并尝试通过 scheme 参数传入
-  if (app === 'sen' || app === 'epx') {
-    const user = prompt('请输入 Emby 用户名（可留空）', '') ?? null;
-    if (user === null) return;
-    const pass = prompt('请输入 Emby 密码（可留空）', '') ?? null;
-    if (pass === null) return;
-
-    const uName = encodeURIComponent(user.trim());
-    const pWord = encodeURIComponent(pass.trim());
-
-    if (app === 'sen') {
-      const url =
-        'senplayer://importserver?type=emby' +
-        '&address=' + encodeURIComponent(base) +
-        '&username=' + uName +
-        '&password=' + pWord;
-      this.openWithPathModal('sen', url, pathOnly);
-      return;
-    }
-
-    if (app === 'epx') {
-      const url =
-        'eplayerx://add-or-update?type=emby' +
-        '&href=' + encodeURIComponent(base) +
-        '&username=' + uName +
-        '&password=' + pWord;
-      this.openWithPathModal('epx', url, pathOnly);
-      return;
-    }
-  }
-
-  if (app === 'capy') {
-    const text = String(address || '').trim(); // 只复制代理地址
-    try { await navigator.clipboard.writeText(text); } catch {}
-    this.toast('已复制代理地址（Capy 请手动粘贴）', 'warn');
+  const userTrim = String((node && node.embyUser) || '').trim();
+  const passTrim = String((node && node.embyPass) || '').trim();
+  const uName = encodeURIComponent(userTrim);
+  const pWord = encodeURIComponent(passTrim);
+  const pqs = this.buildPathQuery(pathOnly);
+  if (app === 'sen') {
+    const url =
+      'senplayer://importserver?type=emby' +
+      '&address=' + encodeURIComponent(origin) +
+      '&username=' + uName +
+      '&password=' + pWord +
+      '&scheme=' + encodeURIComponent(scheme) +
+      '&host=' + encodeURIComponent(host) +
+      '&port=' + encodeURIComponent(String(port)) +
+      pqs;
+    this.openWithPathModal('sen', url, pathOnly);
     return;
   }
-
-  if (app === 'hills' || app === 'forward') {
-    const user = prompt('请输入 Emby 用户名（可留空）', '') ?? null;
-    if (user === null) return;
-    const pass = prompt('请输入 Emby 密码（可留空）', '') ?? null;
-    if (pass === null) return;
-
-    const built = this.buildEmbyImportUrl(app, address, user.trim(), pass.trim());
+  if (app === 'epx') {
+    const url =
+      'eplayerx://add-or-update?type=emby' +
+      '&href=' + encodeURIComponent(full) +
+      '&username=' + uName +
+      '&password=' + pWord +
+      '&scheme=' + encodeURIComponent(scheme) +
+      '&host=' + encodeURIComponent(host) +
+      '&port=' + encodeURIComponent(String(port)) +
+      pqs;
+    this.openWithPathModal('epx', url, pathOnly);
+    return;
+  }
+  if (app === 'capy') {
+    try { await navigator.clipboard.writeText(address); } catch {}
+    this.toast('宸插鍒朵唬鐞嗗湴鍧€锛圕apy 璇锋墜鍔ㄧ矘璐达級', 'warn');
+    return;
+  }
+ if (app === 'hills') {
+  const built = this.buildHillsImportUrls(address, userTrim, passTrim);
+  if (!built) {
+    this.toast('鐢熸垚 Hills 瀵煎叆閾炬帴澶辫触', 'error');
+    return;
+  }
+  const ua = (navigator.userAgent || '').toLowerCase();
+  const isWindows = ua.includes('windows nt');
+  const hillsUrl = isWindows ? built.windowsUrl : built.mobileUrl;
+  console.log('HILLS URL =>', hillsUrl);
+  if (isWindows) {
+    const manualText = this.buildManualImportText(address, userTrim, passTrim);
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(manualText);
+      copied = true;
+    } catch (e) {}
+    if (copied) {
+      this.toast('宸插鍒舵墜鍔ㄥ鍏ヤ俊鎭紙鍦板潃/鐢ㄦ埛鍚�/瀵嗙爜/璺緞锛�', 'warn');
+    } else {
+      this.toast('鍓创鏉胯娴忚鍣ㄦ嫤鎴紝宸插脊鍑烘墜鍔ㄥ鍒舵', 'warn');
+      window.prompt('璇峰鍒朵互涓嬪鍏ヤ俊鎭細', manualText);
+    }
+    this.openWithPathModal('hills', hillsUrl, manualText, { manual: true });
+    return;
+  }
+  this.openWithPathModal('hills', hillsUrl, built.pathOnly);
+  return;
+}
+  if (app === 'rodel') {
+    const built = this.buildHillsImportUrls(address, userTrim, passTrim);
     if (!built) {
-      this.toast('生成导入链接失败', 'error');
+      this.toast('鐢熸垚灏忓够瀵煎叆閾炬帴澶辫触', 'error');
       return;
     }
-
-    this.openWithPathModal(app, built.schemeUrl, built.pathOnly);
+    const rodelUrl = String(built.windowsUrl || '').replace('hills://', 'rodelplayer://');
+    const ua = (navigator.userAgent || '').toLowerCase();
+    const isWindows = ua.includes('windows nt');
+    if (isWindows) {
+      const manualText = this.buildManualImportText(address, userTrim, passTrim);
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(manualText);
+        copied = true;
+      } catch {}
+      if (copied) {
+        this.toast('宸插鍒舵墜鍔ㄥ鍏ヤ俊鎭紙鍦板潃/鐢ㄦ埛鍚�/瀵嗙爜/璺緞锛�', 'warn');
+      } else {
+        this.toast('鍓创鏉胯娴忚鍣ㄦ嫤鎴紝宸插脊鍑烘墜鍔ㄥ鍒舵', 'warn');
+        window.prompt('璇峰鍒朵互涓嬪鍏ヤ俊鎭細', manualText);
+      }
+      this.openWithPathModal('rodel', rodelUrl, manualText, { manual: true });
+      return;
+    }
+    this.openWithPathModal('rodel', rodelUrl, built.pathOnly);
+    return;
+  }
+  if (app === 'forward') {
+    const built = this.buildEmbyImportUrl(app, address, userTrim, passTrim);
+    if (!built) {
+      this.toast('鐢熸垚瀵煎叆閾炬帴澶辫触', 'error');
+      return;
+    }
+    this.openWithPathModal('forward', built.schemeUrl, built.pathOnly);
     return;
   }
 },
@@ -3338,31 +3698,29 @@ async quickAddThirdParty(app, fullUrl){
     }
     return keys;
   },
-
   areAllVisible() {
     const keys = this.getAllVisibilityKeys();
     if (!keys.length) return false;
     return keys.every(k => this.visibleMap.has(k));
   },
-
   updateGlobalVisibilityBtn() {
     const btn = document.getElementById('toggleAllVisBtn');
     if (!btn) return;
     const allVisible = this.areAllVisible();
     btn.innerHTML = allVisible
-      ? '<span class="state-dot on"></span>隐藏全部地址'
-      : '<span class="state-dot off"></span>显示全部地址';
+      ? '<span class="state-dot on"></span>闅愯棌鍏ㄩ儴鍦板潃'
+      : '<span class="state-dot off"></span>鏄剧ず鍏ㄩ儴鍦板潃';
   },
   toggleAllVisibility() {
     const keys = this.getAllVisibilityKeys();
-    if (!keys.length) return this.toast('暂无节点', 'warn');
+    if (!keys.length) return this.toast('鏆傛棤鑺傜偣', 'warn');
     const allVisible = keys.every(k => this.visibleMap.has(k));
     if (allVisible) {
       keys.forEach(k => this.visibleMap.delete(k));
-      this.toast('已隐藏全部节点地址', 'success');
+      this.toast('宸查殣钘忓叏閮ㄨ妭鐐瑰湴鍧€', 'success');
     } else {
       keys.forEach(k => this.visibleMap.add(k));
-      this.toast('已显示全部节点地址', 'success');
+      this.toast('宸叉樉绀哄叏閮ㄨ妭鐐瑰湴鍧€', 'success');
     }
     this.renderList();
   },
@@ -3376,7 +3734,7 @@ async quickAddThirdParty(app, fullUrl){
       empty.style.gridColumn = '1 / -1';
       empty.style.textAlign = 'center';
       empty.style.color = 'var(--muted)';
-      empty.textContent = '暂无节点';
+      empty.textContent = '鏆傛棤鑺傜偣';
       list.appendChild(empty);
       this.updateGlobalVisibilityBtn();
       return;
@@ -3421,7 +3779,7 @@ const badges = document.createElement('div');
 badges.className = 'badges';
 const bm = document.createElement('span');
 bm.className = 'badge b-mode-normal';
-bm.textContent = '反代';
+bm.textContent = '鍙嶄唬';
 badges.appendChild(bm);
 if ((n.tag || '').trim()) {
   const b1 = document.createElement('span');
@@ -3443,7 +3801,7 @@ const txt = document.createElement('span');
 txt.textContent = st.txt;
 status.appendChild(dot);
 status.appendChild(txt);
-status.appendChild(this.iconBtn(SVG.ping, '检测此节点', () => this.checkNode(n.name)));
+status.appendChild(this.iconBtn(SVG.ping, '妫€娴嬫鑺傜偣', () => this.checkNode(n.name)));
 info.appendChild(h3);
 info.appendChild(pathTip);
 info.appendChild(badges);
@@ -3453,298 +3811,401 @@ leftHead.appendChild(info);
 leftWrap.appendChild(leftHead);
       const actions = document.createElement('div');
 actions.className = 'actions';
-const btnFav = this.iconBtn(n.fav ? SVG.starOn : SVG.star, n.fav ? '取消收藏' : '收藏置顶', () => this.toggleFav(n.name));
+const btnFav = this.iconBtn(n.fav ? SVG.starOn : SVG.star, n.fav ? '鍙栨秷鏀惰棌' : '鏀惰棌缃《', () => this.toggleFav(n.name));
 if (n.fav) btnFav.classList.add('is-fav');
 actions.appendChild(btnFav);
-actions.appendChild(this.iconBtn(SVG.edit, '编辑', () => this.openEditor(n.name)));
-actions.appendChild(this.iconBtn(SVG.trash, '删除', () => this.del(n.name), 'color:#ef4444'));
-
+actions.appendChild(this.iconBtn(SVG.edit, '缂栬緫', () => this.openEditor(n.name)));
+actions.appendChild(this.iconBtn(SVG.trash, '鍒犻櫎', () => this.del(n.name), 'color:#ef4444'));
       row.appendChild(leftWrap);
       row.appendChild(actions);
       card.appendChild(row);
-
       const line1 = document.createElement('div');
       line1.className = 'line';
-      const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '目标地址';
+      const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '鐩爣鍦板潃';
       const v1 = document.createElement('div');
 v1.className = 'mono ' + (showTarget ? '' : 'muted');
 v1.textContent = showTarget ? (n.target || '') : '******';
-v1.title = '单击复制目标地址';
+v1.title = '鍗曞嚮澶嶅埗鐩爣鍦板潃';
 v1.addEventListener('click', () => {
-  if (!showTarget) return this.toast('请先显示目标地址', 'warn');
-  this.copyText(n.target || '', '已复制目标地址');
+  if (!showTarget) return this.toast('璇峰厛鏄剧ず鐩爣鍦板潃', 'warn');
+  this.copyText(n.target || '', '宸插鍒剁洰鏍囧湴鍧€');
 });
-
-const eye1 = this.iconBtn(showTarget ? SVG.eyeOff : SVG.eye, showTarget ? '隐藏目标地址' : '显示目标地址', () => this.toggleVisibility(kTarget));
+const eye1 = this.iconBtn(showTarget ? SVG.eyeOff : SVG.eye, showTarget ? '闅愯棌鐩爣鍦板潃' : '鏄剧ず鐩爣鍦板潃', () => this.toggleVisibility(kTarget));
 eye1.classList.add('eye-toggle', showTarget ? 'on' : 'off');
       line1.appendChild(l1); line1.appendChild(v1); line1.appendChild(eye1);
       line1.appendChild(document.createElement('span')); line1.appendChild(document.createElement('span'));
       card.appendChild(line1);
-
       const line2 = document.createElement('div');
       line2.className = 'line';
-      const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '代理地址';
+      const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '浠ｇ悊鍦板潃';
       const v2 = document.createElement('div');
 v2.className = 'mono ' + (showProxy ? '' : 'muted');
 v2.textContent = showProxy ? fullUrl : '******';
-v2.title = '单击复制代理地址';
+v2.title = '鍗曞嚮澶嶅埗浠ｇ悊鍦板潃';
 v2.addEventListener('click', () => {
-  if (!showProxy) return this.toast('请先显示代理地址', 'warn');
-  this.copyText(fullUrl, '已复制代理地址');
+  if (!showProxy) return this.toast('璇峰厛鏄剧ず浠ｇ悊鍦板潃', 'warn');
+  this.copyText(fullUrl, '宸插鍒朵唬鐞嗗湴鍧€');
 });
-
-const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
+const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '闅愯棌浠ｇ悊鍦板潃' : '鏄剧ず浠ｇ悊鍦板潃', () => this.toggleVisibility(kProxyVis));
 eye2.classList.add('eye-toggle', showProxy ? 'on' : 'off');
-      const c1 = this.iconBtn(SVG.copy, '复制普通', () => this.copyText(normalUrl, '已复制普通链接'));
-      const c2 = this.iconBtn(SVG.link, '复制完整', () => this.copyText(fullUrl, '已复制完整链接'));
+      const c1 = this.iconBtn(SVG.copy, '澶嶅埗鏅€�', () => this.copyText(normalUrl, '宸插鍒舵櫘閫氶摼鎺�'));
+      const c2 = this.iconBtn(SVG.link, '澶嶅埗瀹屾暣', () => this.copyText(fullUrl, '宸插鍒跺畬鏁撮摼鎺�'));
       line2.appendChild(l2); line2.appendChild(v2); line2.appendChild(eye2); line2.appendChild(c1); line2.appendChild(c2);
       card.appendChild(line2);
-
-      const sen = document.createElement('button');
-      sen.className = 'app-btn';
-      sen.innerText = 'Sen';
-      sen.title = 'SenPlayer 一键添加';
-      sen.addEventListener('click', () => this.quickAddThirdParty('sen', fullUrl));
-      const capy = document.createElement('button');
-      capy.className = 'app-btn capy';
-      capy.innerText = 'Capy';
-      capy.title = 'CapyPlayer 复制配置';
-      capy.addEventListener('click', () => this.quickAddThirdParty('capy', fullUrl));
-      const epx = document.createElement('button');
-      epx.className = 'app-btn';
-      epx.innerText = 'Epx';
-      epx.title = 'EPlayerX 一键添加';
-      epx.addEventListener('click', () => this.quickAddThirdParty('epx', fullUrl));
-      const hills = document.createElement('button');
+const sen = document.createElement('button');
+sen.className = 'app-btn';
+sen.innerText = 'Sen';
+sen.title = 'SenPlayer 涓€閿坊鍔�';
+sen.addEventListener('click', () => this.quickAddThirdParty('sen', n, fullUrl));
+const capy = document.createElement('button');
+capy.className = 'app-btn capy';
+capy.innerText = 'Capy';
+capy.title = 'CapyPlayer 澶嶅埗閰嶇疆';
+capy.addEventListener('click', () => this.quickAddThirdParty('capy', n, fullUrl));
+const epx = document.createElement('button');
+epx.className = 'app-btn';
+epx.innerText = 'Epx';
+epx.title = 'EPlayerX 涓€閿坊鍔�';
+epx.addEventListener('click', () => this.quickAddThirdParty('epx', n, fullUrl));
+const ua = (navigator.userAgent || '').toLowerCase();
+const isWindows = ua.includes('windows nt');
+const hills = document.createElement('button');
 hills.className = 'app-btn';
-hills.innerText = 'Hills';
-hills.title = 'Hills 一键导入';
-hills.addEventListener('click', () => this.quickAddThirdParty('hills', fullUrl));
+hills.innerText = isWindows ? 'Hills(Win)' : 'Hills';
+hills.title = isWindows ? 'Hills Windows 瀵煎叆' : 'Hills 涓€閿鍏�';
+hills.addEventListener('click', () => this.quickAddThirdParty('hills', n, fullUrl));
 const forward = document.createElement('button');
 forward.className = 'app-btn';
 forward.innerText = 'Forward';
-forward.title = 'Forward 一键导入';
-forward.addEventListener('click', () => this.quickAddThirdParty('forward', fullUrl));
+forward.title = 'Forward 涓€閿鍏�';
+forward.addEventListener('click', () => this.quickAddThirdParty('forward', n, fullUrl));
 const appRow = document.createElement('div');
 appRow.className = 'app-row';
-
 appRow.appendChild(sen);
 appRow.appendChild(capy);
 appRow.appendChild(epx);
 appRow.appendChild(hills);
+if (isWindows) {
+  const rodel = document.createElement('button');
+  rodel.className = 'app-btn';
+  rodel.innerText = '灏忓够(Win)';
+  rodel.title = '灏忓够鎾斁鍣� Windows 瀵煎叆';
+  rodel.addEventListener('click', () => this.quickAddThirdParty('rodel', n, fullUrl));
+  appRow.appendChild(rodel);
+}
 appRow.appendChild(forward);
-
-
 if (appRow.childElementCount > 0) {
   card.appendChild(appRow);
 }
       list.appendChild(card);
     }
-
-    // ✅ 这里加：非空列表时的底部轻提示
-    if (arr.length < 6) { // 想一直显示就去掉 if
+    if (arr.length < 6) { 
       const hint = document.createElement('div');
       hint.className = 'page-hint';
       hint.style.gridColumn = '1 / -1';
-      hint.textContent = '可点击右上 + 新增节点';
+      hint.textContent = '鍙偣鍑诲彸涓� + 鏂板鑺傜偣';
       list.appendChild(hint);
     }
-
     this.updateGlobalVisibilityBtn();
   },
-
-
   toggleSelect(name, checked){
     if(checked) this.selected.add(name); else this.selected.delete(name);
     this.updateBatchBar();
   },
-
   selectAllFiltered(){
     this.getFiltered().forEach(n=>this.selected.add(n.name));
     this.renderList();
     this.updateBatchBar();
-    this.toast('已全选当前筛选结果','success');
+    this.toast('宸插叏閫夊綋鍓嶇瓫閫夌粨鏋�','success');
   },
-
   clearSelection(){
     this.selected.clear();
     this.renderList();
     this.updateBatchBar();
   },
-
   updateBatchBar(){
     $('#selCount').innerText = String(this.selected.size);
     $('#batchBar').style.display = this.selected.size > 0 ? 'flex' : 'none';
   },
-
-  async applyBatchTag(){
-    const names = Array.from(this.selected);
-    const tag = ($('#batchTagInput').value || '').trim();
-    if(!names.length) return this.toast('请先选择节点','warn');
-    const r = await API.req({ action:'batchTag', names, tag });
-    if(r.success){ this.toast('批量标签已更新','success'); await this.refresh(); }
-    else this.toast(r.error || '批量标签失败','error');
+    async applyBatchCred(){
+    const names = Array.from(this.selected || []);
+    if (!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣', 'warn');
+    const user = prompt('鎵归噺璁剧疆鐢ㄦ埛鍚嶏紙鐣欑┖涓嶄慨鏀癸級', '');
+    if (user === null) return;
+    const pass = prompt('鎵归噺璁剧疆瀵嗙爜锛堢暀绌轰笉淇敼锛�', '');
+    if (pass === null) return;
+    const setUser = String(user || '').trim();
+    const setPass = String(pass || '').trim();
+    if (!setUser && !setPass) {
+      return this.toast('鐢ㄦ埛鍚嶅拰瀵嗙爜鑷冲皯濉啓涓€涓�', 'warn');
+    }
+    let ok = 0, fail = 0;
+    for (const name of names) {
+      const n = this.nodes.find(x => x.name === name);
+      if (!n) { fail++; continue; }
+      const payload = {
+        action: 'save',
+        oldName: n.name,
+        name: n.name,
+        displayName: n.displayName || '',
+        target: n.target || '',
+        mode: n.mode || 'split',
+        secret: n.secret || '',
+        tag: n.tag || '',
+        note: n.note || '',
+        rank: Number.isFinite(Number(n.rank)) ? Number(n.rank) : undefined,
+        fav: !!n.fav,
+        embyUser: setUser ? setUser : (n.embyUser || ''),
+        embyPass: setPass ? setPass : (n.embyPass || ''),
+        directExternal: !!n.directExternal
+      };
+      const r = await API.req(payload);
+      if (r && r.success && (!r.failed || r.failed === 0)) ok++;
+      else fail++;
+    }
+    API.clearListCache();
+    await this.refresh();
+    this.toast('鎵归噺璐﹀彿瀵嗙爜瀹屾垚锛氭垚鍔� ' + ok + '锛屽け璐� ' + fail, fail ? 'warn' : 'success');
   },
-
+  async clearBatchCred(){
+    const names = Array.from(this.selected || []);
+    if (!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣', 'warn');
+    if (!confirm('纭娓呯┖宸查€� ' + names.length + ' 涓妭鐐圭殑 Emby 璐﹀彿瀵嗙爜锛�')) return;
+    let ok = 0, fail = 0;
+    for (const name of names) {
+      const n = this.nodes.find(x => x.name === name);
+      if (!n) { fail++; continue; }
+      const payload = {
+        action: 'save',
+        oldName: n.name,
+        name: n.name,
+        displayName: n.displayName || '',
+        target: n.target || '',
+        mode: n.mode || 'split',
+        secret: n.secret || '',
+        tag: n.tag || '',
+        note: n.note || '',
+        rank: Number.isFinite(Number(n.rank)) ? Number(n.rank) : undefined,
+        fav: !!n.fav,
+        embyUser: '',
+        embyPass: '',
+        directExternal: !!n.directExternal
+      };
+      const r = await API.req(payload);
+      if (r && r.success && (!r.failed || r.failed === 0)) ok++;
+      else fail++;
+    }
+    API.clearListCache();
+    await this.refresh();
+    this.toast('娓呯┖璐﹀彿瀵嗙爜瀹屾垚锛氭垚鍔� ' + ok + '锛屽け璐� ' + fail, fail ? 'warn' : 'success');
+  },
   async batchDelete(){
     const names = Array.from(this.selected);
-    if(!names.length) return this.toast('请先选择节点','warn');
-    if(!confirm('确认删除选中节点（'+names.length+'）?')) return;
+    if(!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣','warn');
+    if(!confirm('纭鍒犻櫎閫変腑鑺傜偣锛�'+names.length+'锛�?')) return;
     const r = await API.req({ action:'batchDelete', names });
     if(r.success){
       this.selected.clear();
-      this.toast('已删除 '+(r.count||names.length)+' 个节点','success');
+      this.toast('宸插垹闄� '+(r.count||names.length)+' 涓妭鐐�','success');
       await this.refresh();
     }else{
-      this.toast(r.error || '批量删除失败','error');
+      this.toast(r.error || '鎵归噺鍒犻櫎澶辫触','error');
     }
   },
-
   async checkNode(name){
     const r = await API.req({ action:'checkStatus', names:[name] });
     if(r.success && r.results && r.results[0]){
       this.statusMap[name] = r.results[0];
       this.renderList();
-      this.toast(name + ': ' + (r.results[0].online ? ('在线 '+r.results[0].latency+'ms') : '离线'), r.results[0].online?'success':'warn');
+      this.toast(name + ': ' + (r.results[0].online ? ('鍦ㄧ嚎 '+r.results[0].latency+'ms') : '绂荤嚎'), r.results[0].online?'success':'warn');
     }else{
-      this.toast(r.error || '检测失败','error');
+      this.toast(r.error || '妫€娴嬪け璐�','error');
     }
   },
-
   async checkSelectedStatus(){
     const names = Array.from(this.selected);
-    if(!names.length) return this.toast('先选择节点再检测','warn');
+    if(!names.length) return this.toast('鍏堥€夋嫨鑺傜偣鍐嶆娴�','warn');
     const r = await API.req({ action:'checkStatus', names });
     if(r.success){
       (r.results || []).forEach(x=>{ this.statusMap[x.name] = x; });
       this.renderList();
-      this.toast('选中节点检测完成','success');
+      this.toast('閫変腑鑺傜偣妫€娴嬪畬鎴�','success');
     }else{
-      this.toast(r.error || '检测失败','error');
+      this.toast(r.error || '妫€娴嬪け璐�','error');
     }
   },
-
   async checkAllStatus(){
     const r = await API.req({ action:'checkStatus' });
     if(r.success){
       (r.results || []).forEach(x=>{ this.statusMap[x.name] = x; });
       this.renderList();
-      this.toast('全部节点检测完成','success');
+      this.toast('鍏ㄩ儴鑺傜偣妫€娴嬪畬鎴�','success');
     }else{
-      this.toast(r.error || '检测失败','error');
+      this.toast(r.error || '妫€娴嬪け璐�','error');
     }
   },
-
   openModal(id){
     $('#mask').style.display='block';
     $('#'+id).style.display='block';
   },
-
   closeAllModals(){
     $('#mask').style.display='none';
     ['editor','bgModal','tagPicker'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
   },
+splitTargetsText(v){
+  return String(v || '')
+    .split(/\\r?\\n|[;,锛岋紱|]+/g)
+    .map(s => s.trim())
+    .filter(Boolean);
+},
+ensureTargetRows(min = 1){
+  const list = $('#targetList');
+  if (!list) return;
+  while (list.children.length < min) this.addTargetInput('');
+},
+addTargetInput(val = ''){
+  const list = $('#targetList');
+  if (!list) return;
+  const input = document.createElement('input');
+  input.className = 'target-item';
+  input.placeholder = 'https://example.com';
+  input.value = String(val || '');
+  input.style.marginTop = '8px';
+  list.appendChild(input);
+},
+removeTargetInput(){
+  const list = $('#targetList');
+  if (!list) return;
+  if (list.children.length <= 1) return;
+  list.removeChild(list.lastElementChild);
+},
+setTargetInputsFromText(text){
+  const list = $('#targetList');
+  if (!list) return;
+  list.innerHTML = '';
+  const arr = this.splitTargetsText(text);
+  if (!arr.length) {
+  this.addTargetInput('');
+  return;
+}
+for (const t of arr) this.addTargetInput(t);
+this.ensureTargetRows(1);
+},
+collectTargetsText(){
+  const list = $('#targetList');
+  if (!list) return '';
+  const arr = [...list.querySelectorAll('input')]
+    .map(i => (i.value || '').trim())
+    .filter(Boolean);
+  return arr.join('\\n');
+},
 openEditor(name){
   this.editingOldName = '';
   this.currentMode = 'split';
-  $('#editorTitle').innerText = '新增节点';
+  $('#editorTitle').innerText = '鏂板鑺傜偣';
   $('#inName').value = '';
   $('#inDisplayName').value = '';
   $('#inTag').value = '';
   $('#inNote').value = '';
-  $('#inTarget').value = '';
+  this.setTargetInputsFromText('');
   $('#inSec').value = '';
-
+  $('#inUser').value = '';
+  $('#inPass').value = '';
+  $('#inDirectExternal').checked = false;
   if(name){
     const n = this.nodes.find(x=>x.name===name);
     if(n){
       this.editingOldName = n.name;
-      $('#editorTitle').innerText = '编辑节点';
+      $('#editorTitle').innerText = '缂栬緫鑺傜偣';
       $('#inName').value = n.name || '';
       $('#inDisplayName').value = n.displayName || '';
       $('#inTag').value = n.tag || '';
       $('#inNote').value = n.note || '';
-      $('#inTarget').value = n.target || '';
+      this.setTargetInputsFromText(n.target || '');
       $('#inSec').value = n.secret || '';
+      $('#inUser').value = n.embyUser || '';
+      $('#inPass').value = n.embyPass || '';
+      $('#inDirectExternal').checked = !!n.directExternal;
       this.currentMode = 'split';
     }
   }
-  const tagInput = $('#inTag');
+    const tagInput = $('#inTag');
   if (tagInput && !tagInput.dataset.autoSuggestBound) {
     tagInput.addEventListener('focus', () => this.openTagSuggest());
     tagInput.dataset.autoSuggestBound = '1';
   }
+  $('#inPass').type = 'password';
+const ticon = $('#togglePassIcon');
+if (ticon) ticon.innerHTML = SVG.eye;
+  this.ensureTargetRows(1);
   this.openModal('editor');
 },
-
 async save(){
   const name = ($('#inName').value || '').trim();
   const displayName = ($('#inDisplayName').value || '').trim();
   const tag = ($('#inTag').value || '').trim();
   const note = ($('#inNote').value || '').trim();
-  const target = ($('#inTarget').value || '').trim();
+  const target = this.collectTargetsText();
   const secret = ($('#inSec').value || '').trim();
-
-  if(!name || !target) return this.toast('请求路径和目标地址必填','warn');
-
+  const embyUser = ($('#inUser').value || '').trim();
+  const embyPass = ($('#inPass').value || '').trim();
+  const directExternal = !!$('#inDirectExternal').checked;
+  if(!name || !target) return this.toast('璇锋眰璺緞鍜岀洰鏍囧湴鍧€蹇呭～','warn');
   const lower = name.toLowerCase();
   const existed = this.nodes.some(x => String(x.name || '').toLowerCase() === lower);
   if (!this.editingOldName && existed) {
-    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
+    return this.toast('璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦紝璇锋崲涓€涓矾寰�', 'warn');
   }
   if (this.editingOldName && this.editingOldName.toLowerCase() !== lower && existed) {
-    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
+    return this.toast('璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦紝璇锋崲涓€涓矾寰�', 'warn');
   }
-
-  // 关键：编辑时把原 rank 带回去，避免保存后掉到列表最后
   const editingNode = this.editingOldName
-  ? this.nodes.find(x => String(x.name || '').toLowerCase() === String(this.editingOldName).toLowerCase())
-  : null;
-const rank = Number.isFinite(Number(editingNode?.rank)) ? Number(editingNode.rank) : undefined;
-const fav = !!editingNode?.fav; // 新增：编辑时保留收藏状态
+    ? this.nodes.find(x => String(x.name || '').toLowerCase() === String(this.editingOldName).toLowerCase())
+    : null;
+  const rank = Number.isFinite(Number(editingNode?.rank)) ? Number(editingNode.rank) : undefined;
+  const fav = !!editingNode?.fav;
   const mode = 'split';
   const r = await API.req({
-  action:'save',
-  name, displayName, target, mode,
-  secret, tag, note, rank, fav,   // 新增 fav
-  oldName: this.editingOldName || ''
-});
-  if(!r.success) return this.toast(r.error || '保存失败','error');
+    action:'save',
+    name, displayName, target, mode,
+    secret, tag, note, rank, fav,
+    embyUser, embyPass,
+    directExternal,
+    oldName: this.editingOldName || ''
+  });
+  if(!r.success) return this.toast(r.error || '淇濆瓨澶辫触','error');
   if (r.failed > 0 && Array.isArray(r.errors) && r.errors[0]) {
-    return this.toast('保存失败：' + r.errors[0].error, 'error');
+    return this.toast('淇濆瓨澶辫触锛�' + r.errors[0].error, 'error');
   }
-
   API.clearListCache();
   this.closeAllModals();
-  this.toast('保存成功','success');
+  this.toast('淇濆瓨鎴愬姛','success');
   await this.refresh();
 },
   async toggleFav(name){
   const r = await API.req({ action:'toggleFav', name });
-  if(!r.success) return this.toast(r.error || '操作失败','error');
-  API.clearListCache();   // 新增
+  if(!r.success) return this.toast(r.error || '鎿嶄綔澶辫触','error');
+  API.clearListCache();   
   await this.refresh();
 },
   async del(name){
-    if(!confirm('删除节点: '+name+' ?')) return;
+    if(!confirm('鍒犻櫎鑺傜偣: '+name+' ?')) return;
     const r = await API.req({ action:'delete', name });
     if(r.success){
       this.selected.delete(name);
-      this.toast('删除成功','success');
+      this.toast('鍒犻櫎鎴愬姛','success');
       await this.refresh();
     }else{
-      this.toast(r.error || '删除失败','error');
+      this.toast(r.error || '鍒犻櫎澶辫触','error');
     }
   },
-
   async exportData(){
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(this.nodes, null, 2)], { type:'application/json' }));
     a.download = 'nodes_ui.json';
     a.click();
-    this.toast('导出完成','success');
+    this.toast('瀵煎嚭瀹屾垚','success');
   },
-
   importFile(input){
     const file = input.files && input.files[0];
     if(!file) return;
@@ -3754,14 +4215,14 @@ const fav = !!editingNode?.fav; // 新增：编辑时保留收藏状态
         const nodes = JSON.parse(e.target.result);
         const r = await API.req({ action:'import', nodes });
         if(r.success){
-          if (r.failed > 0) this.toast('导入完成：成功 '+r.saved+'，失败 '+r.failed,'warn');
-          else this.toast('导入成功','success');
+          if (r.failed > 0) this.toast('瀵煎叆瀹屾垚锛氭垚鍔� '+r.saved+'锛屽け璐� '+r.failed,'warn');
+          else this.toast('瀵煎叆鎴愬姛','success');
           await this.refresh();
         } else {
-          this.toast(r.error || '导入失败','error');
+          this.toast(r.error || '瀵煎叆澶辫触','error');
         }
       }catch{
-        this.toast('导入文件格式错误','error');
+        this.toast('瀵煎叆鏂囦欢鏍煎紡閿欒','error');
       }finally{
         input.value='';
       }
@@ -3772,7 +4233,6 @@ toggleMenu(){
   const m = $('#menuPanel');
   const open = m.style.display !== 'block';
   m.style.display = open ? 'block' : 'none';
-
   if (open) {
     const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
     m.style.maxHeight = Math.max(220, Math.floor(vh * 0.72)) + 'px';
@@ -3783,19 +4243,17 @@ toggleMenu(){
     else this.visibleMap.add(k);
     this.renderList();
   },
-
   toggleExpand(k){
     if(this.expandMap.has(k)) this.expandMap.delete(k);
     else this.expandMap.add(k);
     this.renderList();
   },
-
   async copyText(text, msg){
     try{
       await navigator.clipboard.writeText(text);
-      this.toast(msg || '复制成功','success');
+      this.toast(msg || '澶嶅埗鎴愬姛','success');
     }catch{
-      this.toast('复制失败','error');
+      this.toast('澶嶅埗澶辫触','error');
     }
   },
   toast(text, type){
@@ -3807,31 +4265,30 @@ toggleMenu(){
     setTimeout(()=>el.remove(),2200);
   }
 };
-
 window.Gate = Gate;
 window.App = App;
 Gate.boot();
-
 </script>
-
-<div class="disclaimer">
-  <strong>免责声明：</strong>
-  本项目仅供学习与技术测试使用，请遵守当地法律法规。使用者对配置、转发内容与访问行为承担全部责任，开发者不对任何直接或间接损失负责。
+<div class="project-links">
+  <span class="label">椤圭洰鍦板潃锛�</span>
+  <a href="https://github.com/chenhr454/emby---worker" target="_blank" rel="noopener noreferrer">GitHub</a>
+  <span class="label">棰戦亾锛�</span>
+  <a href="https://t.me/+tdZEbQpmAktkZmY1" target="_blank" rel="noopener noreferrer">Telegram</a>
 </div>
-
+<div class="disclaimer">
+  <strong>鍏嶈矗澹版槑锛�</strong>
+  鏈」鐩粎渚涘涔犱笌鎶€鏈祴璇曚娇鐢紝璇烽伒瀹堝綋鍦版硶寰嬫硶瑙勩€備娇鐢ㄨ€呭閰嶇疆銆佽浆鍙戝唴瀹逛笌璁块棶琛屼负鎵挎媴鍏ㄩ儴璐ｄ换锛屽紑鍙戣€呬笉瀵逛换浣曠洿鎺ユ垨闂存帴鎹熷け璐熻矗銆�
+</div>
 </body>
 </html>`;
-
     return new Response(html, {
       headers: { "Content-Type": "text/html;charset=utf-8" },
     });
   },
 };
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (url.pathname === "/favicon.ico")
       return new Response("", { status: 204 });
     if (url.pathname === "/")
@@ -3839,7 +4296,6 @@ export default {
         status: 302,
         headers: { Location: "/admin" },
       });
-
     let segments = [];
     try {
       segments = url.pathname
@@ -3849,32 +4305,25 @@ export default {
     } catch {
       return new Response("Bad Request: invalid URL encoding", { status: 400 });
     }
-
     const root = segments[0];
-
-    // 管理后台
     if (root === "admin") {
       if (request.method === "POST") return Database.handleApi(request, env);
       return UI.renderAdmin();
     }
-    // 兼容旧短链：/{name}（admin）
     if (root && root !== "admin") {
       const nodeName = String(root || "")
         .trim()
         .toLowerCase();
-
       if (/^[a-z0-9_-]{1,32}$/i.test(nodeName)) {
         const nodeData = await Database.getNode(nodeName, env, ctx, "admin");
         if (nodeData) {
           const secret = nodeData.secret || "";
           let valid = true;
           let strip = 1;
-
           if (secret) {
             if (segments[1] === secret) strip = 2;
             else valid = false;
           }
-
           if (valid) {
             let remaining = "/" + segments.slice(strip).join("/");
             if (remaining === "/" && !url.pathname.endsWith("/")) {
@@ -3904,18 +4353,13 @@ export default {
     }
     const enableDirect = String(env.ENABLE_DIRECT_PROXY || "0") === "1";
     if (!enableDirect) return new Response("Node Not Found", { status: 404 });
-
-    // 不要用 segments.join("/")，会破坏 https://
     let directRaw = url.pathname.slice(1);
     try {
       directRaw = decodeURIComponent(directRaw);
     } catch {}
-
     const looksLikeHost =
       /^https?:\/\//i.test(directRaw) || /[.:]/.test(root || "");
     if (!looksLikeHost) return new Response("Node Not Found", { status: 404 });
-
     return ProxyHandler.handleDirect(request, directRaw, env);
   },
 };
-
