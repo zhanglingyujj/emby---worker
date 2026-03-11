@@ -229,7 +229,7 @@ const Auth = {
   check(request, env) {
     const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     const now = Date.now();
-    const win = 10 * 60 * 1000; // 10鍒嗛挓
+    const win = 10 * 60 * 1000; // 10分钟
     const maxFail = 20;
     let rec = GLOBALS.AuthFail.get(ip);
     if (!rec || now - rec.ts > win) rec = { n: 0, ts: now };
@@ -276,33 +276,33 @@ const Validators = {
     if (!this.NAME_RE.test(name)) {
       return {
         ok: false,
-        error: "name 闈炴硶锛氫粎鍏佽 a-z / 0-9 / _ / -锛岄暱搴� 1~32",
+        error: "name 非法：仅允许 a-z / 0-9 / _ / -，长度 1~32",
       };
     }
     return { ok: true, value: name };
   },
   splitTargets(v) {
     return String(v || "")
-      .split(/\r?\n|[;,锛岋紱|]+/g)
+      .split(/\r?\n|[;,，；|]+/g)
       .map((s) => s.trim())
       .filter(Boolean);
   },
   validateTarget(v) {
     const arr = this.splitTargets(v);
-    if (!arr.length) return { ok: false, error: "target 涓嶈兘涓虹┖" };
+    if (!arr.length) return { ok: false, error: "target 不能为空" };
     if (arr.length > 20)
-      return { ok: false, error: "target 鏁伴噺杩囧锛堟渶澶�20锛�" };
+      return { ok: false, error: "target 数量过多（最多20）" };
     const out = [];
     for (const t of arr) {
-      if (t.length > 2048) return { ok: false, error: "target 杩囬暱" };
+      if (t.length > 2048) return { ok: false, error: "target 过长" };
       try {
         const u = new URL(t);
         if (!/^https?:$/i.test(u.protocol)) {
-          return { ok: false, error: "target 鍙厑璁� http/https" };
+          return { ok: false, error: "target 只允许 http/https" };
         }
         out.push(t.replace(/\/+$/, ""));
       } catch {
-        return { ok: false, error: "target 涓嶆槸鍚堟硶 URL锛�" + t };
+        return { ok: false, error: "target 不是合法 URL：" + t };
       }
     }
     return { ok: true, value: [...new Set(out)].join("\n") };
@@ -312,7 +312,7 @@ const Validators = {
       .trim()
       .toLowerCase();
     if (m && m !== "normal" && m !== "split") {
-      return { ok: false, error: "mode 浠呮敮鎸� normal/split" };
+      return { ok: false, error: "mode 仅支持 normal/split" };
     }
     return { ok: true, value: m || "split" };
   },
@@ -321,7 +321,7 @@ const Validators = {
     if (!this.SECRET_RE.test(secret)) {
       return {
         ok: false,
-        error: "secret 闈炴硶锛氫笉鑳藉寘鍚� / ? # 鎴栫┖鐧藉瓧绗︼紝鏈€闀�128",
+        error: "secret 非法：不能包含 / ? # 或空白字符，最长128",
       };
     }
     return { ok: true, value: secret };
@@ -345,7 +345,7 @@ const Validators = {
   },
   validateNodeInput(n) {
     if (!n || typeof n !== "object" || Array.isArray(n)) {
-      return { ok: false, error: "鑺傜偣椤逛笉鏄璞�" };
+      return { ok: false, error: "节点项不是对象" };
     }
     const rn = this.validateName(n.name);
     if (!rn.ok) return { ok: false, error: rn.error };
@@ -614,7 +614,7 @@ const Database = {
     const kv = this.getKV(env);
     if (!kv) {
       return new Response(
-        JSON.stringify({ error: "D1鏈粦瀹�! 璇锋鏌� EMBY_D1 / D1 / DB" }),
+        JSON.stringify({ error: "D1未绑定! 请检查 EMBY_D1 / D1 / DB" }),
         {
           status: 500,
           headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -659,7 +659,7 @@ const Database = {
         const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
         const node = this.unpackNode(name, raw);
         if (!node) {
-          return new Response(JSON.stringify({ error: "鑺傜偣涓嶅瓨鍦�" }), {
+          return new Response(JSON.stringify({ error: "节点不存在" }), {
             status: 404,
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
@@ -702,7 +702,7 @@ const Database = {
       case "import": {
         const items = data.action === "save" ? [data] : data.nodes;
         if (!Array.isArray(items)) {
-          return new Response(JSON.stringify({ error: "nodes 蹇呴』涓烘暟缁�" }), {
+          return new Response(JSON.stringify({ error: "nodes 必须为数组" }), {
             status: 400,
             headers: { "Content-Type": "application/json;charset=utf-8" },
           });
@@ -726,14 +726,14 @@ const Database = {
             if (!oldName && exists) {
               errors.push({
                 name: n.name,
-                error: "璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦�",
+                error: "请求路径重复：该节点已存在",
               });
               continue;
             }
             if (oldName && oldName !== n.name && exists) {
               errors.push({
                 name: n.name,
-                error: "璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦�",
+                error: "请求路径重复：该节点已存在",
               });
               continue;
             }
@@ -986,7 +986,7 @@ const Database = {
     const hostMap = new Map();
     for (const n of nodes) {
       const targets = String(n?.target || "")
-        .split(/\r?\n|[;,锛岋紱|]+/g)
+        .split(/\r?\n|[;,，；|]+/g)
         .map((s) => s.trim())
         .filter(Boolean);
       for (const t of targets) {
@@ -1031,7 +1031,7 @@ const Database = {
 const ProxyHandler = {
   getNodeTargets(node) {
     return String(node?.target || "")
-      .split(/\r?\n|[;,锛岋紱|]+/g)
+      .split(/\r?\n|[;,，；|]+/g)
       .map((s) => s.trim())
       .filter(Boolean);
   },
@@ -2047,7 +2047,7 @@ const UI = {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Emby鍙嶄唬绠＄悊绯荤粺</title>
+<title>Emby反代管理系统</title>
 <style>
 :root{
   --bg:#f3f6fb;
@@ -2794,22 +2794,22 @@ button:hover,.btn:hover{
 <div id="bgOverlay"></div>
 <div id="gate" class="gate">
   <div class="gate-box">
-    <h3>绠＄悊鍛樼櫥褰�</h3>
-    <input id="gatePwd" type="password" placeholder="璇疯緭鍏� ADMIN_TOKEN" />
-<button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">杩涘叆闈㈡澘</button>
-    <div id="gateTip" class="tip">璇峰厛鍦� Worker 鐜鍙橀噺璁剧疆 ADMIN_TOKEN</div>
+    <h3>管理员登录</h3>
+    <input id="gatePwd" type="password" placeholder="请输入 ADMIN_TOKEN" />
+<button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">进入面板</button>
+    <div id="gateTip" class="tip">请先在 Worker 环境变量设置 ADMIN_TOKEN</div>
   </div>
 </div>
 <div id="app" style="display:none">
   <div class="wrap">
     <div class="top">
       <div class="title">
-  Emby鍙嶄唬绠＄悊绯荤粺
-  <small id="nodeCount">0涓�</small>
+  Emby反代管理系统
+  <small id="nodeCount">0个</small>
 </div>
       <div class="right-actions">
   <span class="top-ver">v1.3</span>
-  <button class="icon-btn" title="鍒囨崲涓婚" onclick="App.quickTheme()">
+  <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
         <div class="menu">
@@ -2817,103 +2817,103 @@ button:hover,.btn:hover{
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
           </button>
           <div id="menuPanel" class="menu-panel glass">
-            <button onclick="App.exportData()">瀵煎嚭閰嶇疆</button>
-            <button onclick="document.getElementById('fIn').click()">瀵煎叆閰嶇疆</button>
-            <button onclick="App.openBgModal()">鑳屾櫙楂樼骇璁剧疆</button>
-            <button onclick="App.setDensity('compact')">瀵嗗害锛氱揣鍑�</button>
-            <button onclick="App.setDensity('cozy')">瀵嗗害锛氳垝閫�</button>
-            <button onclick="App.setPreset('deepblue')">涓婚锛氭繁钃�</button>
-            <button onclick="App.setPreset('graphite')">涓婚锛氱煶澧�</button>
-            <button onclick="App.setPreset('light')">涓婚锛氭祬鐏�</button>
-            <button onclick="Gate.logout()">閫€鍑虹櫥褰�</button>
+            <button onclick="App.exportData()">导出配置</button>
+            <button onclick="document.getElementById('fIn').click()">导入配置</button>
+            <button onclick="App.openBgModal()">背景高级设置</button>
+            <button onclick="App.setDensity('compact')">密度：紧凑</button>
+            <button onclick="App.setDensity('cozy')">密度：舒适</button>
+            <button onclick="App.setPreset('deepblue')">主题：深蓝</button>
+            <button onclick="App.setPreset('graphite')">主题：石墨</button>
+            <button onclick="App.setPreset('light')">主题：浅灰</button>
+            <button onclick="Gate.logout()">退出登录</button>
             <input type="file" id="fIn" hidden accept=".json" onchange="App.importFile(this)">
           </div>
         </div>
       </div>
     </div>
     <div class="controls">
-      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">鏍囩锛氬叏閮�</button>
-<input id="searchInput" class="full-sm glass" placeholder="鎼滅储鑺傜偣鍚嶇О銆佸娉�..." oninput="App.filter(this.value)">
-      <button id="toggleAllVisBtn" class="glass" onclick="App.toggleAllVisibility()"><span class="state-dot off"></span>鏄剧ず鍏ㄩ儴鍦板潃</button>
-      <button id="btnCheckSel" class="glass" onclick="App.checkSelectedStatus()">妫€娴嬮€変腑</button>
-      <button id="btnCheckAll" class="glass" onclick="App.checkAllStatus()">妫€娴嬪叏閮�</button>
+      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">标签：全部</button>
+<input id="searchInput" class="full-sm glass" placeholder="搜索节点名称、备注..." oninput="App.filter(this.value)">
+      <button id="toggleAllVisBtn" class="glass" onclick="App.toggleAllVisibility()"><span class="state-dot off"></span>显示全部地址</button>
+      <button id="btnCheckSel" class="glass" onclick="App.checkSelectedStatus()">检测选中</button>
+      <button id="btnCheckAll" class="glass" onclick="App.checkAllStatus()">检测全部</button>
     </div>
     <div id="batchBar" class="batchbar glass">
-      <span class="small">宸查€� <b id="selCount">0</b> 椤�</span>
-      <button onclick="App.selectAllFiltered()">鍏ㄩ€夌瓫閫夌粨鏋�</button>
-      <button onclick="App.clearSelection()">娓呯┖閫夋嫨</button>
-      <input id="batchTagInput" placeholder="鎵归噺鏍囩锛堝 鍏泭鏈嶏級" />
-<button onclick="App.applyBatchTag()">鎵归噺鎵撴爣绛�</button>
-<button onclick="App.applyBatchCred()">鎵归噺璐﹀彿瀵嗙爜</button>
-<button style="color:#ef4444" onclick="App.clearBatchCred()">娓呯┖璐﹀彿瀵嗙爜</button>
-<button style="color:#ef4444" onclick="App.batchDelete()">鎵归噺鍒犻櫎</button>
+      <span class="small">已选 <b id="selCount">0</b> 项</span>
+      <button onclick="App.selectAllFiltered()">全选筛选结果</button>
+      <button onclick="App.clearSelection()">清空选择</button>
+      <input id="batchTagInput" placeholder="批量标签（如 公益服）" />
+<button onclick="App.applyBatchTag()">批量打标签</button>
+<button onclick="App.applyBatchCred()">批量账号密码</button>
+<button style="color:#ef4444" onclick="App.clearBatchCred()">清空账号密码</button>
+<button style="color:#ef4444" onclick="App.batchDelete()">批量删除</button>
     </div>
     <div id="list" class="grid"></div>
   </div>
-  <button class="fab" onclick="App.openEditor()">锛�</button>
+  <button class="fab" onclick="App.openEditor()">＋</button>
   <div id="mask" class="modal-mask" onclick="App.closeAllModals()"></div>
   <div id="editor" class="modal glass">
-<h3 id="editorTitle">鏂板鑺傜偣</h3>
-<div class="field-title"><span class="req">*</span> 璇锋眰璺緞锛堣嫳鏂囷級</div>
-<input id="inName" placeholder="璇疯緭鍏ュ敮涓€鑻辨枃璺緞锛坅-z0-9_-锛�1~32锛�">
-<div class="field-title">鏄剧ず鍚嶇О锛堝彲涓枃锛�</div>
-<input id="inDisplayName" placeholder="鑷畾涔�">
-<div class="field-title">鏍囩</div>
+<h3 id="editorTitle">新增节点</h3>
+<div class="field-title"><span class="req">*</span> 请求路径（英文）</div>
+<input id="inName" placeholder="请输入唯一英文路径（a-z0-9_-，1~32）">
+<div class="field-title">显示名称（可中文）</div>
+<input id="inDisplayName" placeholder="自定义">
+<div class="field-title">标签</div>
 <div class="tagbar">
-  <input id="inTag" list="tagSuggestions" placeholder="鏍囩锛堝 鍏垂鏈� / 鍏泭鏈� / 鐧藉悕鍗� / 绛夛級">
+  <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
 </div>
 <datalist id="tagSuggestions"></datalist>
-<input id="inNote" placeholder="澶囨敞锛堝 淇濆彿瑙勫垯 / 绛夛級">
-<div class="field-title"><span class="req">*</span> 鐩爣鍦板潃锛堝彲澶氫釜锛�</div>
+<input id="inNote" placeholder="备注（如 保号规则 / 等）">
+<div class="field-title"><span class="req">*</span> 目标地址（可多个）</div>
 <div id="targetList"></div>
 <div style="display:flex;gap:8px;margin-top:8px;">
 <div class="btn-row">
-<button type="button" class="btn btn-g" onclick="App.addTargetInput()">+ 娣诲姞鐩爣鍦板潃</button>
-<button type="button" class="btn btn-g" onclick="App.removeTargetInput()">- 鍒犻櫎涓€鏍�</button>
+<button type="button" class="btn btn-g" onclick="App.addTargetInput()">+ 添加目标地址</button>
+<button type="button" class="btn btn-g" onclick="App.removeTargetInput()">- 删除一栏</button>
 </div>
 </div>
-<input id="inSec" placeholder="瀵嗛挜璺緞锛堝彲閫夛紝涓嶈兘鍚� / ? #锛�">
-<div class="field-title">鎾斁绛栫暐</div>
+<input id="inSec" placeholder="密钥路径（可选，不能含 / ? #）">
+<div class="field-title">播放策略</div>
 <label class="check-row">
   <input id="inDirectExternal" type="checkbox">
-  <span>缃戠洏鎾斁鐩磋繛</span>
+  <span>网盘播放直连</span>
 </label>
 <div class="field-help">
-  寮€鍚悗锛岀綉鐩樺閾剧敱鎾斁鍣ㄧ洿鎺ヨ闂紙涓嶇粡 Worker 鍙嶄唬锛夛紝鍙兘鏇村揩浣嗗彈瀹㈡埛绔綉缁滃奖鍝嶃€�
+  开启后，网盘外链由播放器直接访问（不经 Worker 反代），可能更快但受客户端网络影响。
 </div>
-<div class="field-title">Emby 璐﹀彿锛堢敤浜庝竴閿鍏ワ級</div>
-<input id="inUser" placeholder="鐢ㄦ埛鍚嶏紙鍙暀绌猴級">
+<div class="field-title">Emby 账号（用于一键导入）</div>
+<input id="inUser" placeholder="用户名（可留空）">
 <div class="pass-wrap">
-  <input id="inPass" type="password" placeholder="瀵嗙爜锛堝彲鐣欑┖锛�">
-  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="鏄剧ず/闅愯棌瀵嗙爜">
+  <input id="inPass" type="password" placeholder="密码（可留空）">
+  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="显示/隐藏密码">
   <span id="togglePassIcon"></span>
 </button>
 </div>
 <div class="btns">
-  <button class="btn btn-g" onclick="App.closeAllModals()">鍙栨秷</button>
-  <button class="btn btn-p" onclick="App.save()">淇濆瓨</button>
+  <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
+  <button class="btn btn-p" onclick="App.save()">保存</button>
 </div>
   </div>
   <div id="tagPicker" class="modal glass">
-    <h3>鏍囩澶氶€夌瓫閫�</h3>
+    <h3>标签多选筛选</h3>
     <div id="tagPickerList" class="tag-list"></div>
     <div class="btns">
-      <button class="btn btn-g" onclick="App.clearTagFilter()">娓呯┖</button>
-      <button class="btn btn-g" onclick="App.closeAllModals()">鍙栨秷</button>
-      <button class="btn btn-p" onclick="App.applyTagFilter()">搴旂敤</button>
+      <button class="btn btn-g" onclick="App.clearTagFilter()">清空</button>
+      <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
+      <button class="btn btn-p" onclick="App.applyTagFilter()">应用</button>
     </div>
   </div>
   <div id="bgModal" class="modal glass">
-    <h3>鑳屾櫙楂樼骇璁剧疆</h3>
-    <input id="bgUrl" placeholder="鑳屾櫙鍥綰RL锛坔ttps://...锛�">
-    <div class="range"><label>浜害</label><input id="bgBrightness" type="range" min="40" max="140" step="1"><span id="bgBrightnessVal">100%</span></div>
-    <div class="range"><label>妯＄硦</label><input id="bgBlur" type="range" min="0" max="20" step="1"><span id="bgBlurVal">0px</span></div>
-    <div class="range"><label>閬僵</label><input id="bgOverlayRange" type="range" min="0" max="80" step="1"><span id="bgOverlayVal">20%</span></div>
-    <div class="small">寤鸿锛氭繁鑹蹭富棰� + 浜害 75~90 + 妯＄硦 4~8</div>
+    <h3>背景高级设置</h3>
+    <input id="bgUrl" placeholder="背景图URL（https://...）">
+    <div class="range"><label>亮度</label><input id="bgBrightness" type="range" min="40" max="140" step="1"><span id="bgBrightnessVal">100%</span></div>
+    <div class="range"><label>模糊</label><input id="bgBlur" type="range" min="0" max="20" step="1"><span id="bgBlurVal">0px</span></div>
+    <div class="range"><label>遮罩</label><input id="bgOverlayRange" type="range" min="0" max="80" step="1"><span id="bgOverlayVal">20%</span></div>
+    <div class="small">建议：深色主题 + 亮度 75~90 + 模糊 4~8</div>
     <div class="btns">
-      <button class="btn btn-g" onclick="App.clearBg()">娓呴櫎鑳屾櫙</button>
-      <button class="btn btn-g" onclick="App.closeAllModals()">鍏抽棴</button>
-      <button class="btn btn-p" onclick="App.saveBg()">淇濆瓨鑳屾櫙璁剧疆</button>
+      <button class="btn btn-g" onclick="App.clearBg()">清除背景</button>
+      <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
+      <button class="btn btn-p" onclick="App.saveBg()">保存背景设置</button>
     </div>
   </div>
   <div id="toastWrap" class="toast-wrap"></div>
@@ -2978,14 +2978,14 @@ bindEvents() {
 },
 async check() {
   $('#gateTip').classList.remove('ok');
-  $('#gateTip').innerText = '鐧诲綍涓�...';
+  $('#gateTip').innerText = '登录中...';
   const v = ($('#gatePwd').value || '').trim();
-  if (!v) { $('#gateTip').innerText = '璇疯緭鍏� ADMIN_TOKEN'; return; }
+  if (!v) { $('#gateTip').innerText = '请输入 ADMIN_TOKEN'; return; }
   this.setToken(v);
   const d = await API.listCached({ ttl: 0, force: true });
   if (d && !d.error) {
     $('#gateTip').classList.add('ok');
-    $('#gateTip').innerText = '鐧诲綍鎴愬姛';
+    $('#gateTip').innerText = '登录成功';
     $('#gate').style.display='none';
     $('#app').style.display='block';
     App.init(d);
@@ -2993,8 +2993,8 @@ async check() {
   }
   this.clearToken();
   $('#gateTip').classList.remove('ok');
-  if (d && d.error === 'UNAUTHORIZED') $('#gateTip').innerText = '浠ょ墝閿欒';
-  else $('#gateTip').innerText = d?.error || '鐧诲綍澶辫触';
+  if (d && d.error === 'UNAUTHORIZED') $('#gateTip').innerText = '令牌错误';
+  else $('#gateTip').innerText = d?.error || '登录失败';
 },
 async boot() {
   this.bindEvents();
@@ -3025,7 +3025,7 @@ const API = {
     try {
       r = await fetch('/admin', { method:'POST', headers, body: JSON.stringify(data) });
     } catch {
-      return { error:'缃戠粶寮傚父' };
+      return { error:'网络异常' };
     }
     let d = {};
     try { d = await r.json(); } catch {}
@@ -3095,7 +3095,7 @@ openTagSuggest(){
     const p = PRESETS[name] || PRESETS.light;
     Object.keys(p).forEach(k=>document.documentElement.style.setProperty(k,p[k]));
     localStorage.setItem(this.kThemePreset,name);
-    if(needToast) this.toast('涓婚宸插垏鎹�','success');
+    if(needToast) this.toast('主题已切换','success');
   },
   quickTheme(){
     const cur = localStorage.getItem(this.kThemePreset) || 'light';
@@ -3110,7 +3110,7 @@ openTagSuggest(){
     document.documentElement.style.setProperty('--density-label-size', compact?'16px':'17px');
     document.documentElement.style.setProperty('--density-mono-size', compact?'14px':'15px');
     localStorage.setItem(this.kDensity, compact?'compact':'cozy');
-    if(needToast) this.toast('瀵嗗害宸插垏鎹�','success');
+    if(needToast) this.toast('密度已切换','success');
   },
   getBgCfg(){ try{return JSON.parse(localStorage.getItem(this.kBg)||'{}');}catch{return {};} },
   applyBg(cfg){
@@ -3169,7 +3169,7 @@ openTagSuggest(){
     };
     localStorage.setItem(this.kBg, JSON.stringify(cfg));
     this.applyBg(cfg);
-    this.toast('鑳屾櫙璁剧疆宸蹭繚瀛�','success');
+    this.toast('背景设置已保存','success');
     this.closeAllModals();
   },
   clearBg(){
@@ -3177,11 +3177,11 @@ openTagSuggest(){
     cfg.url = '';
     localStorage.setItem(this.kBg, JSON.stringify(cfg));
     this.applyBg(cfg);
-    this.toast('鑳屾櫙宸叉竻闄�','warn');
+    this.toast('背景已清除','warn');
   },
 applyListData(d){
   this.nodes = (d.nodes || []).map(n=>({ ...n, tag:n.tag||'', note:n.note||'' }));
-  $('#nodeCount').innerText = this.nodes.length + '涓�';
+  $('#nodeCount').innerText = this.nodes.length + '个';
   this.buildTagFilter();
   this.updateTagSuggestions();
   this.renderList();
@@ -3191,7 +3191,7 @@ applyListData(d){
 async refresh(){
   const d = await API.listCached({ ttl: 0, force: true });
   if(d.error){
-    if (d.error === 'UNAUTHORIZED') { this.toast('鐧诲綍澶辨晥锛岃閲嶆柊鐧诲綍','error'); Gate.logout(); return; }
+    if (d.error === 'UNAUTHORIZED') { this.toast('登录失效，请重新登录','error'); Gate.logout(); return; }
     this.toast(d.error,'error');
     return;
   }
@@ -3205,14 +3205,14 @@ async refresh(){
   updateTagFilterBtn(){
     const btn = $('#tagFilterBtn');
     if(!btn) return;
-    if(this.selectedTags.size===0){ btn.textContent = '鏍囩锛氬叏閮�'; return; }
+    if(this.selectedTags.size===0){ btn.textContent = '标签：全部'; return; }
     const arr = [...this.selectedTags];
-    btn.textContent = arr.length===1 ? ('鏍囩锛�' + arr[0]) : ('鏍囩锛�' + arr[0] + ' +' + (arr.length-1));
+    btn.textContent = arr.length===1 ? ('标签：' + arr[0]) : ('标签：' + arr[0] + ' +' + (arr.length-1));
   },
   openTagPicker(){
     const box = $('#tagPickerList');
     if(!this.allTags.length){
-      box.innerHTML = '<div class="tag-empty">鏆傛棤鏍囩</div>';
+      box.innerHTML = '<div class="tag-empty">暂无标签</div>';
     }else{
       box.innerHTML = this.allTags.map((t)=>{
         const ck = this.selectedTags.has(t) ? 'checked' : '';
@@ -3291,11 +3291,11 @@ async moveOrder(dragName, targetName) {
   this.renderList();
   const r = await API.req({ action: 'saveOrder', names: all });
   if (!r.success) {
-    this.toast(r.error || '淇濆瓨鎺掑簭澶辫触', 'error');
+    this.toast(r.error || '保存排序失败', 'error');
     await this.refresh(); 
     return;
   }
-  this.toast('鎺掑簭宸蹭繚瀛�', 'success');
+  this.toast('排序已保存', 'success');
 },
 bindCardDrag(card, name) {
   card.setAttribute('draggable', 'true');
@@ -3330,9 +3330,9 @@ bindCardDrag(card, name) {
 },
   tagClass(tag){
     const t = (tag||'').toLowerCase();
-    if (t.includes('鍏泭') || t.includes('鍏垂')) return 'b-green';
-    if (t.includes('鐧藉悕鍗�')) return 'b-blue';
-    if (t.includes('鏈哄満')) return 'b-orange';
+    if (t.includes('公益') || t.includes('公费')) return 'b-green';
+    if (t.includes('白名单')) return 'b-blue';
+    if (t.includes('机场')) return 'b-orange';
     return 'b-gray';
   },
 isMobileOS(){
@@ -3343,9 +3343,9 @@ isMobileOS(){
 },
   statusText(name){
     const s = this.statusMap[name];
-    if(!s) return {cls:'unknown',txt:'鏈娴�'};
-    if(s.online) return {cls:'online',txt:'鍦ㄧ嚎 '+s.latency+'ms'};
-    return {cls:'offline',txt:'绂荤嚎'};
+    if(!s) return {cls:'unknown',txt:'未检测'};
+    if(s.online) return {cls:'online',txt:'在线 '+s.latency+'ms'};
+    return {cls:'offline',txt:'离线'};
   },
   escapeHtml(s){
     if(s==null) return '';
@@ -3384,10 +3384,10 @@ isMobileOS(){
   const pathOnly = info.path || '/';
   const NL = String.fromCharCode(10);
   return (
-    '鍦板潃: ' + origin + NL +
-    '鐢ㄦ埛鍚�: ' + String(username || '') + NL +
-    '瀵嗙爜: ' + String(password || '') + NL +
-    '璺緞: ' + pathOnly
+    '地址: ' + origin + NL +
+    '用户名: ' + String(username || '') + NL +
+    '密码: ' + String(password || '') + NL +
+    '路径: ' + pathOnly
   );
 },
   buildHillsImportUrls(fullUrl, username, password){
@@ -3473,14 +3473,14 @@ showPathModal(text, appName, onOpen, opts = {}){
   const title = document.createElement('div');
   title.style.fontWeight = '700';
   title.style.marginBottom = '8px';
-  title.textContent = appName + (isManual ? ' 瀵煎叆淇℃伅鎻愮ず' : ' 璺緞濉啓鎻愮ず');
+  title.textContent = appName + (isManual ? ' 导入信息提示' : ' 路径填写提示');
   const sub = document.createElement('div');
   sub.style.fontSize = '13px';
   sub.style.opacity = '.9';
   sub.style.marginBottom = '8px';
   sub.textContent = isManual
-    ? '璇ユ挱鏀惧櫒鍙兘涓嶆敮鎸佽嚜鍔ㄥ鍏ワ紝璇峰鍒朵互涓嬩俊鎭墜鍔ㄥ～鍐欙細'
-    : '璇ユ挱鏀惧櫒鏆備笉鏀寔鑷姩鍐欏叆 Path锛岃澶嶅埗鍚庣矘璐村埌 Path锛�';
+    ? '该播放器可能不支持自动导入，请复制以下信息手动填写：'
+    : '该播放器暂不支持自动写入 Path，请复制后粘贴到 Path：';
   const code = document.createElement('div');
   code.style.padding = '10px';
   code.style.border = '1px dashed #64748b';
@@ -3510,14 +3510,14 @@ showPathModal(text, appName, onOpen, opts = {}){
     }
     return b;
   }
-  const btnCancel = mkBtn('鍙栨秷', false);
-  const btnCopy = mkBtn(isManual ? '澶嶅埗淇℃伅' : '澶嶅埗璺緞', false);
-  const btnOpen = mkBtn('鎵撳紑 ' + appName, true);
+  const btnCancel = mkBtn('取消', false);
+  const btnCopy = mkBtn(isManual ? '复制信息' : '复制路径', false);
+  const btnOpen = mkBtn('打开 ' + appName, true);
   const close = () => mask.remove();
   btnCancel.onclick = close;
   btnCopy.onclick = async () => {
     try { await navigator.clipboard.writeText(text); } catch {}
-    this.toast(isManual ? '瀵煎叆淇℃伅宸插鍒�' : '璺緞宸插鍒讹細' + text, 'success');
+    this.toast(isManual ? '导入信息已复制' : '路径已复制：' + text, 'success');
   };
   btnOpen.onclick = () => {
     close();
@@ -3539,13 +3539,13 @@ openWithPathModal(app, schemeUrl, text, opts = {}){
     sen: 'SenPlayer',
     epx: 'EPlayerX',
     hills: 'Hills',
-    rodel: '灏忓够(Win)',
+    rodel: '小幻(Win)',
     forward: 'Forward'
   };
   const appName = nameMap[app] || app;
   this.showPathModal(text, appName, () => {
     this.openAppScheme(schemeUrl);
-    this.toast('宸叉墦寮€ ' + appName, 'success');
+    this.toast('已打开 ' + appName, 'success');
   }, opts);
 },
 buildPathQuery(pathOnly){
@@ -3569,7 +3569,7 @@ toggleEditorPass(){
 async quickAddThirdParty(app, node, fullUrl){
   const address = String(fullUrl || '').trim();
   if (!address) {
-    this.toast('缂哄皯浠ｇ悊鍦板潃', 'error');
+    this.toast('缺少代理地址', 'error');
     return;
   }
   let origin = address;
@@ -3620,13 +3620,13 @@ async quickAddThirdParty(app, node, fullUrl){
   }
   if (app === 'capy') {
     try { await navigator.clipboard.writeText(address); } catch {}
-    this.toast('宸插鍒朵唬鐞嗗湴鍧€锛圕apy 璇锋墜鍔ㄧ矘璐达級', 'warn');
+    this.toast('已复制代理地址（Capy 请手动粘贴）', 'warn');
     return;
   }
  if (app === 'hills') {
   const built = this.buildHillsImportUrls(address, userTrim, passTrim);
   if (!built) {
-    this.toast('鐢熸垚 Hills 瀵煎叆閾炬帴澶辫触', 'error');
+    this.toast('生成 Hills 导入链接失败', 'error');
     return;
   }
   const ua = (navigator.userAgent || '').toLowerCase();
@@ -3641,10 +3641,10 @@ async quickAddThirdParty(app, node, fullUrl){
       copied = true;
     } catch (e) {}
     if (copied) {
-      this.toast('宸插鍒舵墜鍔ㄥ鍏ヤ俊鎭紙鍦板潃/鐢ㄦ埛鍚�/瀵嗙爜/璺緞锛�', 'warn');
+      this.toast('已复制手动导入信息（地址/用户名/密码/路径）', 'warn');
     } else {
-      this.toast('鍓创鏉胯娴忚鍣ㄦ嫤鎴紝宸插脊鍑烘墜鍔ㄥ鍒舵', 'warn');
-      window.prompt('璇峰鍒朵互涓嬪鍏ヤ俊鎭細', manualText);
+      this.toast('剪贴板被浏览器拦截，已弹出手动复制框', 'warn');
+      window.prompt('请复制以下导入信息：', manualText);
     }
     this.openWithPathModal('hills', hillsUrl, manualText, { manual: true });
     return;
@@ -3655,7 +3655,7 @@ async quickAddThirdParty(app, node, fullUrl){
   if (app === 'rodel') {
     const built = this.buildHillsImportUrls(address, userTrim, passTrim);
     if (!built) {
-      this.toast('鐢熸垚灏忓够瀵煎叆閾炬帴澶辫触', 'error');
+      this.toast('生成小幻导入链接失败', 'error');
       return;
     }
     const rodelUrl = String(built.windowsUrl || '').replace('hills://', 'rodelplayer://');
@@ -3669,10 +3669,10 @@ async quickAddThirdParty(app, node, fullUrl){
         copied = true;
       } catch {}
       if (copied) {
-        this.toast('宸插鍒舵墜鍔ㄥ鍏ヤ俊鎭紙鍦板潃/鐢ㄦ埛鍚�/瀵嗙爜/璺緞锛�', 'warn');
+        this.toast('已复制手动导入信息（地址/用户名/密码/路径）', 'warn');
       } else {
-        this.toast('鍓创鏉胯娴忚鍣ㄦ嫤鎴紝宸插脊鍑烘墜鍔ㄥ鍒舵', 'warn');
-        window.prompt('璇峰鍒朵互涓嬪鍏ヤ俊鎭細', manualText);
+        this.toast('剪贴板被浏览器拦截，已弹出手动复制框', 'warn');
+        window.prompt('请复制以下导入信息：', manualText);
       }
       this.openWithPathModal('rodel', rodelUrl, manualText, { manual: true });
       return;
@@ -3683,7 +3683,7 @@ async quickAddThirdParty(app, node, fullUrl){
   if (app === 'forward') {
     const built = this.buildEmbyImportUrl(app, address, userTrim, passTrim);
     if (!built) {
-      this.toast('鐢熸垚瀵煎叆閾炬帴澶辫触', 'error');
+      this.toast('生成导入链接失败', 'error');
       return;
     }
     this.openWithPathModal('forward', built.schemeUrl, built.pathOnly);
@@ -3708,19 +3708,19 @@ async quickAddThirdParty(app, node, fullUrl){
     if (!btn) return;
     const allVisible = this.areAllVisible();
     btn.innerHTML = allVisible
-      ? '<span class="state-dot on"></span>闅愯棌鍏ㄩ儴鍦板潃'
-      : '<span class="state-dot off"></span>鏄剧ず鍏ㄩ儴鍦板潃';
+      ? '<span class="state-dot on"></span>隐藏全部地址'
+      : '<span class="state-dot off"></span>显示全部地址';
   },
   toggleAllVisibility() {
     const keys = this.getAllVisibilityKeys();
-    if (!keys.length) return this.toast('鏆傛棤鑺傜偣', 'warn');
+    if (!keys.length) return this.toast('暂无节点', 'warn');
     const allVisible = keys.every(k => this.visibleMap.has(k));
     if (allVisible) {
       keys.forEach(k => this.visibleMap.delete(k));
-      this.toast('宸查殣钘忓叏閮ㄨ妭鐐瑰湴鍧€', 'success');
+      this.toast('已隐藏全部节点地址', 'success');
     } else {
       keys.forEach(k => this.visibleMap.add(k));
-      this.toast('宸叉樉绀哄叏閮ㄨ妭鐐瑰湴鍧€', 'success');
+      this.toast('已显示全部节点地址', 'success');
     }
     this.renderList();
   },
@@ -3734,7 +3734,7 @@ async quickAddThirdParty(app, node, fullUrl){
       empty.style.gridColumn = '1 / -1';
       empty.style.textAlign = 'center';
       empty.style.color = 'var(--muted)';
-      empty.textContent = '鏆傛棤鑺傜偣';
+      empty.textContent = '暂无节点';
       list.appendChild(empty);
       this.updateGlobalVisibilityBtn();
       return;
@@ -3779,7 +3779,7 @@ const badges = document.createElement('div');
 badges.className = 'badges';
 const bm = document.createElement('span');
 bm.className = 'badge b-mode-normal';
-bm.textContent = '鍙嶄唬';
+bm.textContent = '反代';
 badges.appendChild(bm);
 if ((n.tag || '').trim()) {
   const b1 = document.createElement('span');
@@ -3801,7 +3801,7 @@ const txt = document.createElement('span');
 txt.textContent = st.txt;
 status.appendChild(dot);
 status.appendChild(txt);
-status.appendChild(this.iconBtn(SVG.ping, '妫€娴嬫鑺傜偣', () => this.checkNode(n.name)));
+status.appendChild(this.iconBtn(SVG.ping, '检测此节点', () => this.checkNode(n.name)));
 info.appendChild(h3);
 info.appendChild(pathTip);
 info.appendChild(badges);
@@ -3811,73 +3811,73 @@ leftHead.appendChild(info);
 leftWrap.appendChild(leftHead);
       const actions = document.createElement('div');
 actions.className = 'actions';
-const btnFav = this.iconBtn(n.fav ? SVG.starOn : SVG.star, n.fav ? '鍙栨秷鏀惰棌' : '鏀惰棌缃《', () => this.toggleFav(n.name));
+const btnFav = this.iconBtn(n.fav ? SVG.starOn : SVG.star, n.fav ? '取消收藏' : '收藏置顶', () => this.toggleFav(n.name));
 if (n.fav) btnFav.classList.add('is-fav');
 actions.appendChild(btnFav);
-actions.appendChild(this.iconBtn(SVG.edit, '缂栬緫', () => this.openEditor(n.name)));
-actions.appendChild(this.iconBtn(SVG.trash, '鍒犻櫎', () => this.del(n.name), 'color:#ef4444'));
+actions.appendChild(this.iconBtn(SVG.edit, '编辑', () => this.openEditor(n.name)));
+actions.appendChild(this.iconBtn(SVG.trash, '删除', () => this.del(n.name), 'color:#ef4444'));
       row.appendChild(leftWrap);
       row.appendChild(actions);
       card.appendChild(row);
       const line1 = document.createElement('div');
       line1.className = 'line';
-      const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '鐩爣鍦板潃';
+      const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '目标地址';
       const v1 = document.createElement('div');
 v1.className = 'mono ' + (showTarget ? '' : 'muted');
 v1.textContent = showTarget ? (n.target || '') : '******';
-v1.title = '鍗曞嚮澶嶅埗鐩爣鍦板潃';
+v1.title = '单击复制目标地址';
 v1.addEventListener('click', () => {
-  if (!showTarget) return this.toast('璇峰厛鏄剧ず鐩爣鍦板潃', 'warn');
-  this.copyText(n.target || '', '宸插鍒剁洰鏍囧湴鍧€');
+  if (!showTarget) return this.toast('请先显示目标地址', 'warn');
+  this.copyText(n.target || '', '已复制目标地址');
 });
-const eye1 = this.iconBtn(showTarget ? SVG.eyeOff : SVG.eye, showTarget ? '闅愯棌鐩爣鍦板潃' : '鏄剧ず鐩爣鍦板潃', () => this.toggleVisibility(kTarget));
+const eye1 = this.iconBtn(showTarget ? SVG.eyeOff : SVG.eye, showTarget ? '隐藏目标地址' : '显示目标地址', () => this.toggleVisibility(kTarget));
 eye1.classList.add('eye-toggle', showTarget ? 'on' : 'off');
       line1.appendChild(l1); line1.appendChild(v1); line1.appendChild(eye1);
       line1.appendChild(document.createElement('span')); line1.appendChild(document.createElement('span'));
       card.appendChild(line1);
       const line2 = document.createElement('div');
       line2.className = 'line';
-      const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '浠ｇ悊鍦板潃';
+      const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '代理地址';
       const v2 = document.createElement('div');
 v2.className = 'mono ' + (showProxy ? '' : 'muted');
 v2.textContent = showProxy ? fullUrl : '******';
-v2.title = '鍗曞嚮澶嶅埗浠ｇ悊鍦板潃';
+v2.title = '单击复制代理地址';
 v2.addEventListener('click', () => {
-  if (!showProxy) return this.toast('璇峰厛鏄剧ず浠ｇ悊鍦板潃', 'warn');
-  this.copyText(fullUrl, '宸插鍒朵唬鐞嗗湴鍧€');
+  if (!showProxy) return this.toast('请先显示代理地址', 'warn');
+  this.copyText(fullUrl, '已复制代理地址');
 });
-const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '闅愯棌浠ｇ悊鍦板潃' : '鏄剧ず浠ｇ悊鍦板潃', () => this.toggleVisibility(kProxyVis));
+const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
 eye2.classList.add('eye-toggle', showProxy ? 'on' : 'off');
-      const c1 = this.iconBtn(SVG.copy, '澶嶅埗鏅€�', () => this.copyText(normalUrl, '宸插鍒舵櫘閫氶摼鎺�'));
-      const c2 = this.iconBtn(SVG.link, '澶嶅埗瀹屾暣', () => this.copyText(fullUrl, '宸插鍒跺畬鏁撮摼鎺�'));
+      const c1 = this.iconBtn(SVG.copy, '复制普通', () => this.copyText(normalUrl, '已复制普通链接'));
+      const c2 = this.iconBtn(SVG.link, '复制完整', () => this.copyText(fullUrl, '已复制完整链接'));
       line2.appendChild(l2); line2.appendChild(v2); line2.appendChild(eye2); line2.appendChild(c1); line2.appendChild(c2);
       card.appendChild(line2);
 const sen = document.createElement('button');
 sen.className = 'app-btn';
 sen.innerText = 'Sen';
-sen.title = 'SenPlayer 涓€閿坊鍔�';
+sen.title = 'SenPlayer 一键添加';
 sen.addEventListener('click', () => this.quickAddThirdParty('sen', n, fullUrl));
 const capy = document.createElement('button');
 capy.className = 'app-btn capy';
 capy.innerText = 'Capy';
-capy.title = 'CapyPlayer 澶嶅埗閰嶇疆';
+capy.title = 'CapyPlayer 复制配置';
 capy.addEventListener('click', () => this.quickAddThirdParty('capy', n, fullUrl));
 const epx = document.createElement('button');
 epx.className = 'app-btn';
 epx.innerText = 'Epx';
-epx.title = 'EPlayerX 涓€閿坊鍔�';
+epx.title = 'EPlayerX 一键添加';
 epx.addEventListener('click', () => this.quickAddThirdParty('epx', n, fullUrl));
 const ua = (navigator.userAgent || '').toLowerCase();
 const isWindows = ua.includes('windows nt');
 const hills = document.createElement('button');
 hills.className = 'app-btn';
 hills.innerText = isWindows ? 'Hills(Win)' : 'Hills';
-hills.title = isWindows ? 'Hills Windows 瀵煎叆' : 'Hills 涓€閿鍏�';
+hills.title = isWindows ? 'Hills Windows 导入' : 'Hills 一键导入';
 hills.addEventListener('click', () => this.quickAddThirdParty('hills', n, fullUrl));
 const forward = document.createElement('button');
 forward.className = 'app-btn';
 forward.innerText = 'Forward';
-forward.title = 'Forward 涓€閿鍏�';
+forward.title = 'Forward 一键导入';
 forward.addEventListener('click', () => this.quickAddThirdParty('forward', n, fullUrl));
 const appRow = document.createElement('div');
 appRow.className = 'app-row';
@@ -3888,8 +3888,8 @@ appRow.appendChild(hills);
 if (isWindows) {
   const rodel = document.createElement('button');
   rodel.className = 'app-btn';
-  rodel.innerText = '灏忓够(Win)';
-  rodel.title = '灏忓够鎾斁鍣� Windows 瀵煎叆';
+  rodel.innerText = '小幻(Win)';
+  rodel.title = '小幻播放器 Windows 导入';
   rodel.addEventListener('click', () => this.quickAddThirdParty('rodel', n, fullUrl));
   appRow.appendChild(rodel);
 }
@@ -3903,7 +3903,7 @@ if (appRow.childElementCount > 0) {
       const hint = document.createElement('div');
       hint.className = 'page-hint';
       hint.style.gridColumn = '1 / -1';
-      hint.textContent = '鍙偣鍑诲彸涓� + 鏂板鑺傜偣';
+      hint.textContent = '可点击右上 + 新增节点';
       list.appendChild(hint);
     }
     this.updateGlobalVisibilityBtn();
@@ -3916,7 +3916,7 @@ if (appRow.childElementCount > 0) {
     this.getFiltered().forEach(n=>this.selected.add(n.name));
     this.renderList();
     this.updateBatchBar();
-    this.toast('宸插叏閫夊綋鍓嶇瓫閫夌粨鏋�','success');
+    this.toast('已全选当前筛选结果','success');
   },
   clearSelection(){
     this.selected.clear();
@@ -3929,15 +3929,15 @@ if (appRow.childElementCount > 0) {
   },
     async applyBatchCred(){
     const names = Array.from(this.selected || []);
-    if (!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣', 'warn');
-    const user = prompt('鎵归噺璁剧疆鐢ㄦ埛鍚嶏紙鐣欑┖涓嶄慨鏀癸級', '');
+    if (!names.length) return this.toast('请先选择节点', 'warn');
+    const user = prompt('批量设置用户名（留空不修改）', '');
     if (user === null) return;
-    const pass = prompt('鎵归噺璁剧疆瀵嗙爜锛堢暀绌轰笉淇敼锛�', '');
+    const pass = prompt('批量设置密码（留空不修改）', '');
     if (pass === null) return;
     const setUser = String(user || '').trim();
     const setPass = String(pass || '').trim();
     if (!setUser && !setPass) {
-      return this.toast('鐢ㄦ埛鍚嶅拰瀵嗙爜鑷冲皯濉啓涓€涓�', 'warn');
+      return this.toast('用户名和密码至少填写一个', 'warn');
     }
     let ok = 0, fail = 0;
     for (const name of names) {
@@ -3965,12 +3965,12 @@ if (appRow.childElementCount > 0) {
     }
     API.clearListCache();
     await this.refresh();
-    this.toast('鎵归噺璐﹀彿瀵嗙爜瀹屾垚锛氭垚鍔� ' + ok + '锛屽け璐� ' + fail, fail ? 'warn' : 'success');
+    this.toast('批量账号密码完成：成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
   },
   async clearBatchCred(){
     const names = Array.from(this.selected || []);
-    if (!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣', 'warn');
-    if (!confirm('纭娓呯┖宸查€� ' + names.length + ' 涓妭鐐圭殑 Emby 璐﹀彿瀵嗙爜锛�')) return;
+    if (!names.length) return this.toast('请先选择节点', 'warn');
+    if (!confirm('确认清空已选 ' + names.length + ' 个节点的 Emby 账号密码？')) return;
     let ok = 0, fail = 0;
     for (const name of names) {
       const n = this.nodes.find(x => x.name === name);
@@ -3997,19 +3997,19 @@ if (appRow.childElementCount > 0) {
     }
     API.clearListCache();
     await this.refresh();
-    this.toast('娓呯┖璐﹀彿瀵嗙爜瀹屾垚锛氭垚鍔� ' + ok + '锛屽け璐� ' + fail, fail ? 'warn' : 'success');
+    this.toast('清空账号密码完成：成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
   },
   async batchDelete(){
     const names = Array.from(this.selected);
-    if(!names.length) return this.toast('璇峰厛閫夋嫨鑺傜偣','warn');
-    if(!confirm('纭鍒犻櫎閫変腑鑺傜偣锛�'+names.length+'锛�?')) return;
+    if(!names.length) return this.toast('请先选择节点','warn');
+    if(!confirm('确认删除选中节点（'+names.length+'）?')) return;
     const r = await API.req({ action:'batchDelete', names });
     if(r.success){
       this.selected.clear();
-      this.toast('宸插垹闄� '+(r.count||names.length)+' 涓妭鐐�','success');
+      this.toast('已删除 '+(r.count||names.length)+' 个节点','success');
       await this.refresh();
     }else{
-      this.toast(r.error || '鎵归噺鍒犻櫎澶辫触','error');
+      this.toast(r.error || '批量删除失败','error');
     }
   },
   async checkNode(name){
@@ -4017,21 +4017,21 @@ if (appRow.childElementCount > 0) {
     if(r.success && r.results && r.results[0]){
       this.statusMap[name] = r.results[0];
       this.renderList();
-      this.toast(name + ': ' + (r.results[0].online ? ('鍦ㄧ嚎 '+r.results[0].latency+'ms') : '绂荤嚎'), r.results[0].online?'success':'warn');
+      this.toast(name + ': ' + (r.results[0].online ? ('在线 '+r.results[0].latency+'ms') : '离线'), r.results[0].online?'success':'warn');
     }else{
-      this.toast(r.error || '妫€娴嬪け璐�','error');
+      this.toast(r.error || '检测失败','error');
     }
   },
   async checkSelectedStatus(){
     const names = Array.from(this.selected);
-    if(!names.length) return this.toast('鍏堥€夋嫨鑺傜偣鍐嶆娴�','warn');
+    if(!names.length) return this.toast('先选择节点再检测','warn');
     const r = await API.req({ action:'checkStatus', names });
     if(r.success){
       (r.results || []).forEach(x=>{ this.statusMap[x.name] = x; });
       this.renderList();
-      this.toast('閫変腑鑺傜偣妫€娴嬪畬鎴�','success');
+      this.toast('选中节点检测完成','success');
     }else{
-      this.toast(r.error || '妫€娴嬪け璐�','error');
+      this.toast(r.error || '检测失败','error');
     }
   },
   async checkAllStatus(){
@@ -4039,9 +4039,9 @@ if (appRow.childElementCount > 0) {
     if(r.success){
       (r.results || []).forEach(x=>{ this.statusMap[x.name] = x; });
       this.renderList();
-      this.toast('鍏ㄩ儴鑺傜偣妫€娴嬪畬鎴�','success');
+      this.toast('全部节点检测完成','success');
     }else{
-      this.toast(r.error || '妫€娴嬪け璐�','error');
+      this.toast(r.error || '检测失败','error');
     }
   },
   openModal(id){
@@ -4054,7 +4054,7 @@ if (appRow.childElementCount > 0) {
   },
 splitTargetsText(v){
   return String(v || '')
-    .split(/\\r?\\n|[;,锛岋紱|]+/g)
+    .split(/\\r?\\n|[;,，；|]+/g)
     .map(s => s.trim())
     .filter(Boolean);
 },
@@ -4102,7 +4102,7 @@ collectTargetsText(){
 openEditor(name){
   this.editingOldName = '';
   this.currentMode = 'split';
-  $('#editorTitle').innerText = '鏂板鑺傜偣';
+  $('#editorTitle').innerText = '新增节点';
   $('#inName').value = '';
   $('#inDisplayName').value = '';
   $('#inTag').value = '';
@@ -4116,7 +4116,7 @@ openEditor(name){
     const n = this.nodes.find(x=>x.name===name);
     if(n){
       this.editingOldName = n.name;
-      $('#editorTitle').innerText = '缂栬緫鑺傜偣';
+      $('#editorTitle').innerText = '编辑节点';
       $('#inName').value = n.name || '';
       $('#inDisplayName').value = n.displayName || '';
       $('#inTag').value = n.tag || '';
@@ -4150,14 +4150,14 @@ async save(){
   const embyUser = ($('#inUser').value || '').trim();
   const embyPass = ($('#inPass').value || '').trim();
   const directExternal = !!$('#inDirectExternal').checked;
-  if(!name || !target) return this.toast('璇锋眰璺緞鍜岀洰鏍囧湴鍧€蹇呭～','warn');
+  if(!name || !target) return this.toast('请求路径和目标地址必填','warn');
   const lower = name.toLowerCase();
   const existed = this.nodes.some(x => String(x.name || '').toLowerCase() === lower);
   if (!this.editingOldName && existed) {
-    return this.toast('璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦紝璇锋崲涓€涓矾寰�', 'warn');
+    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
   }
   if (this.editingOldName && this.editingOldName.toLowerCase() !== lower && existed) {
-    return this.toast('璇锋眰璺緞閲嶅锛氳鑺傜偣宸插瓨鍦紝璇锋崲涓€涓矾寰�', 'warn');
+    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
   }
   const editingNode = this.editingOldName
     ? this.nodes.find(x => String(x.name || '').toLowerCase() === String(this.editingOldName).toLowerCase())
@@ -4173,30 +4173,30 @@ async save(){
     directExternal,
     oldName: this.editingOldName || ''
   });
-  if(!r.success) return this.toast(r.error || '淇濆瓨澶辫触','error');
+  if(!r.success) return this.toast(r.error || '保存失败','error');
   if (r.failed > 0 && Array.isArray(r.errors) && r.errors[0]) {
-    return this.toast('淇濆瓨澶辫触锛�' + r.errors[0].error, 'error');
+    return this.toast('保存失败：' + r.errors[0].error, 'error');
   }
   API.clearListCache();
   this.closeAllModals();
-  this.toast('淇濆瓨鎴愬姛','success');
+  this.toast('保存成功','success');
   await this.refresh();
 },
   async toggleFav(name){
   const r = await API.req({ action:'toggleFav', name });
-  if(!r.success) return this.toast(r.error || '鎿嶄綔澶辫触','error');
+  if(!r.success) return this.toast(r.error || '操作失败','error');
   API.clearListCache();   
   await this.refresh();
 },
   async del(name){
-    if(!confirm('鍒犻櫎鑺傜偣: '+name+' ?')) return;
+    if(!confirm('删除节点: '+name+' ?')) return;
     const r = await API.req({ action:'delete', name });
     if(r.success){
       this.selected.delete(name);
-      this.toast('鍒犻櫎鎴愬姛','success');
+      this.toast('删除成功','success');
       await this.refresh();
     }else{
-      this.toast(r.error || '鍒犻櫎澶辫触','error');
+      this.toast(r.error || '删除失败','error');
     }
   },
   async exportData(){
@@ -4204,7 +4204,7 @@ async save(){
     a.href = URL.createObjectURL(new Blob([JSON.stringify(this.nodes, null, 2)], { type:'application/json' }));
     a.download = 'nodes_ui.json';
     a.click();
-    this.toast('瀵煎嚭瀹屾垚','success');
+    this.toast('导出完成','success');
   },
   importFile(input){
     const file = input.files && input.files[0];
@@ -4215,14 +4215,14 @@ async save(){
         const nodes = JSON.parse(e.target.result);
         const r = await API.req({ action:'import', nodes });
         if(r.success){
-          if (r.failed > 0) this.toast('瀵煎叆瀹屾垚锛氭垚鍔� '+r.saved+'锛屽け璐� '+r.failed,'warn');
-          else this.toast('瀵煎叆鎴愬姛','success');
+          if (r.failed > 0) this.toast('导入完成：成功 '+r.saved+'，失败 '+r.failed,'warn');
+          else this.toast('导入成功','success');
           await this.refresh();
         } else {
-          this.toast(r.error || '瀵煎叆澶辫触','error');
+          this.toast(r.error || '导入失败','error');
         }
       }catch{
-        this.toast('瀵煎叆鏂囦欢鏍煎紡閿欒','error');
+        this.toast('导入文件格式错误','error');
       }finally{
         input.value='';
       }
@@ -4251,9 +4251,9 @@ toggleMenu(){
   async copyText(text, msg){
     try{
       await navigator.clipboard.writeText(text);
-      this.toast(msg || '澶嶅埗鎴愬姛','success');
+      this.toast(msg || '复制成功','success');
     }catch{
-      this.toast('澶嶅埗澶辫触','error');
+      this.toast('复制失败','error');
     }
   },
   toast(text, type){
@@ -4270,14 +4270,14 @@ window.App = App;
 Gate.boot();
 </script>
 <div class="project-links">
-  <span class="label">椤圭洰鍦板潃锛�</span>
+  <span class="label">项目地址：</span>
   <a href="https://github.com/chenhr454/emby---worker" target="_blank" rel="noopener noreferrer">GitHub</a>
-  <span class="label">棰戦亾锛�</span>
+  <span class="label">频道：</span>
   <a href="https://t.me/+tdZEbQpmAktkZmY1" target="_blank" rel="noopener noreferrer">Telegram</a>
 </div>
 <div class="disclaimer">
-  <strong>鍏嶈矗澹版槑锛�</strong>
-  鏈」鐩粎渚涘涔犱笌鎶€鏈祴璇曚娇鐢紝璇烽伒瀹堝綋鍦版硶寰嬫硶瑙勩€備娇鐢ㄨ€呭閰嶇疆銆佽浆鍙戝唴瀹逛笌璁块棶琛屼负鎵挎媴鍏ㄩ儴璐ｄ换锛屽紑鍙戣€呬笉瀵逛换浣曠洿鎺ユ垨闂存帴鎹熷け璐熻矗銆�
+  <strong>免责声明：</strong>
+  本项目仅供学习与技术测试使用，请遵守当地法律法规。使用者对配置、转发内容与访问行为承担全部责任，开发者不对任何直接或间接损失负责。
 </div>
 </body>
 </html>`;
