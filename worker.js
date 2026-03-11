@@ -1,11 +1,10 @@
-// CF EMBY PROXY UI - V19.6.3-thirdparty-layoutfix-20260228
-
 const GLOBALS = {
   NodeCache: new Map(),
   NodeHostIndexCache: new Map(),
   NodeHostIndexInflight: new Map(),
-  NodeListCache: new Map(), // 新增：节点列表缓存
-  NodeListInflight: new Map(), // 新增：节点列表并发去重
+  NodeListCache: new Map(),
+  NodeListInflight: new Map(),
+  AuthFail: new Map(),
   Regex: {
     StaticExt:
       /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i,
@@ -17,14 +16,122 @@ const GLOBALS = {
 const Config = {
   Defaults: {
     CacheTTL: 8000,
-    ListCacheTTL: 15000, // 新增：列表缓存15秒（可改30000）
-    MaxRetryBodyBytes: 8 * 1024 * 1024, // 8MB，超过不做协议回退重试
+    ListCacheTTL: 15000,
+    MaxRetryBodyBytes: 8 * 1024 * 1024,
   },
+};
+const FIXED_PROXY_RULES = {
+  FORCE_EXTERNAL_PROXY: true,
+  PAN_302_DIRECT: false,
+  PRESERVE_PAN_HEADERS: true,
+  WANGPAN_REFERER: "",
+  WANGPAN_KEYWORDS: [
+    "aliyundrive",
+    "alipan",
+    "quark",
+    "baidupcs",
+    "pan.baidu.com",
+    "115.com",
+    "123684.com",
+    "uc.cn",
+    "drive.google.com",
+    "googleusercontent.com",
+    "1drv.ms",
+    "onedrive.live.com",
+    "sharepoint.com",
+  ],
+};
+const DIRECT_RULES = {
+  DEFAULT_UA:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+  ADAPTERS: [
+    {
+      name: "tianyi",
+      keywords: ["cloud.189.cn", "189.cn", "ctyun", "e.189.cn", "ctyunxs.cn"],
+      forceProxy: true,
+      referer: "https://cloud.189.cn/",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "115",
+      keywords: ["115.com", "anxia.com", "115cdn"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "pikpak",
+      keywords: ["mypikpak.com", "pikpak"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "aliyun",
+      keywords: ["aliyundrive", "alipan"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "quark",
+      keywords: ["quark", "uc.cn"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "baidu",
+      keywords: ["pan.baidu.com", "baidupcs"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "google-drive",
+      keywords: [
+        "drive.google.com",
+        "googleusercontent.com",
+        "googledrive",
+        "gvt1.com",
+      ],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "onedrive",
+      keywords: [
+        "onedrive.live.com",
+        "1drv.ms",
+        "sharepoint.com",
+        "sharepoint-df.com",
+      ],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+    {
+      name: "generic-pan",
+      keywords: ["123684.com"],
+      forceProxy: true,
+      referer: "",
+      keepOrigin: false,
+      keepReferer: false,
+    },
+  ],
 };
 function getKV(env) {
   const db = env.EMBY_D1 || env.D1 || env.DB;
   if (!db) return null;
-
   return {
     async get(key, opts = {}) {
       const row = await db
@@ -33,7 +140,6 @@ function getKV(env) {
         .first();
       if (!row) return null;
       const val = row.v;
-
       if (opts && opts.type === "json") {
         try {
           return JSON.parse(val);
@@ -43,12 +149,10 @@ function getKV(env) {
       }
       return val;
     },
-
     async put(key, value) {
       const k = String(key);
       const v = typeof value === "string" ? value : JSON.stringify(value);
       const now = Date.now();
-
       await db
         .prepare(
           `
@@ -62,20 +166,17 @@ function getKV(env) {
         .bind(k, v, now)
         .run();
     },
-
     async delete(key) {
       await db
         .prepare("DELETE FROM proxy_kv WHERE k = ?1")
         .bind(String(key))
         .run();
     },
-    // 兼容 KV.list({ prefix, cursor, limit })
     async list(opts = {}) {
-      const o = /** @type {any} */ (opts || {});
+      const o = opts || {};
       const p = String(o.prefix || "");
       const off = Number(o.cursor || 0) || 0;
       const lim = Math.max(1, Math.min(Number(o.limit || 1000), 1000));
-
       const rows = await db
         .prepare(
           `
@@ -88,10 +189,90 @@ function getKV(env) {
         )
         .bind(p + "%", lim + 1, off)
         .all();
-
       const arr = Array.isArray(rows?.results) ? rows.results : [];
       const hasMore = arr.length > lim;
       const slice = hasMore ? arr.slice(0, lim) : arr;
+      return {
+        keys: slice.map((r) => ({ name: r.k })),
+        list_complete: !hasMore,
+        cursor: hasMore ? String(off + lim) : undefined,
+      };
+    },
+  };
+}
+function safeEqual(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+const Auth = {
+  extractToken(request) {
+    const auth = request.headers.get("Authorization") || "";
+    if (/^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim();
+    const x = request.headers.get("X-Admin-Token");
+    return String(x || "").trim();
+  },
+  unauthorized() {
+    return {
+      ok: false,
+      uid: "",
+      role: "",
+      response: new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json;charset=utf-8" },
+      }),
+    };
+  },
+  check(request, env) {
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    const now = Date.now();
+    const win = 10 * 60 * 1000; // 10分钟
+    const maxFail = 20;
+    let rec = GLOBALS.AuthFail.get(ip);
+    if (!rec || now - rec.ts > win) rec = { n: 0, ts: now };
+    if ((now & 63) === 0) {
+      for (const [k, v] of GLOBALS.AuthFail) {
+        if (!v || now - Number(v.ts || 0) > win) {
+          GLOBALS.AuthFail.delete(k);
+        }
+      }
+    }
+    if (rec.n >= maxFail) {
+      return {
+        ok: false,
+        uid: "",
+        role: "",
+        response: new Response(JSON.stringify({ error: "TOO_MANY_REQUESTS" }), {
+          status: 429,
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        }),
+      };
+    }
+    const got = this.extractToken(request);
+    const admin = String(env.ADMIN_TOKEN || "").trim();
+    if (got && admin && safeEqual(got, admin)) {
+      GLOBALS.AuthFail.delete(ip);
+      return { ok: true, uid: "admin", role: "admin", response: null };
+    }
+    rec.n += 1;
+    rec.ts = now;
+    GLOBALS.AuthFail.set(ip, rec);
+    return this.unauthorized();
+  },
+};
+const Validators = {
+  NAME_RE: /^[a-z0-9_-]{1,32}$/i,
+  SECRET_RE: /^[^\/?#\s]{0,128}$/,
+  normalizeName(v) {
+    return String(v || "")
+      .trim()
+      .toLowerCase();
+  },
+  validateName(v) {
+    const name = this.normaliz      const slice = hasMore ? arr.slice(0, lim) : arr;
 
       return {
         keys: slice.map((r) => ({ name: r.k })),
@@ -3737,3 +3918,4 @@ export default {
     return ProxyHandler.handleDirect(request, directRaw, env);
   },
 };
+
