@@ -1212,9 +1212,11 @@ const ProxyHandler = {
     if (isEmos) this.applyEmosHeaders(h, request, env);
     return h;
   },
-  buildCleanProxyHeaders(request, targetUrl) {
+  buildCleanProxyHeaders(request, targetUrl, node, env, opts = {}) {
     const h = new Headers(request.headers);
-    [
+    const isStreaming = !!opts.isStreaming;
+
+    const toDelete = [
       "cf-connecting-ip",
       "cf-ipcountry",
       "cf-ray",
@@ -1227,26 +1229,46 @@ const ProxyHandler = {
       "x-forwarded-port",
       "forwarded",
       "true-client-ip",
-      "origin",
-      "referer",
-      "sec-fetch-site",
-      "sec-fetch-mode",
-      "sec-fetch-dest",
-      "sec-fetch-user",
       "connection",
       "content-length",
-    ].forEach((k) => h.delete(k));
+    ];
+
+    if (!isStreaming) {
+      toDelete.push(
+        "origin",
+        "referer",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        "sec-fetch-user",
+      );
+    }
+
+    toDelete.forEach((k) => h.delete(k));
+
     h.set("Host", targetUrl.host);
+
     const ua = h.get("User-Agent") || "";
     if (!ua || /mpv|ffmpeg|lavf|dart|okhttp/i.test(ua)) {
       h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
     }
+
     const rg = request.headers.get("Range");
     if (rg) h.set("Range", rg);
+
     const ifRange = request.headers.get("If-Range");
     if (ifRange) h.set("If-Range", ifRange);
+
+    if (isStreaming) {
+      h.set("Accept-Encoding", "identity");
+    }
+
+    const isEmos = this.isEmosNode(node, targetUrl, env);
+    if (isEmos) this.applyEmosHeaders(h, request, env);
+
     return h;
   },
+
   stripClientIpHeaders(h) {
     if (!h) return h;
     h.delete("CF-Connecting-IP");
@@ -1452,23 +1474,20 @@ const ProxyHandler = {
       );
       const nodeDirect = this.isNodeDirectExternal(node);
       if (
-        nodeDirect &&
-        (isPlaybackApi || isImageApi || isAdditionalPartsApi) &&
-        (request.method === "GET" || request.method === "HEAD")
-      ) {
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: finalUrl.toString(),
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      if (
         !nodeDirect &&
         (isPlaybackApi || isImageApi || isAdditionalPartsApi)
       ) {
-        const hClean = this.buildCleanProxyHeaders(request, finalUrl);
+        const isStreaming =
+          isPlaybackApi || GLOBALS.Regex.Streaming.test(finalUrl.pathname);
+
+        const hClean = this.buildCleanProxyHeaders(
+          request,
+          finalUrl,
+          node,
+          env,
+          { isStreaming },
+        );
+
         const method = request.method.toUpperCase();
         const body =
           method === "GET" || method === "HEAD"
@@ -1476,17 +1495,51 @@ const ProxyHandler = {
             : replayBody
               ? replayBody.slice(0)
               : null;
-        const resClean = await this.fetchWithProtocolFallback(finalUrl, {
+
+        let resClean = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: hClean,
           body,
           redirect: "follow",
           cf,
         });
+
+        const reqRange = request.headers.get("Range");
+        if (isStreaming && reqRange) {
+          const cr = resClean.headers.get("Content-Range");
+          const ar = resClean.headers.get("Accept-Ranges");
+          if (
+            resClean.status === 416 ||
+            (resClean.status === 200 && !cr && ar !== "bytes")
+          ) {
+            const hNoRange = new Headers(hClean);
+            hNoRange.delete("Range");
+            hNoRange.delete("If-Range");
+            resClean = await this.fetchWithProtocolFallback(finalUrl, {
+              method: request.method,
+              headers: hNoRange,
+              body,
+              redirect: "follow",
+              cf,
+            });
+          }
+        }
+
         const headersClean = new Headers(resClean.headers);
         const aoClean = this.pickAllowOrigin(request, env);
         headersClean.set("Access-Control-Allow-Origin", aoClean);
         if (aoClean !== "*") headersClean.set("Vary", "Origin");
+
+        if (isStreaming) {
+          headersClean.set("Cache-Control", "no-store");
+          headersClean.set("Pragma", "no-cache");
+          headersClean.set("Expires", "0");
+        }
+
+        if (/\.m3u8($|\?)/i.test(finalUrl.pathname)) {
+          headersClean.set("Content-Type", "application/vnd.apple.mpegurl");
+        }
+
         return new Response(resClean.body, {
           status: resClean.status,
           statusText: resClean.statusText,
@@ -2178,7 +2231,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
     gap:6px;
     line-height:1.08;
     min-width:0;
-    max-width:calc(100vw - 120px); 
+    max-width:calc(100vw - 120px);
   }
   #nodeCount,
   .right-actions{
@@ -2346,7 +2399,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   word-break:break-all;
   overflow:hidden;
   display:-webkit-box;
-  -webkit-line-clamp:2;      
+  -webkit-line-clamp:2;
   -webkit-box-orient:vertical;
 }
 .mono.muted{
@@ -2465,11 +2518,11 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   min-width:48px;
   padding:0 8px;
   cursor:pointer;
-} 
+}
  #editor #targetList .target-item{
   width:100%;
   display:block;
-} 
+}
 .field-title{
   font-size:15px;
   font-weight:700;
@@ -2495,10 +2548,10 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .project-links{
   width: min(1100px, calc(100% - 24px));
   margin: 10px auto 8px;
-  padding: 0;                 
-  border: none;               
-  background: transparent;    
-  box-shadow: none;           
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -2511,11 +2564,11 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .project-links .label{
   color: var(--muted);
   margin-right: 2px;
-  font: inherit;              
+  font: inherit;
 }
 .project-links a{
   text-decoration: none;
-  font: inherit;              
+  font: inherit;
   font-size: 14px;
   color: var(--text2);
   border: 1px solid var(--line);
@@ -2541,7 +2594,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .disclaimer{
   width: min(1100px, calc(100% - 24px));
-  margin: 16px auto 12px;   
+  margin: 16px auto 12px;
   padding: 10px 12px;
   border: 1px dashed #cbd5e1;
   border-radius: 10px;
@@ -2549,7 +2602,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   line-height: 1.6;
   color: #64748b;
   background: rgba(255,255,255,.55);
-  text-align: center;       
+  text-align: center;
 }
 @media (max-width:768px){
   .disclaimer{ margin: 12px; font-size: 11.5px; }
@@ -2737,7 +2790,7 @@ button:hover,.btn:hover{
   position: relative;
 }
 #editor .pass-wrap #inPass{
-  padding-right: 34px; 
+  padding-right: 34px;
 }
 #editor .pass-eye{
   position: absolute;
@@ -2808,7 +2861,7 @@ button:hover,.btn:hover{
   <small id="nodeCount">0个</small>
 </div>
       <div class="right-actions">
-  <span class="top-ver">v1.3</span>
+  <span class="top-ver">v1.4</span>
   <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
@@ -2924,7 +2977,7 @@ function mountFabToControls(){
   const controls = document.querySelector('.controls');
   const fab = document.querySelector('.fab');
   if (!controls || !fab || fab.dataset.moved === '1') return;
-  controls.appendChild(fab);   
+  controls.appendChild(fab);
   fab.dataset.moved = '1';
 }
 const SVG = {
@@ -3271,7 +3324,7 @@ updateTagSuggestions(){
   sortByOrder(arr) {
     return [...arr].sort((a, b) => {
       const af = !!a.fav, bf = !!b.fav;
-      if (af !== bf) return af ? -1 : 1; 
+      if (af !== bf) return af ? -1 : 1;
       const ar = Number.isFinite(a.rank) ? a.rank : 1e9;
       const br = Number.isFinite(b.rank) ? b.rank : 1e9;
       if (ar !== br) return ar - br;
@@ -3292,7 +3345,7 @@ async moveOrder(dragName, targetName) {
   const r = await API.req({ action: 'saveOrder', names: all });
   if (!r.success) {
     this.toast(r.error || '保存排序失败', 'error');
-    await this.refresh(); 
+    await this.refresh();
     return;
   }
   this.toast('排序已保存', 'success');
@@ -3899,7 +3952,7 @@ if (appRow.childElementCount > 0) {
 }
       list.appendChild(card);
     }
-    if (arr.length < 6) { 
+    if (arr.length < 6) {
       const hint = document.createElement('div');
       hint.className = 'page-hint';
       hint.style.gridColumn = '1 / -1';
@@ -4185,7 +4238,7 @@ async save(){
   async toggleFav(name){
   const r = await API.req({ action:'toggleFav', name });
   if(!r.success) return this.toast(r.error || '操作失败','error');
-  API.clearListCache();   
+  API.clearListCache();
   await this.refresh();
 },
   async del(name){
