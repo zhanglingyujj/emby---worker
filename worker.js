@@ -1346,6 +1346,38 @@ const ProxyHandler = {
     const reqUrl = new URL(request.url);
     const finalUrl = new URL(forwardPath, base);
     finalUrl.search = reqUrl.search;
+    const isStrm = /\.strm$/i.test(finalUrl.pathname);
+    if (isStrm) {
+      try {
+        const hStrm = new Headers(request.headers);
+        hStrm.delete("Range");
+        hStrm.delete("If-Range");
+
+        const resStrm = await this.fetchWithProtocolFallback(finalUrl, {
+          method: "GET",
+          headers: hStrm,
+          redirect: "follow",
+          cf: { cacheEverything: false, cacheTtl: 0 },
+        });
+
+        if (!resStrm.ok) return resStrm;
+
+        const text = (await resStrm.text()).trim();
+        const line =
+          text
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .find((s) => s && !s.startsWith("#")) || "";
+
+        if (!/^https?:\/\//i.test(line)) {
+          return new Response("Bad STRM", { status: 400 });
+        }
+
+        return this.handleDirect(request, line, env, node);
+      } catch {
+        return new Response("STRM parse error", { status: 500 });
+      }
+    }
     if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
       return await this.handleWebSocket(finalUrl, request);
     }
@@ -2472,6 +2504,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   box-shadow:0 10px 22px rgba(59,130,246,.35);
   z-index:80;
 }
+body.modal-open .fab{display:none;}
 @media (min-width:981px){
   .fab{
     position:static;
@@ -2609,6 +2642,50 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .modal .btns{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
 .btn{border:none;border-radius:10px;padding:9px 14px;cursor:pointer}
+/* mobile modal adapt */
+@media (max-width: 640px){
+  .modal{
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+    padding: 12px;
+    border-radius: 12px;
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  #editor{
+    font-size: 13px;
+  }
+  #editor h3{
+    font-size: 20px;
+    margin: 0 0 10px;
+  }
+  #editor .field-title{
+    font-size: 16px;
+    margin: 8px 0 6px;
+  }
+  #editor input:not([type="checkbox"]),
+  #editor textarea,
+  #editor select{
+    height: 38px;
+    font-size: 14px;
+    padding: 0 10px;
+  }
+
+  #editor .btn-row{
+    flex-wrap: wrap;
+  }
+  #editor .btn-row .btn{
+    flex: 1 1 calc(50% - 6px);
+  }
+
+  #editor .btns{
+    position: sticky;
+    bottom: -1px;
+    background: var(--panel);
+    padding-top: 6px;
+  }
+}
 .btn-p{background:var(--blue);color:#fff}.btn-g{background:rgba(148,163,184,.2);color:var(--text)}
 .range{display:grid;grid-template-columns:90px 1fr 46px;gap:8px;align-items:center;margin:6px 0}
 .small{font-size:12px;color:var(--muted)}
@@ -2861,7 +2938,7 @@ button:hover,.btn:hover{
   <small id="nodeCount">0个</small>
 </div>
       <div class="right-actions">
-  <span class="top-ver">v1.4</span>
+  <span class="top-ver">v1.5</span>
   <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
@@ -4097,14 +4174,16 @@ if (appRow.childElementCount > 0) {
       this.toast(r.error || '检测失败','error');
     }
   },
-  openModal(id){
-    $('#mask').style.display='block';
-    $('#'+id).style.display='block';
-  },
-  closeAllModals(){
-    $('#mask').style.display='none';
-    ['editor','bgModal','tagPicker'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
-  },
+openModal(id){
+  $('#mask').style.display='block';
+  $('#'+id).style.display='block';
+  document.body.classList.add('modal-open');
+},
+closeAllModals(){
+  $('#mask').style.display='none';
+  ['editor','bgModal','tagPicker'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
+  document.body.classList.remove('modal-open');
+},
 splitTargetsText(v){
   return String(v || '')
     .split(/\\r?\\n|[;,，；|]+/g)
