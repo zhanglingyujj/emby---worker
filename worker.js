@@ -1,10 +1,27 @@
+class TTLMap extends Map {
+  set(key, value, ttlMs = 8000) {
+    super.set(key, { value, exp: Date.now() + ttlMs });
+    return this;
+  }
+  get(key) {
+    const hit = super.get(key);
+    if (!hit || Date.now() > hit.exp) {
+      super.delete(key);
+      return undefined;
+    }
+    return hit.value;
+  }
+}
 const GLOBALS = {
-  NodeCache: new Map(),
-  NodeHostIndexCache: new Map(),
+  NodeCache: new TTLMap(),
+  NodeHostIndexCache: new TTLMap(),
   NodeHostIndexInflight: new Map(),
-  NodeListCache: new Map(),
+  NodeListCache: new TTLMap(),
   NodeListInflight: new Map(),
-  AuthFail: new Map(),
+  AuthFail: new TTLMap(),
+  LineCursor: new Map(),
+  LineBan: new TTLMap(),
+  KeepaliveTableReady: false,
   Regex: {
     StaticExt:
       /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i,
@@ -15,13 +32,15 @@ const GLOBALS = {
 };
 const Config = {
   Defaults: {
-    CacheTTL: 8000,
-    ListCacheTTL: 15000,
-    MaxRetryBodyBytes: 8 * 1024 * 1024,
+    CacheTTL: 10000,
+    ListCacheTTL: 180000,
+    MetaCacheTTL: 1800000,
+    StaticCacheTTL: 86400000,
+    MaxRetryBodyBytes: 32 * 1024 * 1024,
   },
 };
 const FIXED_PROXY_RULES = {
-  FORCE_EXTERNAL_PROXY: true,
+  FORCE_EXTERNAL_PROXY: false,
   PAN_302_DIRECT: false,
   PRESERVE_PAN_HEADERS: true,
   WANGPAN_REFERER: "",
@@ -42,13 +61,11 @@ const FIXED_PROXY_RULES = {
   ],
 };
 const DIRECT_RULES = {
-  DEFAULT_UA:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
   ADAPTERS: [
     {
       name: "tianyi",
       keywords: ["cloud.189.cn", "189.cn", "ctyun", "e.189.cn", "ctyunxs.cn"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "https://cloud.189.cn/",
       keepOrigin: false,
       keepReferer: false,
@@ -56,7 +73,7 @@ const DIRECT_RULES = {
     {
       name: "115",
       keywords: ["115.com", "anxia.com", "115cdn"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -64,7 +81,7 @@ const DIRECT_RULES = {
     {
       name: "pikpak",
       keywords: ["mypikpak.com", "pikpak"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -72,7 +89,7 @@ const DIRECT_RULES = {
     {
       name: "aliyun",
       keywords: ["aliyundrive", "alipan"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -80,7 +97,7 @@ const DIRECT_RULES = {
     {
       name: "quark",
       keywords: ["quark", "uc.cn"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -88,7 +105,7 @@ const DIRECT_RULES = {
     {
       name: "baidu",
       keywords: ["pan.baidu.com", "baidupcs"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -101,7 +118,7 @@ const DIRECT_RULES = {
         "googledrive",
         "gvt1.com",
       ],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -114,7 +131,7 @@ const DIRECT_RULES = {
         "sharepoint.com",
         "sharepoint-df.com",
       ],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -122,7 +139,7 @@ const DIRECT_RULES = {
     {
       name: "generic-pan",
       keywords: ["123684.com"],
-      forceProxy: true,
+      forceProxy: false,
       referer: "",
       keepOrigin: false,
       keepReferer: false,
@@ -200,6 +217,39 @@ function getKV(env) {
     },
   };
 }
+function cleanupTTLMaps() {
+  const now = Date.now();
+  [
+    GLOBALS.NodeCache,
+    GLOBALS.NodeHostIndexCache,
+    GLOBALS.NodeListCache,
+    GLOBALS.AuthFail,
+  ].forEach((map) => {
+    for (const [k, v] of map) {
+      if (v?.exp && now > v.exp) map.delete(k);
+    }
+  });
+}
+function rewriteSetCookieHeaders(headers, requestUrl, prefix) {
+  const cookies = headers.getSetCookie
+    ? headers.getSetCookie()
+    : headers.get("Set-Cookie")
+      ? [headers.get("Set-Cookie")]
+      : [];
+  if (!cookies.length) return;
+  headers.delete("Set-Cookie");
+  for (let c of cookies) {
+    c = c.replace(/;\s*domain=[^;]+/i, "");
+    if (prefix) {
+      if (/;\s*path=/i.test(c)) {
+        c = c.replace(/;\s*path=[^;]+/i, `; Path=${prefix}`);
+      } else {
+        c += `; Path=${prefix}`;
+      }
+    }
+    headers.append("Set-Cookie", c);
+  }
+}
 function safeEqual(a, b) {
   a = String(a || "");
   b = String(b || "");
@@ -229,7 +279,7 @@ const Auth = {
   check(request, env) {
     const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     const now = Date.now();
-    const win = 10 * 60 * 1000; // 10分钟
+    const win = 10 * 60 * 1000;
     const maxFail = 20;
     let rec = GLOBALS.AuthFail.get(ip);
     if (!rec || now - rec.ts > win) rec = { n: 0, ts: now };
@@ -283,7 +333,7 @@ const Validators = {
   },
   splitTargets(v) {
     return String(v || "")
-      .split(/\r?\n|[;,，；|]+/g)
+      .split(/\\r?\\n|[;,，；|]+/g)
       .map((s) => s.trim())
       .filter(Boolean);
   },
@@ -363,6 +413,30 @@ const Validators = {
     let embyPass = String(n.embyPass || "").trim();
     if (embyUser.length > 128) embyUser = embyUser.slice(0, 128);
     if (embyPass.length > 256) embyPass = embyPass.slice(0, 256);
+    let renewDays = 0; // 保号周期（天）
+    if (
+      n.renewDays !== undefined &&
+      n.renewDays !== null &&
+      String(n.renewDays).trim() !== ""
+    ) {
+      const d = Number(n.renewDays);
+      if (!Number.isFinite(d) || d < 0 || d > 3650) {
+        return { ok: false, error: "保号周期不合法（0~3650）" };
+      }
+      renewDays = Math.floor(d);
+    }
+    let remindBeforeDays = 0; // 提前几天提醒
+    if (
+      n.remindBeforeDays !== undefined &&
+      n.remindBeforeDays !== null &&
+      String(n.remindBeforeDays).trim() !== ""
+    ) {
+      const d = Number(n.remindBeforeDays);
+      if (!Number.isFinite(d) || d < 0 || d > 3650) {
+        return { ok: false, error: "提前几天提醒不合法（0~3650）" };
+      }
+      remindBeforeDays = Math.floor(d);
+    }
     return {
       ok: true,
       value: {
@@ -379,10 +453,24 @@ const Validators = {
         embyUser,
         embyPass,
         directExternal: !!n.directExternal,
+        renewDays,
+        remindBeforeDays,
       },
     };
   },
 };
+async function sendTG(token, chat, text) {
+  if (!token || !chat) return;
+  await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chat,
+      text,
+      disable_web_page_preview: true,
+    }),
+  });
+}
 const Database = {
   PREFIX: "node:",
   nodePrefix(uid = "admin") {
@@ -418,6 +506,339 @@ const Database = {
   getKV(env) {
     return getKV(env);
   },
+  getDb(env) {
+    return env.EMBY_D1 || env.D1 || env.DB;
+  },
+  async ensureKeepaliveStateTable(env) {
+    const db = this.getDb(env);
+    if (!db) return null;
+    if (!GLOBALS.KeepaliveTableReady) {
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS keepalive_state (" +
+            "node TEXT PRIMARY KEY," +
+            "anchor_ts INTEGER NOT NULL," +
+            "last_play_ts INTEGER NOT NULL DEFAULT 0," +
+            "last_notify_day TEXT" +
+            ")",
+        )
+        .run();
+      GLOBALS.KeepaliveTableReady = true;
+    }
+    return db;
+  },
+  getDayKeyOffset(offsetDays = 0) {
+    const now = new Date();
+    const ts = now.getTime() + offsetDays * 24 * 3600 * 1000;
+    return new Date(ts).toLocaleDateString("en-CA", {
+      timeZone: "Asia/Shanghai",
+    });
+  },
+  getDayKey(ts = Date.now()) {
+    return new Date(ts).toLocaleDateString("en-CA", {
+      timeZone: "Asia/Shanghai",
+    });
+  },
+  getClientName(request) {
+    const x =
+      request.headers.get("X-Emby-Client") ||
+      request.headers.get("X-Emby-Device-Name") ||
+      request.headers.get("User-Agent") ||
+      "Unknown";
+    return String(x).slice(0, 64);
+  },
+  async getTgConfig(env) {
+    const kv = this.getKV(env);
+    if (!kv) return null;
+    const cfg = await kv.get("tg:config", { type: "json" });
+    return (
+      cfg || { enabled: false, token: "", chat: "", flowGB: 0, errCount: 0 }
+    );
+  },
+  async setTgConfig(env, cfg) {
+    const kv = this.getKV(env);
+    if (!kv) return;
+    await kv.put("tg:config", cfg || {});
+  },
+  async logPlayback(env, node, request, res, isPlayback) {
+    try {
+      if (!isPlayback) return;
+      if (res && res.status >= 300 && res.status < 400) return;
+      const method = String(request.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") return;
+      const db = await this.ensureKeepaliveStateTable(env);
+      if (!db) return;
+      const day = this.getDayKey();
+      const nodeName = String(
+        node?.displayName || node?.name || "unknown",
+      ).slice(0, 64);
+      const nodeKey = String(node?.name || "")
+        .trim()
+        .toLowerCase();
+      const client = this.getClientName(request);
+      const range = request.headers.get("Range") || "";
+      const isRange = /^bytes=\d+-\d*/i.test(range);
+      let bytes = Number(res.headers.get("Content-Length") || 0) || 0;
+      const cr = res.headers.get("Content-Range");
+      if (cr) {
+        const m = /bytes\s+(\d+)-(\d+)\/\d+/i.exec(cr);
+        if (m) {
+          const start = Number(m[1]);
+          const end = Number(m[2]);
+          if (!Number.isNaN(start) && !Number.isNaN(end) && end >= start) {
+            bytes = end - start + 1;
+          }
+        }
+      }
+      const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
+      const ua = (request.headers.get("User-Agent") || "").slice(0, 120);
+      const now = Date.now();
+      const deviceId = request.headers.get("X-Emby-Device-Id") || "";
+      const sessKey =
+        day + "|" + nodeName + "|" + ip + "|" + ua + "|" + deviceId;
+      let sessInc = 0;
+      const row = await db
+        .prepare("SELECT last_ts FROM play_sessions WHERE k=?1")
+        .bind(sessKey)
+        .first();
+      const lastTs = Number(row?.last_ts || 0);
+      if (!row || now - lastTs > 5 * 60 * 1000) sessInc = 1;
+      await db
+        .prepare(
+          "INSERT INTO play_sessions (k, day, last_ts) VALUES (?1, ?2, ?3) " +
+            "ON CONFLICT(k) DO UPDATE SET day=excluded.day, last_ts=excluded.last_ts",
+        )
+        .bind(sessKey, day, now)
+        .run();
+      if (nodeKey) {
+        await db
+          .prepare(
+            "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, ?2, NULL) " +
+              "ON CONFLICT(node) DO UPDATE SET last_play_ts=excluded.last_play_ts",
+          )
+          .bind(nodeKey, now)
+          .run();
+      }
+      const isErr = res && res.status >= 500 ? 1 : 0;
+      const playInc = sessInc;
+      await db
+        .prepare(
+          "INSERT INTO play_stats (day,node,client,plays,bytes,sessions,errors,updated_at) " +
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
+            "ON CONFLICT(day,node,client) DO UPDATE SET " +
+            "plays=plays+excluded.plays, bytes=bytes+excluded.bytes, sessions=sessions+excluded.sessions, " +
+            "errors=errors+excluded.errors, updated_at=excluded.updated_at",
+        )
+        .bind(day, nodeName, client, playInc, bytes, sessInc, isErr, now)
+        .run();
+      if (isErr) {
+        const cfg = await this.getTgConfig(env);
+        if (cfg?.enabled && cfg?.token && cfg?.chat) {
+          await sendTG(cfg.token, cfg.chat, "📢 Emby 告警\n⚠️ 发生 5xx 错误");
+        }
+      }
+    } catch (e) {
+      console.log("logPlayback error:", e);
+    }
+  },
+  async buildDailyReport(env) {
+    const db = this.getDb(env);
+    if (!db) return "❌ D1 未绑定";
+    const dayToday = this.getDayKey();
+    const dayYest = this.getDayKeyOffset(-1);
+    const getSum = async (day) => {
+      const total = await db
+        .prepare(
+          "SELECT SUM(plays) AS plays, SUM(bytes) AS bytes, SUM(sessions) AS sessions " +
+            "FROM play_stats WHERE day=?1",
+        )
+        .bind(day)
+        .first();
+      return {
+        plays: Number(total?.plays || 0),
+        bytes: Number(total?.bytes || 0),
+        sessions: Number(total?.sessions || 0),
+      };
+    };
+    const today = await getSum(dayToday);
+    const yest = await getSum(dayYest);
+    const topNodes = await db
+      .prepare(
+        "SELECT node, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY node ORDER BY plays DESC LIMIT 99",
+      )
+      .bind(dayToday)
+      .all();
+    const topClients = await db
+      .prepare(
+        "SELECT client, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY client ORDER BY plays DESC LIMIT 99",
+      )
+      .bind(dayToday)
+      .all();
+    const toGB = (bytes) =>
+      Math.round((bytes / (1024 * 1024 * 1024)) * 10) / 10;
+    const fmtTop = (rows, key) => {
+      const arr = Array.isArray(rows?.results) ? rows.results : [];
+      if (!arr.length) return "暂无";
+      return arr
+        .map((r) => "  • " + (r[key] || "未知") + "(" + (r.plays || 0) + ")")
+        .join("\n");
+    };
+    return (
+      "📊 Emby 反代每日报表\n" +
+      "🗓 今天（北京）： " +
+      dayToday +
+      "\n" +
+      "▶️ 播放次数： " +
+      today.plays +
+      "\n" +
+      "📦 播放流量： " +
+      toGB(today.bytes) +
+      " GB\n" +
+      "🔥 活跃播放： " +
+      today.sessions +
+      "\n" +
+      "━━━━━━━━━━━━━━\n" +
+      "🗓 昨天（北京）： " +
+      dayYest +
+      "\n" +
+      "▶️ 播放次数： " +
+      yest.plays +
+      "\n" +
+      "📦 播放流量： " +
+      toGB(yest.bytes) +
+      " GB\n" +
+      "🔥 活跃播放： " +
+      yest.sessions +
+      "\n" +
+      "━━━━━━━━━━━━━━\n" +
+      "🏷 热门节点（今天）：\n" +
+      fmtTop(topNodes, "node") +
+      "\n" +
+      "📱 热门客户端（今天）：\n" +
+      fmtTop(topClients, "client")
+    );
+  },
+  async checkAlerts(env) {
+    const db = this.getDb(env);
+    if (!db) return null;
+    const cfg = await this.getTgConfig(env);
+    if (!cfg || !cfg.enabled) return null;
+    const day = this.getDayKey();
+    const sum = await db
+      .prepare(
+        "SELECT SUM(bytes) AS bytes, SUM(errors) AS errors FROM play_stats WHERE day=?1",
+      )
+      .bind(day)
+      .first();
+    const bytes = Number(sum?.bytes || 0);
+    const errors = Number(sum?.errors || 0);
+    const flowGB = Number(cfg.flowGB || 0);
+    const errCount = Number(cfg.errCount || 0);
+    const alerts = [];
+    if (flowGB > 0 && bytes >= flowGB * 1024 * 1024 * 1024) {
+      alerts.push(
+        "🚨 流量预警：已达 " +
+          (bytes / (1024 * 1024 * 1024)).toFixed(1) +
+          " GB",
+      );
+    }
+    if (errCount > 0 && errors >= errCount) {
+      alerts.push("⚠️ 异常告警：5xx 次数 " + errors);
+    }
+    return alerts.length ? alerts : null;
+  },
+  async checkKeepaliveAndNotify(env) {
+    const db = await this.ensureKeepaliveStateTable(env);
+    if (!db) return;
+    const cfg = await this.getTgConfig(env);
+    if (!cfg || !cfg.enabled || !cfg.token || !cfg.chat) return;
+    const nodes = await this.listAllNodes(env, "admin", 0);
+    const now = Date.now();
+    const dayMs = 24 * 3600 * 1000;
+    const today = this.getDayKey(now); // 北京日期 YYYY-MM-DD
+    const shNow = new Date(
+      new Date(now).toLocaleString("en-US", { timeZone: "Asia/Shanghai" }),
+    );
+    const curMin = shNow.getHours() * 60 + shNow.getMinutes();
+    const mainMin = 0; // 00:00
+    const fallbackMin = 12 * 60; // 12:00
+    const inMainWindow = curMin >= mainMin && curMin < mainMin + 70;
+    const inFallbackWindow = curMin >= fallbackMin && curMin < fallbackMin + 70;
+    if (!inMainWindow && !inFallbackWindow) return;
+    for (const n of nodes) {
+      try {
+        const nodeKey = String(n?.name || "")
+          .trim()
+          .toLowerCase();
+        if (!nodeKey) continue;
+        const periodDays = Math.max(0, Math.floor(Number(n?.renewDays || 0)));
+        if (periodDays <= 0) continue; // 仅处理设置了周期的节点
+        const beforeDays = Math.max(
+          0,
+          Math.floor(Number(n?.remindBeforeDays || 0)),
+        );
+        let st = await db
+          .prepare(
+            "SELECT anchor_ts, last_play_ts, last_notify_day FROM keepalive_state WHERE node=?1",
+          )
+          .bind(nodeKey)
+          .first();
+        if (!st) {
+          await db
+            .prepare(
+              "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, 0, NULL)",
+            )
+            .bind(nodeKey, now)
+            .run();
+          st = { anchor_ts: now, last_play_ts: 0, last_notify_day: null };
+        }
+        if (String(st?.last_notify_day || "") === today) continue; // 当天只发一次
+        const anchorTs = Number(st?.anchor_ts || now);
+        const lastPlayTs = Number(st?.last_play_ts || 0);
+        const baseTs = lastPlayTs > 0 ? lastPlayTs : anchorTs;
+        const dueTs = baseTs + periodDays * dayMs;
+        const notifyStartTs = dueTs - beforeDays * dayMs;
+        if (now < notifyStartTs) continue;
+        const leftMs = dueTs - now;
+        const showName = String(n?.displayName || n?.name || nodeKey);
+        const msg =
+          (leftMs <= 0 ? "⛔【保号到期提醒】\n" : "⏰【保号提醒】\n") +
+          "节点：" +
+          showName +
+          "\n" +
+          "保号周期：" +
+          periodDays +
+          "天\n" +
+          "提前提醒：" +
+          beforeDays +
+          "天\n" +
+          (leftMs <= 0
+            ? "状态：已到期（未观看）\n"
+            : "剩余：" + Math.ceil(leftMs / dayMs) + "天\n") +
+          "最后播放：" +
+          (lastPlayTs > 0
+            ? new Date(lastPlayTs).toLocaleString("zh-CN", {
+                timeZone: "Asia/Shanghai",
+                hour12: false,
+              })
+            : "无记录");
+        await sendTG(cfg.token, cfg.chat, msg);
+        await db
+          .prepare(
+            "UPDATE keepalive_state SET last_notify_day=?2 WHERE node=?1",
+          )
+          .bind(nodeKey, today)
+          .run();
+      } catch (e) {
+        console.error(
+          "keepalive node notify failed:",
+          n?.name,
+          e?.message || e,
+        );
+      }
+    }
+  },
+  async cleanupOld(env) {},
   packNode(n) {
     const o = { t: String(n?.target || "").trim() };
     if (n?.mode) o.m = String(n.mode);
@@ -431,6 +852,15 @@ const Database = {
     if (n?.embyUser) o.eu = String(n.embyUser);
     if (n?.embyPass) o.ep = String(n.embyPass);
     if (n?.directExternal) o.de = 1;
+    if (Number.isFinite(Number(n?.renewDays)) && Number(n.renewDays) > 0) {
+      o.xd = Math.floor(Number(n.renewDays)); // 保号周期
+    }
+    if (
+      Number.isFinite(Number(n?.remindBeforeDays)) &&
+      Number(n.remindBeforeDays) >= 0
+    ) {
+      o.xb = Math.floor(Number(n.remindBeforeDays)); // 提前几天提醒
+    }
     return JSON.stringify(o);
   },
   unpackNode(name, raw) {
@@ -459,6 +889,12 @@ const Database = {
       embyUser: String(raw.eu ?? raw.embyUser ?? ""),
       embyPass: String(raw.ep ?? raw.embyPass ?? ""),
       directExternal: !!(raw.de ?? raw.directExternal ?? false),
+      renewDays: Number.isFinite(Number(raw.xd ?? raw.renewDays))
+        ? Math.max(0, Math.floor(Number(raw.xd ?? raw.renewDays)))
+        : 0,
+      remindBeforeDays: Number.isFinite(Number(raw.xb ?? raw.remindBeforeDays))
+        ? Math.max(0, Math.floor(Number(raw.xb ?? raw.remindBeforeDays)))
+        : 0,
     };
   },
   async getNode(nodeName, env, ctx, uid = "admin") {
@@ -508,14 +944,17 @@ const Database = {
     if (!kv) return [];
     const key = this.listCacheKey(uid);
     const now = Date.now();
-    const ttl =
-      typeof ttlOverride === "number"
-        ? Math.max(0, ttlOverride)
+    const forceRefresh =
+      typeof ttlOverride === "number" && Number(ttlOverride) <= 0;
+    const ttl = forceRefresh
+      ? 0
+      : Number.isFinite(Number(ttlOverride))
+        ? Math.max(0, Number(ttlOverride))
         : Number(Config?.Defaults?.ListCacheTTL || 15000);
     const hit = GLOBALS.NodeListCache.get(key);
-    if (hit && hit.exp > now) return hit.data;
+    if (!forceRefresh && hit && hit.exp > now) return hit.data;
     const inflight = GLOBALS.NodeListInflight.get(key);
-    if (inflight) {
+    if (!forceRefresh && inflight) {
       if (hit?.data) return hit.data;
       return await inflight;
     }
@@ -536,14 +975,15 @@ const Database = {
           const mk = this.memKey(uid, name);
           const mem = GLOBALS.NodeCache.get(mk);
           let v = mem && mem.exp > now2 ? mem.data : null;
-          if (!v) {
+          if (!v || forceRefresh) {
             const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
             v = this.unpackNode(name, raw);
-            if (v)
+            if (v) {
               GLOBALS.NodeCache.set(mk, {
                 data: v,
                 exp: now2 + Config.Defaults.CacheTTL,
               });
+            }
           }
           return v;
         }),
@@ -562,13 +1002,17 @@ const Database = {
           { sensitivity: "base" },
         );
       });
-      GLOBALS.NodeListCache.set(key, { data: out, exp: Date.now() + ttl });
+      if (ttl > 0) {
+        GLOBALS.NodeListCache.set(key, { data: out, exp: Date.now() + ttl });
+      } else {
+        GLOBALS.NodeListCache.delete(key);
+      }
       return out;
     })().finally(() => {
       GLOBALS.NodeListInflight.delete(key);
     });
     GLOBALS.NodeListInflight.set(key, task);
-    if (hit?.data) return hit.data;
+    if (!forceRefresh && hit?.data) return hit.data;
     return await task;
   },
   async checkOne(target, timeoutMs = 4500) {
@@ -641,9 +1085,202 @@ const Database = {
       await cache.delete(this.cacheUrl(uid, name));
     };
     switch (data.action) {
+      case "cname.get":
+      case "cname.set": {
+        const token = String(env.CF_API_TOKEN || "").trim();
+        const zoneName = String(env.CF_ZONE_NAME || "").trim();
+        const recordName = String(env.CF_RECORD_NAME || "").trim();
+        if (!token || !zoneName || !recordName) {
+          return new Response(
+            JSON.stringify({
+              error: "CF_API_TOKEN / CF_ZONE_NAME / CF_RECORD_NAME 未配置",
+            }),
+            {
+              status: 500,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+        const cfFetch = async (method, path, body) => {
+          const r = await fetch("https://api.cloudflare.com/client/v4" + path, {
+            method,
+            headers: {
+              Authorization: "Bearer " + token,
+              "Content-Type": "application/json",
+            },
+            body: body ? JSON.stringify(body) : undefined,
+          });
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok || !d?.success) {
+            const msg =
+              (d?.errors && d.errors[0] && d.errors[0].message) ||
+              "CF API ERROR: " + r.status;
+            throw new Error(msg);
+          }
+          return d;
+        };
+        const normCname = (v) => {
+          let s = String(v || "").trim();
+          if (!s) return "";
+          if (/^https?:\/\//i.test(s)) {
+            try {
+              s = new URL(s).hostname;
+            } catch {}
+          }
+          s = s.replace(/\/.*$/, "").replace(/\.$/, "");
+          return s;
+        };
+        try {
+          const z = await cfFetch(
+            "GET",
+            "/zones?name=" + encodeURIComponent(zoneName),
+          );
+          const zoneId = z?.result?.[0]?.id;
+          if (!zoneId) throw new Error("未找到 Zone: " + zoneName);
+          const rec = await cfFetch(
+            "GET",
+            `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(recordName)}`,
+          );
+          const record = rec?.result?.[0];
+          if (!record) throw new Error("未找到 CNAME 记录: " + recordName);
+          if (data.action === "cname.get") {
+            return new Response(
+              JSON.stringify({ success: true, content: record.content }),
+              {
+                headers: { "Content-Type": "application/json;charset=utf-8" },
+              },
+            );
+          }
+          const value = normCname(data.value);
+          if (!value) throw new Error("CNAME 目标不能为空");
+          const upd = await cfFetch(
+            "PUT",
+            `/zones/${zoneId}/dns_records/${record.id}`,
+            {
+              type: "CNAME",
+              name: recordName,
+              content: value,
+              ttl: record.ttl ?? 1,
+              proxied: record.proxied ?? false,
+            },
+          );
+          return new Response(
+            JSON.stringify({
+              success: true,
+              content: upd?.result?.content || value,
+            }),
+            {
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        } catch (e) {
+          return new Response(
+            JSON.stringify({ error: e?.message || "CF API 调用失败" }),
+            {
+              status: 500,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+      }
+      case "tg.get": {
+        const cfg = await this.getTgConfig(env);
+        return new Response(
+          JSON.stringify({ success: true, content: cfg || {} }),
+          {
+            headers: { "Content-Type": "application/json;charset=utf-8" },
+          },
+        );
+      }
+      case "tg.set": {
+        const cfg = data.content || {};
+        await this.setTgConfig(env, {
+          enabled: !!cfg.enabled,
+          token: String(cfg.token || "").trim(),
+          chat: String(cfg.chat || "").trim(),
+          flowGB: Math.min(10240, Math.max(0, Number(cfg.flowGB || 0))),
+          errCount: Math.min(2000, Math.max(0, Number(cfg.errCount || 0))),
+        });
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        });
+      }
+      case "keepalive.test": {
+        const cfg = await this.getTgConfig(env);
+        if (!cfg || !cfg.enabled || !cfg.token || !cfg.chat) {
+          return new Response(
+            JSON.stringify({ error: "请先在TG设置中启用并配置 Token/Chat ID" }),
+            {
+              status: 400,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+        const name = String(data.displayName || data.name || "未命名节点");
+        const renewDays = Math.max(0, Math.floor(Number(data.renewDays || 0)));
+        const remindBeforeDays = Math.max(
+          0,
+          Math.floor(Number(data.remindBeforeDays || 0)),
+        );
+        const text =
+          "🧪【保号测试通知】\n" +
+          "节点：" +
+          name +
+          "\n" +
+          "保号周期：" +
+          renewDays +
+          "天\n" +
+          "提前提醒：" +
+          remindBeforeDays +
+          "天\n" +
+          "提醒时间：北京时间 00:00（主提醒），12:00（补发）";
+        await sendTG(cfg.token, cfg.chat, text);
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        });
+      }
+      case "tg.test": {
+        const cfg = await this.getTgConfig(env);
+        if (!cfg || !cfg.token || !cfg.chat) {
+          return new Response(
+            JSON.stringify({ error: "请先配置 Bot Token 和 Chat ID" }),
+            {
+              status: 400,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+        const text = "✅ Telegram 报表测试消息";
+        await sendTG(cfg.token, cfg.chat, text);
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        });
+      }
       case "list": {
         const nodes = await this.listAllNodes(env, uid, 0);
-        return new Response(JSON.stringify({ nodes, uid }), {
+        const db = await this.ensureKeepaliveStateTable(env);
+        const lastMap = {};
+        if (db) {
+          const rows = await db
+            .prepare("SELECT node, last_play_ts FROM keepalive_state")
+            .all();
+          (rows?.results || []).forEach((r) => {
+            const k = String(r.node || "")
+              .trim()
+              .toLowerCase();
+            lastMap[k] = Number(r.last_play_ts || 0);
+          });
+        }
+        const withLast = nodes.map((n) => {
+          const key = String(n.name || "")
+            .trim()
+            .toLowerCase();
+          return {
+            ...n,
+            lastPlayAt: lastMap[key] || 0,
+          };
+        });
+        return new Response(JSON.stringify({ nodes: withLast, uid }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
       }
@@ -721,7 +1358,18 @@ const Database = {
             .toLowerCase();
           const oldName = Validators.NAME_RE.test(oldNameRaw) ? oldNameRaw : "";
           const newKey = this.nodeKey(uid, n.name);
+          const prevName = oldName || n.name;
+          const prevRaw = await kv.get(this.nodeKey(uid, prevName), {
+            type: "json",
+          });
           if (data.action === "save") {
+            if (oldName && !prevRaw) {
+              errors.push({
+                name: n.name,
+                error: "原节点不存在（可能已删除或列表过期），请刷新后重试",
+              });
+              continue;
+            }
             const exists = await kv.get(newKey);
             if (!oldName && exists) {
               errors.push({
@@ -740,10 +1388,6 @@ const Database = {
           }
           let toSave = n;
           if (data.action === "save") {
-            const prevName = oldName || n.name;
-            const prevRaw = await kv.get(this.nodeKey(uid, prevName), {
-              type: "json",
-            });
             const prevNode = this.unpackNode(prevName, prevRaw);
             const hasFavInPayload =
               raw && Object.prototype.hasOwnProperty.call(raw, "fav");
@@ -889,6 +1533,19 @@ const Database = {
       }
       case "checkStatus": {
         try {
+          const baseOrigin = new URL(request.url).origin;
+          const buildProxyUrl = (n) => {
+            const name = encodeURIComponent(String(n?.name || "").trim());
+            if (!name) return "";
+            const secret = n?.secret
+              ? "/" + encodeURIComponent(String(n.secret))
+              : "";
+            return baseOrigin + "/" + name + secret;
+          };
+          const buildTestUrl = (proxyUrl) => {
+            if (!proxyUrl) return "";
+            return proxyUrl.replace(/\/+$/, "") + "/System/Info/Public";
+          };
           let target = [];
           if (Array.isArray(data.names) && data.names.length > 0) {
             const names = data.names
@@ -922,8 +1579,8 @@ const Database = {
                 });
                 continue;
               }
-              const targets = Validators.splitTargets(String(n.target || ""));
-              const urlToCheck = String(targets[0] || "").trim();
+              const proxyUrl = buildProxyUrl(n);
+              const urlToCheck = buildTestUrl(proxyUrl);
               if (!urlToCheck) {
                 results.push({
                   name: n.name || "",
@@ -933,7 +1590,7 @@ const Database = {
                   rt: 0,
                   latency: 0,
                   checked: "",
-                  error: "NO_TARGET",
+                  error: "NO_PROXY_URL",
                 });
                 continue;
               }
@@ -1103,10 +1760,12 @@ const ProxyHandler = {
   isPanUrl(urlLike) {
     try {
       const u = typeof urlLike === "string" ? new URL(urlLike) : urlLike;
-      const hay = `${u.host}${u.pathname}${u.search}`.toLowerCase();
-      return FIXED_PROXY_RULES.WANGPAN_KEYWORDS.some((k) =>
-        hay.includes(String(k).toLowerCase()),
-      );
+      const host = u.hostname.toLowerCase();
+      return FIXED_PROXY_RULES.WANGPAN_KEYWORDS.some((k) => {
+        const key = String(k).toLowerCase();
+        if (host === key || host.endsWith("." + key)) return true;
+        return !key.includes(".") && host.includes(key);
+      });
     } catch {
       return false;
     }
@@ -1182,18 +1841,20 @@ const ProxyHandler = {
       "referer",
     ].forEach((k) => h.delete(k));
     h.set("Host", u.host);
-    const ua = h.get("User-Agent") || "";
-    if (!ua || /mpv|ffmpeg|lavf|dart|okhttp/i.test(ua)) {
-      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
-    }
+    const ua = request.headers.get("User-Agent") || "";
+    if (ua) h.set("User-Agent", ua);
+    else h.set("User-Agent", "emby-proxy/1.0");
     const rg = request.headers.get("Range");
     if (rg) h.set("Range", rg);
     const ifRange = request.headers.get("If-Range");
     if (ifRange) h.set("If-Range", ifRange);
-    if (adapter.keepReferer && adapter.referer) {
+    const existingRef = h.get("Referer");
+    if (adapter.referer && (!existingRef || !adapter.keepReferer)) {
       h.set("Referer", adapter.referer);
     }
-    if (adapter.keepOrigin && adapter.referer) {
+    if (!adapter.keepOrigin) {
+      h.delete("Origin");
+    } else if (adapter.referer) {
       try {
         h.set("Origin", new URL(adapter.referer).origin);
       } catch {}
@@ -1203,7 +1864,10 @@ const ProxyHandler = {
       h.delete("Referer");
     }
     if (mode === "retry-browserish") {
-      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+      h.set(
+        "User-Agent",
+        request.headers.get("User-Agent") || "emby-proxy/1.0",
+      );
       if (!h.get("Referer") && adapter.keepReferer && adapter.referer) {
         h.set("Referer", adapter.referer);
       }
@@ -1215,7 +1879,6 @@ const ProxyHandler = {
   buildCleanProxyHeaders(request, targetUrl, node, env, opts = {}) {
     const h = new Headers(request.headers);
     const isStreaming = !!opts.isStreaming;
-
     const toDelete = [
       "cf-connecting-ip",
       "cf-ipcountry",
@@ -1232,7 +1895,6 @@ const ProxyHandler = {
       "connection",
       "content-length",
     ];
-
     if (!isStreaming) {
       toDelete.push(
         "origin",
@@ -1243,32 +1905,22 @@ const ProxyHandler = {
         "sec-fetch-user",
       );
     }
-
     toDelete.forEach((k) => h.delete(k));
-
     h.set("Host", targetUrl.host);
-
-    const ua = h.get("User-Agent") || "";
-    if (!ua || /mpv|ffmpeg|lavf|dart|okhttp/i.test(ua)) {
-      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
-    }
-
+    const ua = request.headers.get("User-Agent") || "";
+    if (ua) h.set("User-Agent", ua);
+    else h.set("User-Agent", "emby-proxy/1.0");
     const rg = request.headers.get("Range");
     if (rg) h.set("Range", rg);
-
     const ifRange = request.headers.get("If-Range");
     if (ifRange) h.set("If-Range", ifRange);
-
     if (isStreaming) {
       h.set("Accept-Encoding", "identity");
     }
-
     const isEmos = this.isEmosNode(node, targetUrl, env);
     if (isEmos) this.applyEmosHeaders(h, request, env);
-
     return h;
   },
-
   stripClientIpHeaders(h) {
     if (!h) return h;
     h.delete("CF-Connecting-IP");
@@ -1281,13 +1933,24 @@ const ProxyHandler = {
     h.delete("X-Forwarded-Port");
     return h;
   },
-  async handle(request, node, path, name, key, env, uid = "admin") {
+  async handle(request, node, path, name, key, env, uid = "admin", ctx = null) {
     const targets = this.getNodeTargets(node);
     if (!targets.length) {
       return new Response("Invalid node target", { status: 500 });
     }
+    const nodeKey = `${String(uid || "admin").toLowerCase()}:${String(name || node?.name || "")}`;
+    const total = targets.length;
+    let start = Number(GLOBALS.LineCursor.get(nodeKey) || 0);
+    if (!Number.isFinite(start) || start < 0) start = 0;
+    if (total > 0) start = start % total;
+    const ordered = targets.slice(start).concat(targets.slice(0, start));
     let lastRes = null;
-    for (const t of targets) {
+    let tried = 0;
+    for (const t of ordered) {
+      const banKey = `${nodeKey}|${t}`;
+      const banned = !!GLOBALS.LineBan.get(banKey);
+      if (banned && total > 1) continue;
+      tried++;
       try {
         const nodeTry = { ...node, target: t };
         const res = await this.handleOneTarget(
@@ -1298,22 +1961,83 @@ const ProxyHandler = {
           key,
           env,
           uid,
+          ctx,
         );
-        if (res && res.status < 500) return res;
+        const status = Number(res?.status || 0);
+        const shouldTryNext =
+          !res ||
+          status >= 500 ||
+          status === 403 ||
+          status === 404 ||
+          status === 416;
+        if (!shouldTryNext) {
+          const realIdx = targets.indexOf(t);
+          GLOBALS.LineCursor.set(nodeKey, (realIdx + 1) % total);
+          return res;
+        }
+        GLOBALS.LineBan.set(banKey, 1, 60 * 1000);
         lastRes = res;
-      } catch (e) {}
+      } catch (e) {
+        GLOBALS.LineBan.set(banKey, 1, 60 * 1000);
+        lastRes = this.errResp(e);
+      }
+    }
+    if (tried === 0) {
+      for (const t of ordered) {
+        try {
+          const nodeTry = { ...node, target: t };
+          const res = await this.handleOneTarget(
+            request,
+            nodeTry,
+            path,
+            name,
+            key,
+            env,
+            uid,
+            ctx,
+          );
+          const status = Number(res?.status || 0);
+          const shouldTryNext =
+            !res ||
+            status >= 500 ||
+            status === 403 ||
+            status === 404 ||
+            status === 416;
+          if (!shouldTryNext) {
+            const realIdx = targets.indexOf(t);
+            GLOBALS.LineCursor.set(nodeKey, (realIdx + 1) % total);
+            return res;
+          }
+          lastRes = res;
+        } catch (e) {
+          lastRes = this.errResp(e);
+        }
+      }
     }
     return (
       lastRes ||
       new Response("Proxy Error: all targets failed", { status: 502 })
     );
   },
-  async handleOneTarget(request, node, path, name, key, env, uid = "admin") {
+  async handleOneTarget(
+    request,
+    node,
+    path,
+    name,
+    key,
+    env,
+    uid = "admin",
+    ctx = null,
+  ) {
     let base = new URL(node.target);
     const isEmos = this.isEmosNode(node, base, env);
     const ua = request.headers.get("User-Agent") || "";
     const isCapy = /CapyPlayer|Dart/i.test(ua);
     let forwardPath = path || "/";
+    const basePath = (base.pathname || "").replace(/\/+$/, "");
+    if (/^\/emby(\/|$)/i.test(forwardPath) && /^\/emby(\/|$)/i.test(basePath)) {
+      forwardPath = forwardPath.replace(/^\/emby/i, "") || "/";
+    }
     const capyStrip = String(env.CAPY_STRIP_EMBY || "0") === "1";
     if (capyStrip && isCapy && /^\/emby(\/|$)/i.test(forwardPath)) {
       forwardPath = forwardPath.replace(/^\/emby/i, "") || "/";
@@ -1333,8 +2057,9 @@ const ProxyHandler = {
       } catch {
         return new Response("Bad raw url", { status: 400 });
       }
-      if (!/^https?:$/i.test(u.protocol))
-        return new Response("Forbidden", { status: 403 });
+      if (!/^https?:/i.test(raw)) {
+        return new Response("Bad Request", { status: 400 });
+      }
       const allowHosts = this.buildRawAllowHosts(node, env);
       const allowAnyWhenSplitNoStream =
         String(env.RAW_ALLOW_ANY || "0") === "1";
@@ -1347,33 +2072,53 @@ const ProxyHandler = {
     const finalUrl = new URL(forwardPath, base);
     finalUrl.search = reqUrl.search;
     const isStrm = /\.strm$/i.test(finalUrl.pathname);
-    if (isStrm) {
+    const isEmbyStreamStrm = /\/emby\/videos\/[^/]+\/stream\.strm$/i.test(
+      finalUrl.pathname,
+    );
+    if (isStrm && !isEmbyStreamStrm) {
       try {
         const hStrm = new Headers(request.headers);
         hStrm.delete("Range");
         hStrm.delete("If-Range");
-
         const resStrm = await this.fetchWithProtocolFallback(finalUrl, {
           method: "GET",
           headers: hStrm,
           redirect: "follow",
           cf: { cacheEverything: false, cacheTtl: 0 },
         });
-
         if (!resStrm.ok) return resStrm;
-
         const text = (await resStrm.text()).trim();
         const line =
           text
             .split(/\r?\n/)
             .map((s) => s.trim())
             .find((s) => s && !s.startsWith("#")) || "";
-
         if (!/^https?:\/\//i.test(line)) {
           return new Response("Bad STRM", { status: 400 });
         }
-
-        return this.handleDirect(request, line, env, node);
+        const targetUrl = new URL(line);
+        if (!/^https?:$/i.test(targetUrl.protocol)) {
+          return new Response("Bad STRM URL", { status: 400 });
+        }
+        const reqNoQueryUrl = new URL(request.url);
+        reqNoQueryUrl.search = "";
+        const reqNoQuery = new Request(reqNoQueryUrl.toString(), request);
+        const resDirect = await this.handleDirect(
+          reqNoQuery,
+          targetUrl.toString(),
+          env,
+          node,
+        );
+        const logTask = Database.logPlayback(
+          env,
+          node,
+          request,
+          resDirect,
+          true,
+        );
+        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
+        else logTask.catch(() => {});
+        return resDirect;
       } catch {
         return new Response("STRM parse error", { status: 500 });
       }
@@ -1389,15 +2134,25 @@ const ProxyHandler = {
       request.method === "GET";
     const h = new Headers(request.headers);
     const p = finalUrl.pathname.toLowerCase();
-    const isAuthApi = p.includes("/users/authenticatebyname");
+    const isAuthApi = /\/users\/authenticate(byname)?/i.test(p);
     const isPlaybackApi =
-      p.includes("/videos/") ||
-      p.includes("/playback/") ||
-      p.includes("/sessions/playing") ||
-      /\.m3u8$/i.test(p) ||
-      /\.mpd$/i.test(p) ||
-      /\.mkv$/i.test(p) ||
-      /\.mp4$/i.test(p);
+      p.includes("/emby/") &&
+      (p.includes("/videos/") ||
+        p.includes("/playback/") ||
+        p.includes("/sessions/playing") ||
+        (p.includes("/items/") &&
+          (p.includes("/download") ||
+            p.includes("/stream") ||
+            p.includes("/file"))) ||
+        p.includes("/audio/") ||
+        p.includes("/hls/") ||
+        p.includes("/dash/") ||
+        /\.m3u8$/i.test(p) ||
+        /\.mpd$/i.test(p) ||
+        /\.mkv$/i.test(p) ||
+        /\.mp4$/i.test(p) ||
+        /\.ts$/i.test(p) ||
+        /\.m4s$/i.test(p));
     const needCompatOrigin = isAuthApi || isPlaybackApi;
     if (isCapy && isAuthApi) {
       h.delete("X-Emby-Token");
@@ -1436,14 +2191,9 @@ const ProxyHandler = {
         }
       }
     }
-    const currentUa = h.get("User-Agent") || "";
-    if (
-      isPlaybackApi ||
-      !currentUa ||
-      /mpv|ffmpeg|lavf|dart|okhttp/i.test(currentUa)
-    ) {
-      h.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
-    }
+    const currentUa = request.headers.get("User-Agent") || "";
+    if (currentUa) h.set("User-Agent", currentUa);
+    else h.set("User-Agent", "emby-proxy/1.0");
     [
       "cf-connecting-ip",
       "cf-ipcountry",
@@ -1506,12 +2256,28 @@ const ProxyHandler = {
       );
       const nodeDirect = this.isNodeDirectExternal(node);
       if (
+        nodeDirect &&
+        (isPlaybackApi || isImageApi || isAdditionalPartsApi) &&
+        (request.method === "GET" || request.method === "HEAD")
+      ) {
+        const fakeRes = new Response(null, { status: 200 });
+        const logTask = Database.logPlayback(env, node, request, fakeRes, true);
+        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
+        else logTask.catch(() => {});
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: finalUrl.toString(),
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      if (
         !nodeDirect &&
         (isPlaybackApi || isImageApi || isAdditionalPartsApi)
       ) {
         const isStreaming =
           isPlaybackApi || GLOBALS.Regex.Streaming.test(finalUrl.pathname);
-
         const hClean = this.buildCleanProxyHeaders(
           request,
           finalUrl,
@@ -1519,7 +2285,6 @@ const ProxyHandler = {
           env,
           { isStreaming },
         );
-
         const method = request.method.toUpperCase();
         const body =
           method === "GET" || method === "HEAD"
@@ -1527,7 +2292,6 @@ const ProxyHandler = {
             : replayBody
               ? replayBody.slice(0)
               : null;
-
         let resClean = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: hClean,
@@ -1535,15 +2299,17 @@ const ProxyHandler = {
           redirect: "follow",
           cf,
         });
-
         const reqRange = request.headers.get("Range");
         if (isStreaming && reqRange) {
+          const m = /^\s*bytes\s*=\s*(\d+)-/i.exec(reqRange || "");
+          const start = m ? Number(m[1]) : NaN;
           const cr = resClean.headers.get("Content-Range");
-          const ar = resClean.headers.get("Accept-Ranges");
-          if (
-            resClean.status === 416 ||
-            (resClean.status === 200 && !cr && ar !== "bytes")
-          ) {
+          const is206 = resClean.status === 206;
+          const shouldFallbackNoRange =
+            Number.isFinite(start) &&
+            start === 0 &&
+            ((!is206 && !cr) || resClean.status === 416);
+          if (shouldFallbackNoRange) {
             const hNoRange = new Headers(hClean);
             hNoRange.delete("Range");
             hNoRange.delete("If-Range");
@@ -1556,22 +2322,38 @@ const ProxyHandler = {
             });
           }
         }
-
         const headersClean = new Headers(resClean.headers);
+        const cr2 = resClean.headers.get("Content-Range");
         const aoClean = this.pickAllowOrigin(request, env);
         headersClean.set("Access-Control-Allow-Origin", aoClean);
         if (aoClean !== "*") headersClean.set("Vary", "Origin");
-
+        headersClean.set(
+          "Access-Control-Expose-Headers",
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+        );
+        const arClean = resClean.headers.get("Accept-Ranges") || "";
         if (isStreaming) {
-          headersClean.set("Cache-Control", "no-store");
-          headersClean.set("Pragma", "no-cache");
-          headersClean.set("Expires", "0");
+          if (resClean.status === 206 || cr2 || /bytes/i.test(arClean)) {
+            headersClean.set("Accept-Ranges", "bytes");
+          } else {
+            headersClean.delete("Accept-Ranges");
+          }
         }
-
+        if (isStreaming) {
+          headersClean.set("Cache-Control", "no-store, no-transform");
+        }
         if (/\.m3u8($|\?)/i.test(finalUrl.pathname)) {
           headersClean.set("Content-Type", "application/vnd.apple.mpegurl");
         }
-
+        const logTask = Database.logPlayback(
+          env,
+          node,
+          request,
+          resClean,
+          isPlaybackApi || isStreaming,
+        );
+        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
+        else logTask.catch(() => {});
         return new Response(resClean.body, {
           status: resClean.status,
           statusText: resClean.statusText,
@@ -1603,7 +2385,10 @@ const ProxyHandler = {
         const h3 = new Headers(h);
         this.stripClientIpHeaders(h3);
         h3.set("Host", base.host);
-        h3.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+        h3.set(
+          "User-Agent",
+          request.headers.get("User-Agent") || "emby-proxy/1.0",
+        );
         const rg = request.headers.get("Range");
         if (rg) h3.set("Range", rg);
         const ifRange = request.headers.get("If-Range");
@@ -1626,7 +2411,10 @@ const ProxyHandler = {
           const h4 = new Headers(h3);
           this.stripClientIpHeaders(h4);
           h4.set("Host", base.host);
-          h4.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+          h4.set(
+            "User-Agent",
+            request.headers.get("User-Agent") || "emby-proxy/1.0",
+          );
           h4.set("Referer", base.origin + "/");
           h4.set("Origin", base.origin);
           const rg2 = request.headers.get("Range");
@@ -1649,7 +2437,10 @@ const ProxyHandler = {
             const h5 = new Headers(h4);
             this.stripClientIpHeaders(h5);
             h5.set("Host", base.host);
-            h5.set("User-Agent", DIRECT_RULES.DEFAULT_UA);
+            h5.set(
+              "User-Agent",
+              request.headers.get("User-Agent") || "emby-proxy/1.0",
+            );
             h5.set("Referer", base.origin + "/");
             h5.set("Origin", base.origin);
             const rg3 = request.headers.get("Range");
@@ -1675,6 +2466,8 @@ const ProxyHandler = {
       const ao = this.pickAllowOrigin(request, env);
       headers.set("Access-Control-Allow-Origin", ao);
       if (ao !== "*") headers.set("Vary", "Origin");
+      const selfPrefix = this.routePrefix(name, key, uid);
+      rewriteSetCookieHeaders(headers, request.url, selfPrefix);
       if (isStatic) {
         headers.set("Access-Control-Allow-Origin", "*");
         headers.delete("Vary");
@@ -1684,7 +2477,7 @@ const ProxyHandler = {
           "public, max-age=31536000, s-maxage=86400",
         );
       } else if (isStreaming) {
-        headers.set("Cache-Control", "no-store");
+        headers.set("Cache-Control", "no-store, no-transform");
       }
       let splitLocHit = false;
       let hostMap = null;
@@ -1893,14 +2686,18 @@ const ProxyHandler = {
     );
     let allowFallback = true;
     let bodyBuf = null;
+    let allowRetry = true; // ✅ 新增
     if (hasBody) {
       const cl = Number(request.headers.get("content-length") || 0);
       if (cl > maxBytes) allowFallback = false;
       if (allowFallback) {
         bodyBuf = await request.clone().arrayBuffer();
         if (bodyBuf.byteLength > maxBytes) allowFallback = false;
+      } else {
+        allowRetry = false; // ✅ body 不可复用时禁止重试
       }
     }
+    if (hasBody && !bodyBuf) allowRetry = false; // ✅ 保险
     let lastErr = null;
     let lastRes = null;
     const targets = allowFallback ? candidates : candidates.slice(0, 1);
@@ -1915,14 +2712,43 @@ const ProxyHandler = {
           node,
           "normal",
         );
+        h.set("Accept-Encoding", "identity");
         this.stripClientIpHeaders(h);
+        let hActive = h;
         let res = await fetch(target, {
           method,
-          headers: h,
+          headers: hActive,
           body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
           redirect: redirectMode,
         });
-        if (res.status === 403) {
+        const reqRange = request.headers.get("Range");
+        if (reqRange) {
+          const m = /^\s*bytes\s*=\s*(\d+)-/i.exec(reqRange || "");
+          const start = m ? Number(m[1]) : NaN;
+          const cr = res.headers.get("Content-Range");
+          const is206 = res.status === 206;
+          const shouldFallbackNoRange =
+            Number.isFinite(start) &&
+            start === 0 &&
+            ((!is206 && !cr) || res.status === 416);
+          if (shouldFallbackNoRange) {
+            const hNoRange = new Headers(hActive);
+            hNoRange.delete("Range");
+            hNoRange.delete("If-Range");
+            hNoRange.set("Accept-Encoding", "identity");
+            res = await fetch(target, {
+              method,
+              headers: hNoRange,
+              body: hasBody
+                ? bodyBuf
+                  ? bodyBuf.slice(0)
+                  : request.body
+                : null,
+              redirect: redirectMode,
+            });
+          }
+        }
+        if (allowRetry && res.status === 403) {
           const h2 = this.buildDirectOutboundHeaders(
             request,
             u,
@@ -1930,15 +2756,17 @@ const ProxyHandler = {
             node,
             "retry-no-origin",
           );
+          h2.set("Accept-Encoding", "identity");
           this.stripClientIpHeaders(h2);
+          hActive = h2; // 关键
           res = await fetch(target, {
             method,
-            headers: h2,
+            headers: hActive,
             body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
             redirect: redirectMode,
           });
         }
-        if (res.status === 403) {
+        if (allowRetry && res.status === 403) {
           const h3 = this.buildDirectOutboundHeaders(
             request,
             u,
@@ -1946,19 +2774,63 @@ const ProxyHandler = {
             node,
             "retry-browserish",
           );
+          h3.set("Accept-Encoding", "identity");
           this.stripClientIpHeaders(h3);
+          hActive = h3; // 关键
           res = await fetch(target, {
             method,
-            headers: h3,
+            headers: hActive,
             body: hasBody ? (bodyBuf ? bodyBuf.slice(0) : request.body) : null,
             redirect: redirectMode,
           });
+        }
+        const reqRangeAfterRetry = request.headers.get("Range");
+        if (reqRangeAfterRetry) {
+          const m = /^\s*bytes\s*=\s*(\d+)-/i.exec(reqRangeAfterRetry || "");
+          const start = m ? Number(m[1]) : NaN;
+          const cr = res.headers.get("Content-Range");
+          const is206 = res.status === 206;
+          const shouldFallbackNoRange =
+            Number.isFinite(start) &&
+            start === 0 &&
+            ((!is206 && !cr) || res.status === 416);
+          if (shouldFallbackNoRange) {
+            const hNoRange = new Headers(hActive);
+            hNoRange.delete("Range");
+            hNoRange.delete("If-Range");
+            hNoRange.set("Accept-Encoding", "identity");
+            res = await fetch(target, {
+              method,
+              headers: hNoRange,
+              body: hasBody
+                ? bodyBuf
+                  ? bodyBuf.slice(0)
+                  : request.body
+                : null,
+              redirect: redirectMode,
+            });
+          }
         }
         if ([525, 526, 530].includes(res.status)) {
           lastRes = res;
           continue;
         }
         const rh = new Headers(res.headers);
+        const reqU = new URL(request.url);
+        const i = reqU.pathname.indexOf("/__raw__/");
+        const selfPrefix = i >= 0 ? reqU.pathname.slice(0, i) : "";
+        rewriteSetCookieHeaders(rh, request.url, selfPrefix);
+        const cr2 = res.headers.get("Content-Range");
+        rh.set(
+          "Access-Control-Expose-Headers",
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+        );
+        const ar = res.headers.get("Accept-Ranges") || "";
+        if (res.status === 206 || cr2 || /bytes/i.test(ar)) {
+          rh.set("Accept-Ranges", "bytes");
+        } else {
+          rh.delete("Accept-Ranges");
+        }
         try {
           const reqU = new URL(request.url);
           const i = reqU.pathname.indexOf("/__raw__/");
@@ -2060,7 +2932,11 @@ const ProxyHandler = {
       } catch {}
     }
     const selfPrefix = this.routePrefix(currentName, currentKey, uid);
-    const splitNoStream = FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY;
+    const nodeDirect = this.isNodeDirectExternal(currentNode);
+    const splitNoStream =
+      nodeDirect ||
+      FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY ||
+      (currentNode?.mode === "split" && !currentNode?.streamTarget);
     for (const full of urls) {
       let u;
       try {
@@ -2134,6 +3010,7 @@ const UI = {
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Emby反代管理系统</title>
 <style>
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap");
 :root{
   --bg:#f3f6fb;
   --panel:#ffffff;
@@ -2153,19 +3030,16 @@ const UI = {
   --card-text:#1e293b;
   --card-muted:#64748b;
   --card-line:#dbe4f2;
-  --density-gap:12px;
-  --density-card-pad:14px;
-  --density-name-size:34px;
-  --density-label-size:16px;
-  --density-mono-size:14px;
 }
 *{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif;
-  background:var(--bg); color:var(--text);
+html,body{
+  margin:0;
+  padding:0;
+  font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);
+  color:var(--text);
 }
-#bgLayer{position:fixed;inset:0;z-index:-3;background-size:cover;background-position:center;background-repeat:no-repeat;filter:brightness(var(--bg-brightness,100%)) blur(var(--bg-blur,0px));transform:scale(1.04);display:none}
+gLayer{position:fixed;inset:0;z-index:-3;background-size:cover;background-position:center;background-repeat:no-repeat;filter:brightness(var(--bg-brightness,100%)) blur(var(--bg-blur,0px));transform:scale(1.04);display:none}
 #bgOverlay{position:fixed;inset:0;z-index:-2;pointer-events:none;background:rgba(0,0,0,var(--bg-overlay,0.2));display:none}
 body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .glass{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);background:color-mix(in oklab, var(--panel) 80%, transparent)}
@@ -2197,13 +3071,11 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .icon-btn.is-fav{ color:#f59e0b; }
 .icon-btn:hover{background:rgba(148,163,184,.16)}
 .icon-btn.eye-toggle{transition:.15s ease}
-.icon-btn.eye-toggle.on{
-  color:#2563eb;
-  background:rgba(37,99,235,.12);
-}
+.icon-btn.eye-toggle.on,
 .icon-btn.eye-toggle.off{
   color:var(--icon);
-  opacity:.7;
+  background:transparent;
+  opacity:.9;
 }
 .controls{display:grid;grid-template-columns:120px minmax(0,1fr) 140px 94px 94px 40px;gap:10px;margin-bottom:12px;width:100%}
 .controls select,.controls input,.controls button{
@@ -2265,10 +3137,16 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
     min-width:0;
     max-width:calc(100vw - 120px);
   }
-  #nodeCount,
-  .right-actions{
+  #nodeCount,.right-actions{
     flex:0 0 auto;
   }
+}
+@media (max-width:480px){
+  .card{padding:8px}
+  .name{font-size:calc(var(--density-name-size) - 2px)}
+  .app-btn{height:28px;font-size:12px}
+  .badge{height:22px;font-size:12px;padding:0 10px}
+  .actions .icon-btn{padding:8px}
 }
 #toggleAllVisBtn{
   display:flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;
@@ -2309,7 +3187,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 }
 .card:hover{
   border-color:color-mix(in oklab, var(--card-line) 70%, #93c5fd 30%);
-  box-shadow:0 6px 18px rgba(37,99,235,.12);
+  box-shadow:0 10px 22px rgba(15,23,42,.08);
   transform:translateY(-1px);
 }
 .row{
@@ -2331,7 +3209,7 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   min-width:0;
   flex:1 1 auto;
 }
-.selbox{ margin-top:4px; flex:0 0 auto; }
+.selbox{ margin-top:6px; flex:0 0 auto; }
 .selbox input{ width:16px; height:16px; cursor:pointer; }
 .info{
   min-width:0;
@@ -2348,15 +3226,10 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   text-overflow:ellipsis;
   max-width:100%;
 }
-.path-tip{
-  margin-top:2px;
-  font-size:12px;
-  color:var(--muted);
-  white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
-  max-width:100%;
-}
+.subline .v{color:var(--card-text)}
+.subline{display:flex;gap:6px;color:var(--card-muted);margin-top:4px}
+.path-tip{margin-top:2px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.status{margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--card-muted)}
 .actions{
   display:flex;
   gap:4px;
@@ -2373,28 +3246,21 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .badge{
   display:inline-flex;
   align-items:center;
-  height:18px;
-  padding:0 8px;
+  height:20px;
+  padding:0 9px;
   border-radius:999px;
-  font-size:11px;
-  line-height:18px;
+  font-size:12px;
+  line-height:20px;
   font-weight:700;
   white-space:nowrap;
 }
 .b-mode-normal{ background:#dbeafe; color:#1d4ed8; }
+.b-mode-direct{ background:#fff3e0; color:#c2410c; border:1px solid #fed7aa; }
 .b-green{  background:#dcfce7; color:#166534; }
 .b-blue{   background:#e0f2fe; color:#075985; }
 .b-orange{ background:#ffedd5; color:#9a3412; }
 .b-gray{   background:#e5e7eb; color:#374151; }
 .b-note{   background:#ede9fe; color:#5b21b6; }
-.status{
-  margin-top:8px;
-  display:flex;
-  align-items:center;
-  gap:6px;
-  font-size:12px;
-  color:var(--card-muted);
-}
 .dot{
   width:7px;
   height:7px;
@@ -2405,52 +3271,26 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
 .dot.online{  background:#16a34a; }
 .dot.offline{ background:#ef4444; }
 .dot.unknown{ background:#94a3b8; }
-.line{margin-top:10px;display:grid;grid-template-columns:56px minmax(0,1fr) 24px 24px 24px;gap:6px;align-items:start}
-.label{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-  font-size:12.5px;
-  font-weight:500;
-  color: color-mix(in srgb, var(--card-text) 88%, #000 12%);
-  line-height:1.35;
-  letter-spacing:0.1px;
+.card{ --head-indent: 30px; }
+.line,
+.app-row{
+  padding-left: var(--head-indent);
 }
-.k{
-  font-size:12px;
-  color:var(--card-muted);
-  font-weight:500;
+.line .copy-ghost{
+  opacity:1;
+  transform:none;
+  transition:none;
+  pointer-events:auto;
 }
-.mono{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-  font-size:12.5px;
-  font-weight:500;
-  color: color-mix(in srgb, var(--card-text) 88%, #000 12%);
-  line-height:1.35;
-  letter-spacing:0.1px;
-  cursor:copy;
-  white-space:normal;
-  word-break:break-all;
-  overflow:hidden;
-  display:-webkit-box;
-  -webkit-line-clamp:2;
-  -webkit-box-orient:vertical;
-}
-.mono.muted{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-  font-size:12.5px;
-  font-weight:500;
-  line-height:1.35;
-  letter-spacing:0.1px;
-  color: color-mix(in srgb, var(--card-text) 88%, #000 12%);
-}
-.app-row{margin-top:6px;display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+.app-row{margin-top:6px;display:flex;gap:6px;justify-content:flex-start;flex-wrap:wrap}
 .app-btn{
   border:1px solid var(--inborder);
   background:var(--inbg);
   color:var(--intext);
   border-radius:8px;
-  padding:0 6px;
-  height:24px;
-  font-size:11px;
+  padding:0 9px;
+  height:26px;
+  font-size:12px;
   font-weight:700;
   cursor:pointer;
   white-space:nowrap;
@@ -2522,10 +3362,49 @@ body.modal-open .fab{display:none;}
 }
 .modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:60}
 .modal{
-  display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(92vw,560px);
-  border:1px solid var(--line);border-radius:14px;padding:14px;z-index:61
+  display:none;
+  position:fixed;
+  left:50%;
+  top:50%;
+  transform:translate(-50%,-50%);
+  width:min(94vw,560px);
+  max-height: 92vh;
+  overflow-y: auto;
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:14px;
+  z-index:61;
+  -webkit-overflow-scrolling: touch;
 }
 .modal h3{margin:0 0 10px;color:var(--text)}
+.modal{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+.modal .field-title{
+  font-size:15px;
+  font-weight:600;
+  color:#0f172a;
+  letter-spacing:.1px;
+}
+.modal label,
+.modal .small,
+.modal .hint,
+.modal .tips,
+.modal .muted{
+  font-size:12.5px;
+  font-weight:400;
+  color:#64748b;
+  letter-spacing:.1px;
+  line-height:1.45;
+}
+.modal input:not([type="checkbox"]),
+.modal select,
+.modal textarea{
+  font-size:14px;
+  font-weight:500;
+  color:#111827;
+  letter-spacing:.1px;
+}
 .modal input:not([type="checkbox"]),.modal select{
   width:100%;height:40px;border:1px solid var(--inborder);background:#fff;color:var(--intext);
   border-radius:10px;padding:0 10px;margin-bottom:8px;outline:none
@@ -2551,11 +3430,11 @@ body.modal-open .fab{display:none;}
   min-width:48px;
   padding:0 8px;
   cursor:pointer;
-}
+} 
  #editor #targetList .target-item{
   width:100%;
   display:block;
-}
+} 
 .field-title{
   font-size:15px;
   font-weight:700;
@@ -2581,10 +3460,10 @@ body.modal-open .fab{display:none;}
 .project-links{
   width: min(1100px, calc(100% - 24px));
   margin: 10px auto 8px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  box-shadow: none;
+  padding: 0;                 
+  border: none;               
+  background: transparent;    
+  box-shadow: none;           
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -2597,11 +3476,11 @@ body.modal-open .fab{display:none;}
 .project-links .label{
   color: var(--muted);
   margin-right: 2px;
-  font: inherit;
+  font: inherit;              
 }
 .project-links a{
   text-decoration: none;
-  font: inherit;
+  font: inherit;              
   font-size: 14px;
   color: var(--text2);
   border: 1px solid var(--line);
@@ -2627,7 +3506,7 @@ body.modal-open .fab{display:none;}
 }
 .disclaimer{
   width: min(1100px, calc(100% - 24px));
-  margin: 16px auto 12px;
+  margin: 16px auto 12px;   
   padding: 10px 12px;
   border: 1px dashed #cbd5e1;
   border-radius: 10px;
@@ -2635,14 +3514,23 @@ body.modal-open .fab{display:none;}
   line-height: 1.6;
   color: #64748b;
   background: rgba(255,255,255,.55);
-  text-align: center;
+  text-align: center;       
 }
 @media (max-width:768px){
   .disclaimer{ margin: 12px; font-size: 11.5px; }
 }
-.modal .btns{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+.modal .btns{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  margin-top:12px;
+  position: sticky;
+  bottom: -14px; 
+  background: var(--panel);
+  padding: 10px 0 2px;
+  border-top: 1px solid var(--line);
+}
 .btn{border:none;border-radius:10px;padding:9px 14px;cursor:pointer}
-/* mobile modal adapt */
 @media (max-width: 640px){
   .modal{
     width: calc(100vw - 16px);
@@ -2652,7 +3540,6 @@ body.modal-open .fab{display:none;}
     overflow: auto;
     -webkit-overflow-scrolling: touch;
   }
-
   #editor{
     font-size: 13px;
   }
@@ -2671,14 +3558,12 @@ body.modal-open .fab{display:none;}
     font-size: 14px;
     padding: 0 10px;
   }
-
   #editor .btn-row{
     flex-wrap: wrap;
   }
   #editor .btn-row .btn{
     flex: 1 1 calc(50% - 6px);
   }
-
   #editor .btns{
     position: sticky;
     bottom: -1px;
@@ -2693,12 +3578,6 @@ body.modal-open .fab{display:none;}
 .tag-item{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:8px}
 .tag-item:hover{background:#f8fafc}
 .tag-item input{margin:0}
-.tag-item{
-  display:flex;
-  align-items:center;
-  justify-content:flex-start;
-  gap:8px;
-}
 .tag-item input[type="checkbox"]{
   width:16px;
   height:16px;
@@ -2709,21 +3588,18 @@ body.modal-open .fab{display:none;}
 .gate{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:70}
 .gate-box{width:min(92vw,360px);background:#fff;border:1px solid #d7dce4;border-radius:14px;padding:16px}
 .gate-box h3{margin:0 0 10px}
+.gate-pass{ position:relative; }
+.gate-pass #gatePwd{ padding-right:34px; }
 .gate-box input{width:100%;height:42px;border:1px solid #d7dce4;border-radius:10px;padding:0 10px;outline:none}
-.gate-box button{width:100%;height:42px;border:none;border-radius:10px;background:#111827;color:#fff;cursor:pointer;margin-top:10px}
-.tip{min-height:16px;margin-top:7px;font-size:12px;color:#ef4444}
+.tip{min-height:16px;margin-top:7px;font-size:12px;color:#ef4444;display:none}
 .tip.ok{color:#16a34a}
+.tip.show{display:block}
 .toast-wrap{position:fixed;right:16px;bottom:16px;z-index:90;display:flex;flex-direction:column;gap:8px}
 .toast{
   min-width:180px;max-width:360px;background:#111827;color:#fff;border-radius:10px;padding:10px 12px;font-size:13px;
   box-shadow:0 8px 18px rgba(0,0,0,.2);opacity:.97
 }
 .toast.success{background:#065f46}.toast.warn{background:#92400e}.toast.error{background:#991b1b}
-:root{
-  --density-name-size: clamp(22px, 2.2vw, 30px);
-  --density-label-size: clamp(14px, 1.2vw, 16px);
-  --density-mono-size: clamp(12px, 1vw, 14px);
-}
 .gate-box,
 .modal,
 .menu-panel{
@@ -2737,6 +3613,23 @@ body.modal-open .fab{display:none;}
 .modal input:not([type="checkbox"]),
 .modal select,
 .modal textarea,
+#cnameModal input,
+#cnameModal textarea{
+  width: 100%;
+  box-sizing: border-box;
+}
+#cnameModal textarea{
+  min-height: 110px;
+}
+#cnameModal input,
+#cnameModal textarea{
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+}
+#cnameModal textarea{
+  font-family: inherit;
+}
 .menu-panel input,
 .menu-panel select{
   background: var(--inbg) !important;
@@ -2744,12 +3637,38 @@ body.modal-open .fab{display:none;}
   border: 1px solid var(--inborder) !important;
   border-radius: 10px !important;
 }
-.gate-box button{
+.gate-box #gateBtn{
+  width:100%;
+  height:42px;
+  margin-top:10px;
+  font-size:14px;
+  font-weight:700;
+  cursor:pointer;
   background: var(--brand) !important;
   color: #fff !important;
   border: none !important;
   border-radius: 10px !important;
 }
+.gate-pass .pass-eye{
+  position:absolute;
+  right:8px;
+  top:50%;
+  transform:translateY(-50%);
+  width:20px;
+  height:20px;
+  border:none;
+  background:transparent;
+  padding:0;
+  border-radius:0;
+  color:#94a3b8;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+}
+.gate-pass .pass-eye:hover{ color:#64748b; }
+.gate-pass .pass-eye svg{ width:20px; height:20px; display:block; }
+.gate-pass .pass-eye span{ display:flex; }  
 button:focus-visible,
 .btn:focus-visible,
 input:focus-visible,
@@ -2766,10 +3685,6 @@ textarea:focus-visible,
 button,
 .btn{
   transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease;
-}
-.card:hover{
-  transform: translateY(-1px);
-  box-shadow: 0 10px 22px rgba(15,23,42,.08);
 }
 button:hover,.btn:hover{
   transform: translateY(-1px);
@@ -2810,24 +3725,35 @@ button:hover,.btn:hover{
   color:#9aa4b2;
   font-size:14px;
 }
+#editor .exp-row{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  margin-bottom:8px;
+}
+#editor .exp-row .exp-date{
+  flex: 1 1 62%;
+  min-width: 170px;
+}
+#editor .exp-row .exp-time{
+  flex: 1 1 38%;
+  min-width: 120px;
+}
+#editor input.exp-date,
+#editor input.exp-time{
+  height:42px;
+  font-size:15px;
+  border-radius:10px;
+  padding:0 12px;
+  margin-bottom:0;
+  font-family: inherit;
+  font-weight: 500;
+}
 #editor .field-help{
   font-size:12px;
   line-height:1.5;
   color:var(--muted);
   margin:2px 0 10px 24px;
-}
-#editor .check-row{
-  display:flex;
-  align-items:flex-start;
-  gap:8px;
-  margin:6px 0 2px;
-}
-#editor .check-row input[type="checkbox"]{
-  margin-top:3px;
-}
-#editor .check-row span{
-  font-size:15px;
-  line-height:1.4;
 }
 #editor .btn-row{
   display:flex;
@@ -2867,7 +3793,7 @@ button:hover,.btn:hover{
   position: relative;
 }
 #editor .pass-wrap #inPass{
-  padding-right: 34px;
+  padding-right: 34px; 
 }
 #editor .pass-eye{
   position: absolute;
@@ -2893,29 +3819,89 @@ button:hover,.btn:hover{
 #editor .pass-eye:focus{
   outline: none;
 }
-#editor #togglePassIcon,
-#editor #togglePassIcon svg{
-  width: 16px;
-  height: 16px;
-  display: block;
-}
 #editor .check-row input[type="checkbox"]{
   width: 20px;
   height: 20px;
   margin: 0;
   accent-color: var(--blue);
 }
-#editor .pass-eye{
-  width: 24px;
-  height: 24px;
-  right: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-}
 #editor #togglePassIcon,
 #editor #togglePassIcon svg{
   width: 22px;
   height: 22px;
+}
+:root{
+  --density-name-size: clamp(24px, 2vw, 30px);
+  --density-label-size: clamp(13px, 1.1vw, 15px);
+  --density-mono-size: clamp(12px, 1vw, 13px);
+  --density-card-pad: 12px;
+  --density-gap: 10px;
+  --status-indent: 13px;
+}
+.title{font-size:34px;font-weight:800}
+.title::after{width:28px;height:3px;margin-bottom:6px}
+.title small{font-size:12px;padding:3px 10px}
+.controls select,
+.controls input,
+.controls button{
+  height:36px;
+  font-size:13px;
+  border-radius:10px;
+}
+.subline,
+.path-tip,
+.status,
+.k,
+.mono,
+.mono.muted{
+  font-size:var(--density-mono-size);
+  line-height:1.35;
+}
+.line{
+  margin-top:6px;
+  display:grid;
+  grid-template-columns:56px minmax(0,1fr) auto;
+  gap:6px 8px;
+  align-items:flex-start;
+}
+.label{
+  text-align:left;
+  font-size:var(--density-mono-size);
+  line-height:1.2;
+  color:var(--card-muted);
+  padding-top:2px;
+}
+.status{
+  position:relative;
+}
+.status .dot{
+  position:absolute;
+  left:-12px;
+  top:50%;
+  transform:translateY(-50%);
+}
+.line-actions{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  padding-top:2px;
+}
+.line-actions .icon-btn{
+  width:22px;
+  height:22px;
+  padding:0;
+  border-radius:6px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  color:var(--icon);
+  background:transparent;
+  opacity:.9;
+}
+.line-actions .icon-btn svg{
+  width:20px;
+  height:20px;
+  display:block;
 }
 </style>
 </head>
@@ -2924,8 +3910,13 @@ button:hover,.btn:hover{
 <div id="bgOverlay"></div>
 <div id="gate" class="gate">
   <div class="gate-box">
-    <h3>管理员登录</h3>
-    <input id="gatePwd" type="password" placeholder="请输入 ADMIN_TOKEN" />
+<h3>管理员登录</h3>
+<div class="pass-wrap gate-pass">
+  <input id="gatePwd" type="password" placeholder="请输入 ADMIN_TOKEN" />
+  <button type="button" id="gatePassBtn" class="pass-eye" onclick="Gate.toggleGatePass()" title="显示/隐藏密码">
+    <span id="gatePassIcon"></span>
+  </button>
+</div>
 <button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">进入面板</button>
     <div id="gateTip" class="tip">请先在 Worker 环境变量设置 ADMIN_TOKEN</div>
   </div>
@@ -2938,7 +3929,7 @@ button:hover,.btn:hover{
   <small id="nodeCount">0个</small>
 </div>
       <div class="right-actions">
-  <span class="top-ver">v1.5</span>
+  <span class="top-ver">v1.6</span>
   <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
@@ -2947,17 +3938,19 @@ button:hover,.btn:hover{
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
           </button>
           <div id="menuPanel" class="menu-panel glass">
-            <button onclick="App.exportData()">导出配置</button>
-            <button onclick="document.getElementById('fIn').click()">导入配置</button>
-            <button onclick="App.openBgModal()">背景高级设置</button>
-            <button onclick="App.setDensity('compact')">密度：紧凑</button>
-            <button onclick="App.setDensity('cozy')">密度：舒适</button>
-            <button onclick="App.setPreset('deepblue')">主题：深蓝</button>
-            <button onclick="App.setPreset('graphite')">主题：石墨</button>
-            <button onclick="App.setPreset('light')">主题：浅灰</button>
-            <button onclick="Gate.logout()">退出登录</button>
-            <input type="file" id="fIn" hidden accept=".json" onchange="App.importFile(this)">
-          </div>
+  <button onclick="App.openTgModal()">TG 每日报表设置</button>
+  <button onclick="App.openCnameModal()">CNAME 优选设置</button>
+  <button onclick="App.exportData()">导出配置</button>
+  <button onclick="document.getElementById('fIn').click()">导入配置</button>
+  <button onclick="App.openBgModal()">背景高级设置</button>
+  <button onclick="App.setDensity('compact')">密度：紧凑</button>
+  <button onclick="App.setDensity('cozy')">密度：舒适</button>
+  <button onclick="App.setPreset('deepblue')">主题：深蓝</button>
+  <button onclick="App.setPreset('graphite')">主题：石墨</button>
+  <button onclick="App.setPreset('light')">主题：浅灰</button>
+  <button onclick="Gate.logout()">退出登录</button>
+  <input type="file" id="fIn" hidden accept=".json" onchange="App.importFile(this)">
+</div>
         </div>
       </div>
     </div>
@@ -2984,25 +3977,28 @@ button:hover,.btn:hover{
   <div id="mask" class="modal-mask" onclick="App.closeAllModals()"></div>
   <div id="editor" class="modal glass">
 <h3 id="editorTitle">新增节点</h3>
-<div class="field-title"><span class="req">*</span> 请求路径（英文）</div>
-<input id="inName" placeholder="请输入唯一英文路径（a-z0-9_-，1~32）">
 <div class="field-title">显示名称（可中文）</div>
 <input id="inDisplayName" placeholder="自定义">
-<div class="field-title">标签</div>
-<div class="tagbar">
-  <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
-</div>
-<datalist id="tagSuggestions"></datalist>
-<input id="inNote" placeholder="备注（如 保号规则 / 等）">
 <div class="field-title"><span class="req">*</span> 目标地址（可多个）</div>
 <div id="targetList"></div>
 <div style="display:flex;gap:8px;margin-top:8px;">
-<div class="btn-row">
-<button type="button" class="btn btn-g" onclick="App.addTargetInput()">+ 添加目标地址</button>
-<button type="button" class="btn btn-g" onclick="App.removeTargetInput()">- 删除一栏</button>
+  <div class="btn-row">
+    <button type="button" class="btn btn-g" onclick="App.addTargetInput()">+ 添加目标地址</button>
+    <button type="button" class="btn btn-g" onclick="App.removeTargetInput()">- 删除一栏</button>
+  </div>
 </div>
-</div>
+<div class="field-help">最多支持 5 条目标地址。</div>
+<div class="field-title"><span class="req">*</span> 请求路径和密钥路径</div>
+<input id="inName" placeholder="请输入唯一英文路径（a-z0-9_-，1~32）">
 <input id="inSec" placeholder="密钥路径（可选，不能含 / ? #）">
+<div class="field-title">Emby 账号（用于一键导入）</div>
+<input id="inUser" placeholder="用户名（可留空）">
+<div class="pass-wrap">
+  <input id="inPass" type="password" placeholder="密码（可留空）">
+  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="显示/隐藏密码">
+    <span id="togglePassIcon"></span>
+  </button>
+</div>
 <div class="field-title">播放策略</div>
 <label class="check-row">
   <input id="inDirectExternal" type="checkbox">
@@ -3011,15 +4007,19 @@ button:hover,.btn:hover{
 <div class="field-help">
   开启后，网盘外链由播放器直接访问（不经 Worker 反代），可能更快但受客户端网络影响。
 </div>
-<div class="field-title">Emby 账号（用于一键导入）</div>
-<input id="inUser" placeholder="用户名（可留空）">
-<div class="pass-wrap">
-  <input id="inPass" type="password" placeholder="密码（可留空）">
-  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="显示/隐藏密码">
-  <span id="togglePassIcon"></span>
-</button>
+<div class="field-title">标签和备注</div>
+<div class="tagbar">
+  <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
 </div>
+<datalist id="tagSuggestions"></datalist>
+<input id="inNote" placeholder="备注（如 保号规则 / 等）">
+<div class="field-title">保号周期（天）</div>
+<input id="inRenewDays" type="number" min="0" max="3650" step="1" placeholder="例如 30（0=不启用）">
+<div class="field-title">提前几天提醒</div>
+<input id="inRemindBeforeDays" type="number" min="0" max="3650" step="1" placeholder="例如 3">
+<div class="field-help">提醒时间：北京时间 00:00（主提醒），12:00（补发）</div>
 <div class="btns">
+  <button class="btn btn-g" onclick="App.testKeepaliveNotify()">测试通知</button>
   <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
   <button class="btn btn-p" onclick="App.save()">保存</button>
 </div>
@@ -3046,7 +4046,33 @@ button:hover,.btn:hover{
       <button class="btn btn-p" onclick="App.saveBg()">保存背景设置</button>
     </div>
   </div>
-  <div id="toastWrap" class="toast-wrap"></div>
+<div id="cnameModal" class="modal glass">
+  <h3>CNAME 优选设置</h3>
+  <div class="small">当前记录：<b id="cnameCurrent">-</b></div>
+  <input id="cnameValue" placeholder="输入新的CNAME目标域名（如 cf.xxx.com）">
+  <div class="small">提示：仅支持域名，不要带 https://</div>
+  <div class="btns">
+    <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
+    <button class="btn btn-g" onclick="App.loadCnameStatus()">刷新</button>
+    <button class="btn btn-p" onclick="App.saveCname()">保存</button>
+  </div>
+</div>
+<div id="tgModal" class="modal glass">
+  <h3>Telegram 每日报表</h3>
+  <label class="small"><input type="checkbox" id="tgEnable"> 启用</label>
+<input id="tgToken" placeholder="Bot Token">
+<input id="tgChat" placeholder="Chat ID">
+<input id="tgFlowGB" placeholder="流量预警阈值 GB（0=关闭，最大10240）" min="0" max="10240">
+<input id="tgErrCount" placeholder="异常预警阈值（0=关闭，最大2000）" min="0" max="2000">
+<div class="small">每天北京时间 00:00 自动发送</div>
+  <div class="btns">
+    <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
+    <button class="btn btn-g" onclick="App.loadTg()">刷新</button>
+    <button class="btn btn-g" onclick="App.testTg()">发送测试</button>
+    <button class="btn btn-p" onclick="App.saveTg()">保存</button>
+  </div>
+</div>
+<div id="toastWrap" class="toast-wrap"></div>
 </div>
 <script>
 const $ = (s)=>document.querySelector(s);
@@ -3054,19 +4080,19 @@ function mountFabToControls(){
   const controls = document.querySelector('.controls');
   const fab = document.querySelector('.fab');
   if (!controls || !fab || fab.dataset.moved === '1') return;
-  controls.appendChild(fab);
+  controls.appendChild(fab);   
   fab.dataset.moved = '1';
 }
 const SVG = {
-  edit: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>',
-  trash: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>',
-  eye: '<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"></path><circle cx="12" cy="12" r="3"></circle></svg>',
-  eyeOff: '<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>',
-  copy: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
-  link: '<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l2.92-2.92a5 5 0 0 0-7.07-7.07L11.7 5.23"></path><path d="M14 11a5 5 0 0 0-7.54-.54L3.54 13.38a5 5 0 0 0 7.07 7.07l1.69-1.69"></path></svg>',
-  ping: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9"></path><path d="M12 7v5l3 3"></path></svg>',
-  star: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
-  starOn: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
+  edit: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>',
+  trash: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>',
+  eye: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
+  eyeOff: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M9 10V7a3 3 0 0 1 6 0"/></svg>',
+  copy: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+  link: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+  ping: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9"></path><path d="M12 7v5l3 3"></path></svg>',
+  star: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
+  starOn: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.2"><polygon points="12 2 15 9 22 9 17 14 19 22 12 18 5 22 7 14 2 9 9 9 12 2"></polygon></svg>',
 };
 const PRESETS = {
   light: {
@@ -3090,7 +4116,20 @@ const Gate = {
 getToken() { return (sessionStorage.getItem(this.key) || '').trim(); },
 setToken(v) { sessionStorage.setItem(this.key, String(v || '').trim()); },
 clearToken() { sessionStorage.removeItem(this.key); },
+  initGateEye(){
+    const icon = $('#gatePassIcon');
+    if (icon) icon.innerHTML = SVG.eye;
+  },
+  toggleGatePass(){
+    const ip = $('#gatePwd');
+    const icon = $('#gatePassIcon');
+    if (!ip) return;
+    const show = ip.type === 'password';
+    ip.type = show ? 'text' : 'password';
+    if (icon) icon.innerHTML = show ? SVG.eyeOff : SVG.eye;
+  },
 bindEvents() {
+  this.initGateEye();
   const btn = $('#gateBtn');
   const input = $('#gatePwd');
   if (btn) {
@@ -3107,24 +4146,31 @@ bindEvents() {
   }
 },
 async check() {
-  $('#gateTip').classList.remove('ok');
-  $('#gateTip').innerText = '登录中...';
+  const tip = $('#gateTip');
+  tip.classList.remove('ok');
+  tip.classList.add('show');
+  tip.innerText = '登录中...';
   const v = ($('#gatePwd').value || '').trim();
-  if (!v) { $('#gateTip').innerText = '请输入 ADMIN_TOKEN'; return; }
-  this.setToken(v);
-  const d = await API.listCached({ ttl: 0, force: true });
-  if (d && !d.error) {
-    $('#gateTip').classList.add('ok');
-    $('#gateTip').innerText = '登录成功';
-    $('#gate').style.display='none';
-    $('#app').style.display='block';
-    App.init(d);
+  if (!v) {
+    tip.innerText = '请输入 ADMIN_TOKEN';
     return;
   }
+  this.setToken(v);
+const d = await API.listCached({ ttl: 0, force: true });
+if (d && !d.error) {
+  tip.classList.add('ok');
+  tip.innerText = '登录成功';
+  tip.classList.remove('show');
+  $('#gate').style.display='none';
+  $('#app').style.display='block';
+  App.init(d); 
+  return;
+}
   this.clearToken();
-  $('#gateTip').classList.remove('ok');
-  if (d && d.error === 'UNAUTHORIZED') $('#gateTip').innerText = '令牌错误';
-  else $('#gateTip').innerText = d?.error || '登录失败';
+  tip.classList.remove('ok');
+  tip.classList.add('show');
+  if (d && d.error === 'UNAUTHORIZED') tip.innerText = '令牌错误';
+  else tip.innerText = d?.error || '登录失败';
 },
 async boot() {
   this.bindEvents();
@@ -3200,6 +4246,12 @@ const App = {
     kThemePreset: 'emby_theme_preset',
   kDensity: 'emby_density',
   kBg: 'emby_bg_cfg',
+    autoRefreshMs: 1800000,   
+  autoRefreshTimer: null,
+  startAutoRefresh(){
+    if (this.autoRefreshTimer) clearInterval(this.autoRefreshTimer);
+    this.autoRefreshTimer = setInterval(() => this.refresh(), this.autoRefreshMs);
+  },
 async init(prefetchedList = null){
   this.loadPrefs();
   if (prefetchedList && !prefetchedList.error) {
@@ -3209,6 +4261,7 @@ async init(prefetchedList = null){
   }
   mountFabToControls();
   this.bindBgRangePreview();
+  this.startAutoRefresh();
 },
 openTagSuggest(){
   const inp = $('#inTag');
@@ -3236,9 +4289,9 @@ openTagSuggest(){
     const compact = mode !== 'cozy';
     document.documentElement.style.setProperty('--density-gap', compact?'12px':'16px');
     document.documentElement.style.setProperty('--density-card-pad', compact?'14px':'18px');
-    document.documentElement.style.setProperty('--density-name-size', compact?'34px':'38px');
-    document.documentElement.style.setProperty('--density-label-size', compact?'16px':'17px');
-    document.documentElement.style.setProperty('--density-mono-size', compact?'14px':'15px');
+document.documentElement.style.setProperty('--density-name-size', compact?'28px':'32px');
+document.documentElement.style.setProperty('--density-label-size', compact?'13px':'14px');
+document.documentElement.style.setProperty('--density-mono-size', compact?'12px':'13px');
     localStorage.setItem(this.kDensity, compact?'compact':'cozy');
     if(needToast) this.toast('密度已切换','success');
   },
@@ -3269,6 +4322,62 @@ openTagSuggest(){
     $('#bgOverlayRange').value = String(cfg.overlay ?? 20);
     this.refreshBgRangeText();
     this.openModal('bgModal');
+  },
+    openTgModal(){
+    this.loadTg();
+    this.openModal('tgModal');
+  },
+  async loadTg(){
+    const r = await API.req({ action:'tg.get' });
+    if(!r || !r.success) return this.toast(r.error || '读取失败','error');
+    $('#tgEnable').checked = !!r.content.enabled;
+    $('#tgToken').value = r.content.token || '';
+    $('#tgChat').value = r.content.chat || '';
+    $('#tgFlowGB').value = r.content.flowGB || 0;
+    $('#tgErrCount').value = r.content.errCount || 0;
+  },
+async saveTg(){
+  const flowGB = Number($('#tgFlowGB').value || 0);
+  const errCount = Number($('#tgErrCount').value || 0);
+  if (flowGB < 0 || flowGB > 10240) return this.toast('流量阈值范围：0~10240 GB','warn');
+  if (errCount < 0 || errCount > 2000) return this.toast('异常阈值范围：0~2000','warn');
+  const cfg = {
+    enabled: !!$('#tgEnable').checked,
+    token: String($('#tgToken').value||'').trim(),
+    chat: String($('#tgChat').value||'').trim(),
+    flowGB,
+    errCount
+  };
+  const r = await API.req({ action:'tg.set', content: cfg });
+  if(!r || !r.success) return this.toast(r.error || '保存失败','error');
+  this.toast('保存成功','success');
+},
+  async testTg(){
+    const r = await API.req({ action:'tg.test' });
+    if(!r || !r.success) return this.toast(r.error || '发送失败','error');
+    this.toast('测试消息已发送','success');
+  },
+    openCnameModal(){
+    this.loadCnameStatus();
+    this.openModal('cnameModal');
+  },
+  async loadCnameStatus(){
+    const r = await API.req({ action:'cname.get' });
+    if(!r || !r.success){
+      return this.toast(r.error || '获取 CNAME 失败','error');
+    }
+    $('#cnameCurrent').textContent = r.content || '-';
+    $('#cnameValue').value = r.content || '';
+  },
+  async saveCname(){
+    let v = String($('#cnameValue').value || '').trim();
+    if(!v) return this.toast('请输入 CNAME 目标域名','warn');
+    const r = await API.req({ action:'cname.set', value: v });
+    if(!r || !r.success){
+      return this.toast(r.error || '更新失败','error');
+    }
+    $('#cnameCurrent').textContent = r.content || v;
+    this.toast('更新成功','success');
   },
   bindBgRangePreview(){
     ['bgBrightness','bgBlur','bgOverlayRange'].forEach(id=>{
@@ -3401,7 +4510,7 @@ updateTagSuggestions(){
   sortByOrder(arr) {
     return [...arr].sort((a, b) => {
       const af = !!a.fav, bf = !!b.fav;
-      if (af !== bf) return af ? -1 : 1;
+      if (af !== bf) return af ? -1 : 1; 
       const ar = Number.isFinite(a.rank) ? a.rank : 1e9;
       const br = Number.isFinite(b.rank) ? b.rank : 1e9;
       if (ar !== br) return ar - br;
@@ -3422,7 +4531,7 @@ async moveOrder(dragName, targetName) {
   const r = await API.req({ action: 'saveOrder', names: all });
   if (!r.success) {
     this.toast(r.error || '保存排序失败', 'error');
-    await this.refresh();
+    await this.refresh(); 
     return;
   }
   this.toast('排序已保存', 'success');
@@ -3762,7 +4871,6 @@ async quickAddThirdParty(app, node, fullUrl){
   const ua = (navigator.userAgent || '').toLowerCase();
   const isWindows = ua.includes('windows nt');
   const hillsUrl = isWindows ? built.windowsUrl : built.mobileUrl;
-  console.log('HILLS URL =>', hillsUrl);
   if (isWindows) {
     const manualText = this.buildManualImportText(address, userTrim, passTrim);
     let copied = false;
@@ -3908,8 +5016,8 @@ pathTip.textContent = '/' + n.name;
 const badges = document.createElement('div');
 badges.className = 'badges';
 const bm = document.createElement('span');
-bm.className = 'badge b-mode-normal';
-bm.textContent = '反代';
+bm.className = 'badge ' + (n.directExternal ? 'b-mode-direct' : 'b-mode-normal');
+bm.textContent = n.directExternal ? '直连' : '反代';
 badges.appendChild(bm);
 if ((n.tag || '').trim()) {
   const b1 = document.createElement('span');
@@ -3922,6 +5030,37 @@ if ((n.note || '').trim()) {
   b2.className = 'badge b-note';
   b2.textContent = n.note;
   badges.appendChild(b2);
+}
+const periodDays = Math.max(0, Math.floor(Number(n.renewDays || 0)));
+const remindBeforeDays = Math.max(0, Math.floor(Number(n.remindBeforeDays || 0)));
+if (periodDays > 0) {
+  const b3 = document.createElement('span');
+  b3.className = 'badge b-note';
+  const baseTs = Number(n.lastPlayAt || 0); // 先用最后播放
+  if (baseTs <= 0) {
+    b3.textContent = '保号已启用';
+    b3.style.background = '#e5e7eb';
+    b3.style.color = '#374151';
+  } else {
+    const dueTs = baseTs + periodDays * 86400000;
+    const leftMs = dueTs - Date.now();
+    const warnMs = remindBeforeDays * 86400000;
+    const leftDays = Math.ceil(leftMs / 86400000);
+    if (leftMs <= 0) {
+      b3.textContent = '保号到期';
+      b3.style.background = '#fee2e2';
+      b3.style.color = '#991b1b';
+    } else if (leftMs <= warnMs) {
+      b3.textContent = '即将到期 ' + leftDays + '天';
+      b3.style.background = '#fef3c7';
+      b3.style.color = '#92400e';
+    } else {
+      b3.textContent = '保号正常';
+      b3.style.background = '#dcfce7';
+      b3.style.color = '#166534';
+    }
+  }
+  badges.appendChild(b3);
 }
 const status = document.createElement('div');
 status.className = 'status';
@@ -3936,6 +5075,21 @@ info.appendChild(h3);
 info.appendChild(pathTip);
 info.appendChild(badges);
 info.appendChild(status);
+const lastTs = Number(n.lastPlayAt || 0);
+const lastText = lastTs
+  ? new Date(lastTs).toLocaleString('zh-CN', { timeZone:'Asia/Shanghai', hour12:false })
+  : '暂无';
+const lastLine = document.createElement('div');
+lastLine.className = 'subline';
+const k = document.createElement('span');
+k.className = 'k';
+k.textContent = '最后播放';
+const v = document.createElement('span');
+v.className = 'v';
+v.textContent = lastText;
+lastLine.appendChild(k);
+lastLine.appendChild(v);
+info.appendChild(lastLine);
 leftHead.appendChild(sel);
 leftHead.appendChild(info);
 leftWrap.appendChild(leftHead);
@@ -3949,10 +5103,10 @@ actions.appendChild(this.iconBtn(SVG.trash, '删除', () => this.del(n.name), 'c
       row.appendChild(leftWrap);
       row.appendChild(actions);
       card.appendChild(row);
-      const line1 = document.createElement('div');
-      line1.className = 'line';
-      const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '目标地址';
-      const v1 = document.createElement('div');
+const line1 = document.createElement('div');
+line1.className = 'line';
+const l1 = document.createElement('div'); l1.className = 'label'; l1.textContent = '目标地址';
+const v1 = document.createElement('div');
 v1.className = 'mono ' + (showTarget ? '' : 'muted');
 v1.textContent = showTarget ? (n.target || '') : '******';
 v1.title = '单击复制目标地址';
@@ -3962,26 +5116,46 @@ v1.addEventListener('click', () => {
 });
 const eye1 = this.iconBtn(showTarget ? SVG.eyeOff : SVG.eye, showTarget ? '隐藏目标地址' : '显示目标地址', () => this.toggleVisibility(kTarget));
 eye1.classList.add('eye-toggle', showTarget ? 'on' : 'off');
-      line1.appendChild(l1); line1.appendChild(v1); line1.appendChild(eye1);
-      line1.appendChild(document.createElement('span')); line1.appendChild(document.createElement('span'));
-      card.appendChild(line1);
-      const line2 = document.createElement('div');
-      line2.className = 'line';
-      const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '代理地址';
-      const v2 = document.createElement('div');
+const c0 = this.iconBtn(SVG.copy, '复制目标地址', () => {
+  if (!showTarget) return this.toast('请先显示目标地址', 'warn');
+  this.copyText(n.target || '', '已复制目标地址');
+});
+c0.classList.add('copy-ghost');
+const actions1 = document.createElement('div');
+actions1.className = 'line-actions';
+actions1.appendChild(eye1);
+actions1.appendChild(c0);
+line1.appendChild(l1);
+line1.appendChild(v1);
+line1.appendChild(actions1);
+card.appendChild(line1);
+const line2 = document.createElement('div');
+line2.className = 'line';
+const l2 = document.createElement('div'); l2.className = 'label'; l2.textContent = '代理地址';
+const v2 = document.createElement('div');
 v2.className = 'mono ' + (showProxy ? '' : 'muted');
 v2.textContent = showProxy ? fullUrl : '******';
 v2.title = '单击复制代理地址';
 v2.addEventListener('click', () => {
   if (!showProxy) return this.toast('请先显示代理地址', 'warn');
-  this.copyText(fullUrl, '已复制代理地址');
+  this.copyText(proxyCopyUrl, n.secret ? '已复制含密钥链接' : '已复制代理地址');
 });
+const proxyCopyUrl = fullUrl; // 有密钥=带密钥，无密钥=仅路径
 const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
 eye2.classList.add('eye-toggle', showProxy ? 'on' : 'off');
-      const c1 = this.iconBtn(SVG.copy, '复制普通', () => this.copyText(normalUrl, '已复制普通链接'));
-      const c2 = this.iconBtn(SVG.link, '复制完整', () => this.copyText(fullUrl, '已复制完整链接'));
-      line2.appendChild(l2); line2.appendChild(v2); line2.appendChild(eye2); line2.appendChild(c1); line2.appendChild(c2);
-      card.appendChild(line2);
+const c2 = this.iconBtn(SVG.link, '复制代理地址', () => {
+  if (!showProxy) return this.toast('请先显示代理地址', 'warn');
+  this.copyText(proxyCopyUrl, n.secret ? '已复制含密钥链接' : '已复制代理地址');
+});
+c2.classList.add('copy-ghost');
+const actions2 = document.createElement('div');
+actions2.className = 'line-actions';
+actions2.appendChild(eye2);
+actions2.appendChild(c2);
+line2.appendChild(l2);
+line2.appendChild(v2);
+line2.appendChild(actions2);
+card.appendChild(line2);
 const sen = document.createElement('button');
 sen.className = 'app-btn';
 sen.innerText = 'Sen';
@@ -4029,7 +5203,7 @@ if (appRow.childElementCount > 0) {
 }
       list.appendChild(card);
     }
-    if (arr.length < 6) {
+    if (arr.length < 6) { 
       const hint = document.createElement('div');
       hint.className = 'page-hint';
       hint.style.gridColumn = '1 / -1';
@@ -4087,7 +5261,11 @@ if (appRow.childElementCount > 0) {
         fav: !!n.fav,
         embyUser: setUser ? setUser : (n.embyUser || ''),
         embyPass: setPass ? setPass : (n.embyPass || ''),
-        directExternal: !!n.directExternal
+directExternal: !!n.directExternal,
+renewDays: Number.isFinite(Number(n.renewDays)) ? Number(n.renewDays) : 0,
+remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
+  ? Number(n.remindBeforeDays)
+  : 0,
       };
       const r = await API.req(payload);
       if (r && r.success && (!r.failed || r.failed === 0)) ok++;
@@ -4119,7 +5297,11 @@ if (appRow.childElementCount > 0) {
         fav: !!n.fav,
         embyUser: '',
         embyPass: '',
-        directExternal: !!n.directExternal
+directExternal: !!n.directExternal,
+renewDays: Number.isFinite(Number(n.renewDays)) ? Number(n.renewDays) : 0,
+remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
+  ? Number(n.remindBeforeDays)
+  : 0,
       };
       const r = await API.req(payload);
       if (r && r.success && (!r.failed || r.failed === 0)) ok++;
@@ -4181,7 +5363,7 @@ openModal(id){
 },
 closeAllModals(){
   $('#mask').style.display='none';
-  ['editor','bgModal','tagPicker'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
+  ['editor','bgModal','tagPicker','cnameModal','tgModal'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
   document.body.classList.remove('modal-open');
 },
 splitTargetsText(v){
@@ -4198,6 +5380,7 @@ ensureTargetRows(min = 1){
 addTargetInput(val = ''){
   const list = $('#targetList');
   if (!list) return;
+  if (list.children.length >= 5) return this.toast('目标地址最多5条', 'warn');
   const input = document.createElement('input');
   input.className = 'target-item';
   input.placeholder = 'https://example.com';
@@ -4242,11 +5425,13 @@ openEditor(name){
   this.setTargetInputsFromText('');
   $('#inSec').value = '';
   $('#inUser').value = '';
+  $('#inRenewDays').value = '';
   $('#inPass').value = '';
   $('#inDirectExternal').checked = false;
-  if(name){
-    const n = this.nodes.find(x=>x.name===name);
-    if(n){
+  $('#inRemindBeforeDays').value = '';
+  if (name) {
+    const n = this.nodes.find(x => x.name === name);
+    if (n) {
       this.editingOldName = n.name;
       $('#editorTitle').innerText = '编辑节点';
       $('#inName').value = n.name || '';
@@ -4255,20 +5440,20 @@ openEditor(name){
       $('#inNote').value = n.note || '';
       this.setTargetInputsFromText(n.target || '');
       $('#inSec').value = n.secret || '';
-      $('#inUser').value = n.embyUser || '';
-      $('#inPass').value = n.embyPass || '';
       $('#inDirectExternal').checked = !!n.directExternal;
+      $('#inRenewDays').value = Number.isFinite(Number(n.renewDays)) ? String(Number(n.renewDays)) : '';
+$('#inRemindBeforeDays').value = Number.isFinite(Number(n.remindBeforeDays)) ? String(Number(n.remindBeforeDays)) : '';
       this.currentMode = 'split';
     }
   }
-    const tagInput = $('#inTag');
+  const tagInput = $('#inTag');
   if (tagInput && !tagInput.dataset.autoSuggestBound) {
     tagInput.addEventListener('focus', () => this.openTagSuggest());
     tagInput.dataset.autoSuggestBound = '1';
   }
   $('#inPass').type = 'password';
-const ticon = $('#togglePassIcon');
-if (ticon) ticon.innerHTML = SVG.eye;
+  const ticon = $('#togglePassIcon');
+  if (ticon) ticon.innerHTML = SVG.eye;
   this.ensureTargetRows(1);
   this.openModal('editor');
 },
@@ -4282,6 +5467,16 @@ async save(){
   const embyUser = ($('#inUser').value || '').trim();
   const embyPass = ($('#inPass').value || '').trim();
   const directExternal = !!$('#inDirectExternal').checked;
+const renewDaysRaw = ($('#inRenewDays').value || '').trim();
+const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
+if (!Number.isFinite(renewDays) || renewDays < 0 || renewDays > 3650) {
+  return this.toast('保号周期不合法（0~3650）', 'warn');
+}
+const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
+const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
+if (!Number.isFinite(remindBeforeDays) || remindBeforeDays < 0 || remindBeforeDays > 3650) {
+  return this.toast('提前几天提醒不合法（0~3650）', 'warn');
+}
   if(!name || !target) return this.toast('请求路径和目标地址必填','warn');
   const lower = name.toLowerCase();
   const existed = this.nodes.some(x => String(x.name || '').toLowerCase() === lower);
@@ -4302,8 +5497,10 @@ async save(){
     name, displayName, target, mode,
     secret, tag, note, rank, fav,
     embyUser, embyPass,
-    directExternal,
-    oldName: this.editingOldName || ''
+directExternal,
+renewDays: Math.floor(renewDays),
+remindBeforeDays: Math.floor(remindBeforeDays),
+oldName: this.editingOldName || ''
   });
   if(!r.success) return this.toast(r.error || '保存失败','error');
   if (r.failed > 0 && Array.isArray(r.errors) && r.errors[0]) {
@@ -4314,10 +5511,29 @@ async save(){
   this.toast('保存成功','success');
   await this.refresh();
 },
+async testKeepaliveNotify(){
+  const name = ($('#inName').value || '').trim() || '未命名节点';
+  const displayName = ($('#inDisplayName').value || '').trim();
+  const renewDaysRaw = ($('#inRenewDays').value || '').trim();
+  const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
+const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
+const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
+const r = await API.req({
+  action: 'keepalive.test',
+  name,
+  displayName: displayName || name,
+  renewDays: Number.isFinite(renewDays) ? Math.floor(renewDays) : 0,
+  remindBeforeDays: Number.isFinite(remindBeforeDays) ? Math.floor(remindBeforeDays) : 0
+});
+  if (!r || !r.success) {
+    return this.toast((r && r.error) || '测试通知失败', 'error');
+  }
+  this.toast('测试通知已发送', 'success');
+},
   async toggleFav(name){
   const r = await API.req({ action:'toggleFav', name });
   if(!r.success) return this.toast(r.error || '操作失败','error');
-  API.clearListCache();
+  API.clearListCache();   
   await this.refresh();
 },
   async del(name){
@@ -4414,12 +5630,18 @@ Gate.boot();
 </body>
 </html>`;
     return new Response(html, {
-      headers: { "Content-Type": "text/html;charset=utf-8" },
+      headers: {
+        "Content-Type": "text/html;charset=utf-8",
+        "Content-Security-Policy":
+          "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';",
+        "X-Frame-Options": "DENY",
+      },
     });
   },
 };
 export default {
   async fetch(request, env, ctx) {
+    cleanupTTLMaps();
     const url = new URL(request.url);
     if (url.pathname === "/favicon.ico")
       return new Response("", { status: 204 });
@@ -4477,6 +5699,7 @@ export default {
               secret,
               env,
               "admin",
+              ctx,
             );
           }
           return new Response("Node Not Found", { status: 404 });
@@ -4493,5 +5716,38 @@ export default {
       /^https?:\/\//i.test(directRaw) || /[.:]/.test(root || "");
     if (!looksLikeHost) return new Response("Node Not Found", { status: 404 });
     return ProxyHandler.handleDirect(request, directRaw, env);
+  },
+  async scheduled(event, env, ctx) {
+    cleanupTTLMaps();
+    ctx.waitUntil(
+      (async () => {
+        const cfg = await Database.getTgConfig(env);
+        const kv = Database.getKV(env);
+        if (cfg && cfg.enabled && cfg.token && cfg.chat) {
+          const day = Database.getDayKey();
+          const reportKey = "report:" + day;
+          const reportSent = kv ? await kv.get(reportKey) : null;
+          if (!reportSent) {
+            const text = await Database.buildDailyReport(env);
+            await sendTG(cfg.token, cfg.chat, text);
+            if (kv) await kv.put(reportKey, "1");
+          }
+          const alerts = await Database.checkAlerts(env);
+          if (alerts && alerts.length) {
+            const day2 = Database.getDayKey();
+            for (const msg of alerts) {
+              const key = "alert:" + day2 + ":" + msg.slice(0, 6);
+              const sent = kv ? await kv.get(key) : null;
+              if (!sent) {
+                await sendTG(cfg.token, cfg.chat, "📢 Emby 告警\n" + msg);
+                if (kv) await kv.put(key, "1");
+              }
+            }
+          }
+          await Database.checkKeepaliveAndNotify(env);
+        }
+        await Database.cleanupOld(env);
+      })(),
+    );
   },
 };
