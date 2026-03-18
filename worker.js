@@ -859,7 +859,7 @@ const Database = {
       Number.isFinite(Number(n?.remindBeforeDays)) &&
       Number(n.remindBeforeDays) >= 0
     ) {
-      o.xb = Math.floor(Number(n.remindBeforeDays)); // 提前几天提醒
+      o.xb = Math.floor(Number(n.remindBeforeDays)); // 提前多少天提醒
     }
     return JSON.stringify(o);
   },
