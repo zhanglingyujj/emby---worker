@@ -21,6 +21,8 @@ const GLOBALS = {
   AuthFail: new TTLMap(),
   LineCursor: new Map(),
   LineBan: new TTLMap(),
+  ProgressThrottle: new TTLMap(),
+  _lastCleanupAt: 0,
   KeepaliveTableReady: false,
   Regex: {
     StaticExt:
@@ -34,8 +36,6 @@ const Config = {
   Defaults: {
     CacheTTL: 10000,
     ListCacheTTL: 180000,
-    MetaCacheTTL: 1800000,
-    StaticCacheTTL: 86400000,
     MaxRetryBodyBytes: 32 * 1024 * 1024,
   },
 };
@@ -178,7 +178,7 @@ function getKV(env) {
         ON CONFLICT(k) DO UPDATE SET
           v = excluded.v,
           updated_at = excluded.updated_at
-      `,
+      `
         )
         .bind(k, v, now)
         .run();
@@ -202,7 +202,7 @@ function getKV(env) {
     WHERE k LIKE ?1
     ORDER BY k
     LIMIT ?2 OFFSET ?3
-  `,
+  `
         )
         .bind(p + "%", lim + 1, off)
         .all();
@@ -219,23 +219,27 @@ function getKV(env) {
 }
 function cleanupTTLMaps() {
   const now = Date.now();
+  if (GLOBALS._lastCleanupAt && now - GLOBALS._lastCleanupAt < 15000) return;
+  GLOBALS._lastCleanupAt = now;
   [
     GLOBALS.NodeCache,
     GLOBALS.NodeHostIndexCache,
     GLOBALS.NodeListCache,
     GLOBALS.AuthFail,
+    GLOBALS.LineBan,
+    GLOBALS.ProgressThrottle,
   ].forEach((map) => {
     for (const [k, v] of map) {
       if (v?.exp && now > v.exp) map.delete(k);
     }
   });
 }
-function rewriteSetCookieHeaders(headers, requestUrl, prefix) {
+function rewriteSetCookieHeaders(headers, prefix) {
   const cookies = headers.getSetCookie
     ? headers.getSetCookie()
     : headers.get("Set-Cookie")
-      ? [headers.get("Set-Cookie")]
-      : [];
+    ? [headers.get("Set-Cookie")]
+    : [];
   if (!cookies.length) return;
   headers.delete("Set-Cookie");
   for (let c of cookies) {
@@ -284,7 +288,11 @@ const Auth = {
     let rec = GLOBALS.AuthFail.get(ip);
     if (!rec || now - rec.ts > win) rec = { n: 0, ts: now };
     if ((now & 63) === 0) {
-      for (const [k, v] of GLOBALS.AuthFail) {
+      for (const [k, entry] of GLOBALS.AuthFail) {
+        const v =
+          entry && typeof entry === "object" && "value" in entry
+            ? entry.value
+            : entry;
         if (!v || now - Number(v.ts || 0) > win) {
           GLOBALS.AuthFail.delete(k);
         }
@@ -309,7 +317,7 @@ const Auth = {
     }
     rec.n += 1;
     rec.ts = now;
-    GLOBALS.AuthFail.set(ip, rec);
+    GLOBALS.AuthFail.set(ip, rec, win);
     return this.unauthorized();
   },
 };
@@ -332,8 +340,11 @@ const Validators = {
     return { ok: true, value: name };
   },
   splitTargets(v) {
-    return String(v || "")
-      .split(/\\r?\\n|[;,，；|]+/g)
+    const raw = String(v || "")
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n");
+    return raw
+      .split(/\r?\n|[;,，；|]+/g)
       .map((s) => s.trim())
       .filter(Boolean);
   },
@@ -413,7 +424,19 @@ const Validators = {
     let embyPass = String(n.embyPass || "").trim();
     if (embyUser.length > 128) embyUser = embyUser.slice(0, 128);
     if (embyPass.length > 256) embyPass = embyPass.slice(0, 256);
-    let renewDays = 0; // 保号周期（天）
+    let keepaliveMaxPerDay = 1;
+    if (
+      n.keepaliveMaxPerDay !== undefined &&
+      n.keepaliveMaxPerDay !== null &&
+      String(n.keepaliveMaxPerDay).trim() !== ""
+    ) {
+      const c = Number(n.keepaliveMaxPerDay);
+      if (!Number.isFinite(c) || c < 1 || c > 1440) {
+        return { ok: false, error: "保号每日提醒次数不合法（1~1440）" };
+      }
+      keepaliveMaxPerDay = Math.floor(c);
+    }
+    let renewDays = 0;
     if (
       n.renewDays !== undefined &&
       n.renewDays !== null &&
@@ -425,7 +448,7 @@ const Validators = {
       }
       renewDays = Math.floor(d);
     }
-    let remindBeforeDays = 0; // 提前几天提醒
+    let remindBeforeDays = 0;
     if (
       n.remindBeforeDays !== undefined &&
       n.remindBeforeDays !== null &&
@@ -436,6 +459,26 @@ const Validators = {
         return { ok: false, error: "提前几天提醒不合法（0~3650）" };
       }
       remindBeforeDays = Math.floor(d);
+    }
+    let keepaliveAtRaw = String(n.keepaliveAt || "").trim();
+    let keepaliveAt = "";
+    if (keepaliveAtRaw) {
+      let s = keepaliveAtRaw
+        .replace(/[\s\u3000]+/g, "")
+        .replace(/[０-９]/g, (ch) =>
+          String.fromCharCode(ch.charCodeAt(0) - 65248)
+        )
+        .replace(/[：﹕∶]/g, ":")
+        .replace(/[．。]/g, ".");
+      let mk = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
+      if (!mk) mk = /(\d{1,2})\D+(\d{1,2})/.exec(s);
+      if (!mk) {
+        return { ok: false, error: "保号提醒时间格式不合法（HH:mm）" };
+      }
+      const hh = Math.max(0, Math.min(23, Number(mk[1])));
+      const mm = Math.max(0, Math.min(59, Number(mk[2])));
+      keepaliveAt =
+        String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
     }
     return {
       ok: true,
@@ -455,6 +498,8 @@ const Validators = {
         directExternal: !!n.directExternal,
         renewDays,
         remindBeforeDays,
+        keepaliveAt,
+        keepaliveMaxPerDay,
       },
     };
   },
@@ -519,8 +564,10 @@ const Database = {
             "node TEXT PRIMARY KEY," +
             "anchor_ts INTEGER NOT NULL," +
             "last_play_ts INTEGER NOT NULL DEFAULT 0," +
-            "last_notify_day TEXT" +
-            ")",
+            "last_notify_day TEXT," +
+            "notify_count_day TEXT," +
+            "notify_count INTEGER NOT NULL DEFAULT 0" +
+            ")"
         )
         .run();
       GLOBALS.KeepaliveTableReady = true;
@@ -552,7 +599,16 @@ const Database = {
     if (!kv) return null;
     const cfg = await kv.get("tg:config", { type: "json" });
     return (
-      cfg || { enabled: false, token: "", chat: "", flowGB: 0, errCount: 0 }
+      cfg || {
+        enabled: false,
+        token: "",
+        chat: "",
+        flowGB: 0,
+        errCount: 0,
+        reportTime: "00:00",
+        reportEveryMin: 0,
+        reportMaxPerDay: 1,
+      }
     );
   },
   async setTgConfig(env, cfg) {
@@ -570,7 +626,7 @@ const Database = {
       if (!db) return;
       const day = this.getDayKey();
       const nodeName = String(
-        node?.displayName || node?.name || "unknown",
+        node?.displayName || node?.name || "unknown"
       ).slice(0, 64);
       const nodeKey = String(node?.name || "")
         .trim()
@@ -606,7 +662,7 @@ const Database = {
       await db
         .prepare(
           "INSERT INTO play_sessions (k, day, last_ts) VALUES (?1, ?2, ?3) " +
-            "ON CONFLICT(k) DO UPDATE SET day=excluded.day, last_ts=excluded.last_ts",
+            "ON CONFLICT(k) DO UPDATE SET day=excluded.day, last_ts=excluded.last_ts"
         )
         .bind(sessKey, day, now)
         .run();
@@ -614,7 +670,7 @@ const Database = {
         await db
           .prepare(
             "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, ?2, NULL) " +
-              "ON CONFLICT(node) DO UPDATE SET last_play_ts=excluded.last_play_ts",
+              "ON CONFLICT(node) DO UPDATE SET last_play_ts=excluded.last_play_ts"
           )
           .bind(nodeKey, now)
           .run();
@@ -627,7 +683,7 @@ const Database = {
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
             "ON CONFLICT(day,node,client) DO UPDATE SET " +
             "plays=plays+excluded.plays, bytes=bytes+excluded.bytes, sessions=sessions+excluded.sessions, " +
-            "errors=errors+excluded.errors, updated_at=excluded.updated_at",
+            "errors=errors+excluded.errors, updated_at=excluded.updated_at"
         )
         .bind(day, nodeName, client, playInc, bytes, sessInc, isErr, now)
         .run();
@@ -638,7 +694,7 @@ const Database = {
         }
       }
     } catch (e) {
-      console.log("logPlayback error:", e);
+      console.error("logPlayback error:", e);
     }
   },
   async buildDailyReport(env) {
@@ -650,7 +706,7 @@ const Database = {
       const total = await db
         .prepare(
           "SELECT SUM(plays) AS plays, SUM(bytes) AS bytes, SUM(sessions) AS sessions " +
-            "FROM play_stats WHERE day=?1",
+            "FROM play_stats WHERE day=?1"
         )
         .bind(day)
         .first();
@@ -664,13 +720,13 @@ const Database = {
     const yest = await getSum(dayYest);
     const topNodes = await db
       .prepare(
-        "SELECT node, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY node ORDER BY plays DESC LIMIT 99",
+        "SELECT node, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY node ORDER BY plays DESC LIMIT 99"
       )
       .bind(dayToday)
       .all();
     const topClients = await db
       .prepare(
-        "SELECT client, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY client ORDER BY plays DESC LIMIT 99",
+        "SELECT client, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY client ORDER BY plays DESC LIMIT 99"
       )
       .bind(dayToday)
       .all();
@@ -726,7 +782,7 @@ const Database = {
     const day = this.getDayKey();
     const sum = await db
       .prepare(
-        "SELECT SUM(bytes) AS bytes, SUM(errors) AS errors FROM play_stats WHERE day=?1",
+        "SELECT SUM(bytes) AS bytes, SUM(errors) AS errors FROM play_stats WHERE day=?1"
       )
       .bind(day)
       .first();
@@ -737,9 +793,7 @@ const Database = {
     const alerts = [];
     if (flowGB > 0 && bytes >= flowGB * 1024 * 1024 * 1024) {
       alerts.push(
-        "🚨 流量预警：已达 " +
-          (bytes / (1024 * 1024 * 1024)).toFixed(1) +
-          " GB",
+        "🚨 流量预警：已达 " + (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB"
       );
     }
     if (errCount > 0 && errors >= errCount) {
@@ -755,16 +809,11 @@ const Database = {
     const nodes = await this.listAllNodes(env, "admin", 0);
     const now = Date.now();
     const dayMs = 24 * 3600 * 1000;
-    const today = this.getDayKey(now); // 北京日期 YYYY-MM-DD
+    const today = this.getDayKey(now);
     const shNow = new Date(
-      new Date(now).toLocaleString("en-US", { timeZone: "Asia/Shanghai" }),
+      new Date(now).toLocaleString("en-US", { timeZone: "Asia/Shanghai" })
     );
     const curMin = shNow.getHours() * 60 + shNow.getMinutes();
-    const mainMin = 0; // 00:00
-    const fallbackMin = 12 * 60; // 12:00
-    const inMainWindow = curMin >= mainMin && curMin < mainMin + 70;
-    const inFallbackWindow = curMin >= fallbackMin && curMin < fallbackMin + 70;
-    if (!inMainWindow && !inFallbackWindow) return;
     for (const n of nodes) {
       try {
         const nodeKey = String(n?.name || "")
@@ -772,33 +821,64 @@ const Database = {
           .toLowerCase();
         if (!nodeKey) continue;
         const periodDays = Math.max(0, Math.floor(Number(n?.renewDays || 0)));
-        if (periodDays <= 0) continue; // 仅处理设置了周期的节点
+        if (periodDays <= 0) continue;
         const beforeDays = Math.max(
           0,
-          Math.floor(Number(n?.remindBeforeDays || 0)),
+          Math.floor(Number(n?.remindBeforeDays || 0))
+        );
+        const maxPerDay = Math.max(
+          1,
+          Math.floor(Number(n?.keepaliveMaxPerDay || 1))
         );
         let st = await db
           .prepare(
-            "SELECT anchor_ts, last_play_ts, last_notify_day FROM keepalive_state WHERE node=?1",
+            "SELECT anchor_ts, last_play_ts, notify_count_day, notify_count FROM keepalive_state WHERE node=?1"
           )
           .bind(nodeKey)
           .first();
         if (!st) {
           await db
             .prepare(
-              "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, 0, NULL)",
+              "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count_day, notify_count) VALUES (?1, ?2, 0, NULL, NULL, 0)"
             )
             .bind(nodeKey, now)
             .run();
-          st = { anchor_ts: now, last_play_ts: 0, last_notify_day: null };
+          st = {
+            anchor_ts: now,
+            last_play_ts: 0,
+            notify_count_day: null,
+            notify_count: 0,
+          };
         }
-        if (String(st?.last_notify_day || "") === today) continue; // 当天只发一次
         const anchorTs = Number(st?.anchor_ts || now);
         const lastPlayTs = Number(st?.last_play_ts || 0);
         const baseTs = lastPlayTs > 0 ? lastPlayTs : anchorTs;
         const dueTs = baseTs + periodDays * dayMs;
         const notifyStartTs = dueTs - beforeDays * dayMs;
         if (now < notifyStartTs) continue;
+        const keepaliveAtRaw = String(n?.keepaliveAt || "00:00")
+          .trim()
+          .replace(/[：﹕∶]/g, ":");
+        const m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
+          keepaliveAtRaw
+        );
+        let remindMin = 0;
+        let keepaliveAt = "00:00";
+        if (m) {
+          const hh = Math.max(0, Math.min(23, Number(m[1])));
+          const mm = Math.max(0, Math.min(59, Number(m[2])));
+          keepaliveAt =
+            String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+          remindMin = hh * 60 + mm;
+        }
+        if (curMin < remindMin) continue;
+        let cntDay = String(st?.notify_count_day || "");
+        let cnt = Number(st?.notify_count || 0);
+        if (cntDay !== today) {
+          cntDay = today;
+          cnt = 0;
+        }
+        if (cnt >= maxPerDay) continue;
         const leftMs = dueTs - now;
         const showName = String(n?.displayName || n?.name || nodeKey);
         const msg =
@@ -812,6 +892,14 @@ const Database = {
           "提前提醒：" +
           beforeDays +
           "天\n" +
+          "提醒时间：" +
+          keepaliveAt +
+          "（北京时间）\n" +
+          "今日次数：" +
+          (cnt + 1) +
+          "/" +
+          maxPerDay +
+          "\n" +
           (leftMs <= 0
             ? "状态：已到期（未观看）\n"
             : "剩余：" + Math.ceil(leftMs / dayMs) + "天\n") +
@@ -825,15 +913,15 @@ const Database = {
         await sendTG(cfg.token, cfg.chat, msg);
         await db
           .prepare(
-            "UPDATE keepalive_state SET last_notify_day=?2 WHERE node=?1",
+            "UPDATE keepalive_state SET notify_count_day=?2, notify_count=?3, last_notify_day=?2 WHERE node=?1"
           )
-          .bind(nodeKey, today)
+          .bind(nodeKey, today, cnt + 1)
           .run();
       } catch (e) {
         console.error(
           "keepalive node notify failed:",
           n?.name,
-          e?.message || e,
+          e?.message || e
         );
       }
     }
@@ -853,13 +941,20 @@ const Database = {
     if (n?.embyPass) o.ep = String(n.embyPass);
     if (n?.directExternal) o.de = 1;
     if (Number.isFinite(Number(n?.renewDays)) && Number(n.renewDays) > 0) {
-      o.xd = Math.floor(Number(n.renewDays)); // 保号周期
+      o.xd = Math.floor(Number(n.renewDays));
     }
     if (
       Number.isFinite(Number(n?.remindBeforeDays)) &&
       Number(n.remindBeforeDays) >= 0
     ) {
-      o.xb = Math.floor(Number(n.remindBeforeDays)); // 提前多少天提醒
+      o.xb = Math.floor(Number(n.remindBeforeDays));
+    }
+    if (n?.keepaliveAt) o.xh = String(n.keepaliveAt);
+    if (
+      Number.isFinite(Number(n?.keepaliveMaxPerDay)) &&
+      Number(n.keepaliveMaxPerDay) >= 1
+    ) {
+      o.xk = Math.floor(Number(n.keepaliveMaxPerDay));
     }
     return JSON.stringify(o);
   },
@@ -895,6 +990,12 @@ const Database = {
       remindBeforeDays: Number.isFinite(Number(raw.xb ?? raw.remindBeforeDays))
         ? Math.max(0, Math.floor(Number(raw.xb ?? raw.remindBeforeDays)))
         : 0,
+      keepaliveAt: String(raw.xh ?? raw.keepaliveAt ?? ""),
+      keepaliveMaxPerDay: Number.isFinite(
+        Number(raw.xk ?? raw.keepaliveMaxPerDay)
+      )
+        ? Math.max(1, Math.floor(Number(raw.xk ?? raw.keepaliveMaxPerDay)))
+        : 1,
     };
   },
   async getNode(nodeName, env, ctx, uid = "admin") {
@@ -911,7 +1012,11 @@ const Database = {
     const cached = await cache.match(cacheUrl);
     if (cached) {
       const data = await cached.json();
-      GLOBALS.NodeCache.set(mk, { data, exp: now + Config.Defaults.CacheTTL });
+      GLOBALS.NodeCache.set(
+        mk,
+        { data, exp: now + Config.Defaults.CacheTTL },
+        Config.Defaults.CacheTTL
+      );
       return data;
     }
     const raw = await kv.get(this.nodeKey(uid, nodeName), { type: "json" });
@@ -923,17 +1028,21 @@ const Database = {
           headers: {
             "Cache-Control": "public, max-age=5, stale-while-revalidate=30",
           },
-        }),
+        })
       );
       if (ctx && typeof ctx.waitUntil === "function") {
         ctx.waitUntil(putPromise);
       } else {
         putPromise.catch(() => {});
       }
-      GLOBALS.NodeCache.set(mk, {
-        data: nodeData,
-        exp: now + Config.Defaults.CacheTTL,
-      });
+      GLOBALS.NodeCache.set(
+        mk,
+        {
+          data: nodeData,
+          exp: now + Config.Defaults.CacheTTL,
+        },
+        Config.Defaults.CacheTTL
+      );
       return nodeData;
     }
     return null;
@@ -949,8 +1058,8 @@ const Database = {
     const ttl = forceRefresh
       ? 0
       : Number.isFinite(Number(ttlOverride))
-        ? Math.max(0, Number(ttlOverride))
-        : Number(Config?.Defaults?.ListCacheTTL || 15000);
+      ? Math.max(0, Number(ttlOverride))
+      : Number(Config?.Defaults?.ListCacheTTL || 15000);
     const hit = GLOBALS.NodeListCache.get(key);
     if (!forceRefresh && hit && hit.exp > now) return hit.data;
     const inflight = GLOBALS.NodeListInflight.get(key);
@@ -979,14 +1088,18 @@ const Database = {
             const raw = await kv.get(this.nodeKey(uid, name), { type: "json" });
             v = this.unpackNode(name, raw);
             if (v) {
-              GLOBALS.NodeCache.set(mk, {
-                data: v,
-                exp: now2 + Config.Defaults.CacheTTL,
-              });
+              GLOBALS.NodeCache.set(
+                mk,
+                {
+                  data: v,
+                  exp: now2 + Config.Defaults.CacheTTL,
+                },
+                Config.Defaults.CacheTTL
+              );
             }
           }
           return v;
-        }),
+        })
       );
       const out = nodes.filter(Boolean);
       out.sort((a, b) => {
@@ -999,11 +1112,15 @@ const Database = {
         return String(a?.name || "").localeCompare(
           String(b?.name || ""),
           "zh-Hans-CN",
-          { sensitivity: "base" },
+          { sensitivity: "base" }
         );
       });
       if (ttl > 0) {
-        GLOBALS.NodeListCache.set(key, { data: out, exp: Date.now() + ttl });
+        GLOBALS.NodeListCache.set(
+          key,
+          { data: out, exp: Date.now() + ttl },
+          ttl
+        );
       } else {
         GLOBALS.NodeListCache.delete(key);
       }
@@ -1062,7 +1179,7 @@ const Database = {
         {
           status: 500,
           headers: { "Content-Type": "application/json;charset=utf-8" },
-        },
+        }
       );
     }
     let data = {};
@@ -1098,7 +1215,7 @@ const Database = {
             {
               status: 500,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
+            }
           );
         }
         const cfFetch = async (method, path, body) => {
@@ -1133,13 +1250,15 @@ const Database = {
         try {
           const z = await cfFetch(
             "GET",
-            "/zones?name=" + encodeURIComponent(zoneName),
+            "/zones?name=" + encodeURIComponent(zoneName)
           );
           const zoneId = z?.result?.[0]?.id;
           if (!zoneId) throw new Error("未找到 Zone: " + zoneName);
           const rec = await cfFetch(
             "GET",
-            `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(recordName)}`,
+            `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(
+              recordName
+            )}`
           );
           const record = rec?.result?.[0];
           if (!record) throw new Error("未找到 CNAME 记录: " + recordName);
@@ -1148,7 +1267,7 @@ const Database = {
               JSON.stringify({ success: true, content: record.content }),
               {
                 headers: { "Content-Type": "application/json;charset=utf-8" },
-              },
+              }
             );
           }
           const value = normCname(data.value);
@@ -1162,7 +1281,7 @@ const Database = {
               content: value,
               ttl: record.ttl ?? 1,
               proxied: record.proxied ?? false,
-            },
+            }
           );
           return new Response(
             JSON.stringify({
@@ -1171,7 +1290,7 @@ const Database = {
             }),
             {
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
+            }
           );
         } catch (e) {
           return new Response(
@@ -1179,7 +1298,7 @@ const Database = {
             {
               status: 500,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
+            }
           );
         }
       }
@@ -1189,18 +1308,80 @@ const Database = {
           JSON.stringify({ success: true, content: cfg || {} }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          },
+          }
         );
       }
       case "tg.set": {
         const cfg = data.content || {};
+        let reportTime = String(cfg.reportTime || "")
+          .trim()
+          .replace(/[：﹕∶]/g, ":");
+        const mt = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
+          reportTime
+        );
+        if (reportTime && !mt) {
+          return new Response(
+            JSON.stringify({ error: "日报推送时间格式不合法（HH:mm）" }),
+            {
+              status: 400,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            }
+          );
+        }
+        if (mt) {
+          const hh = Math.max(0, Math.min(23, Number(mt[1])));
+          const mm = Math.max(0, Math.min(59, Number(mt[2])));
+          reportTime =
+            String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+        }
+        const reportEveryMin = Math.max(
+          0,
+          Math.min(1440, Number(cfg.reportEveryMin || 0))
+        );
+        const reportMaxPerDay = Math.max(
+          1,
+          Math.min(1440, Number(cfg.reportMaxPerDay || 1))
+        );
         await this.setTgConfig(env, {
           enabled: !!cfg.enabled,
           token: String(cfg.token || "").trim(),
           chat: String(cfg.chat || "").trim(),
           flowGB: Math.min(10240, Math.max(0, Number(cfg.flowGB || 0))),
           errCount: Math.min(2000, Math.max(0, Number(cfg.errCount || 0))),
+          reportTime: reportTime || "00:00",
+          reportEveryMin,
+          reportMaxPerDay,
         });
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        });
+      }
+      case "tg.test": {
+        const cfg = await this.getTgConfig(env);
+        if (!cfg || !cfg.enabled || !cfg.token || !cfg.chat) {
+          return new Response(
+            JSON.stringify({ error: "请先在TG设置中启用并配置 Token/Chat ID" }),
+            {
+              status: 400,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            }
+          );
+        }
+        const reportTime = String(cfg.reportTime || "00:00");
+        const reportEveryMin = Math.max(0, Number(cfg.reportEveryMin || 0));
+        const reportMaxPerDay = Math.max(1, Number(cfg.reportMaxPerDay || 1));
+        const text =
+          "🧪【日报测试通知】\n" +
+          "状态：配置正常\n" +
+          "日报时间：" +
+          reportTime +
+          "（北京时间）\n" +
+          "间隔模式：" +
+          (reportEveryMin > 0 ? `${reportEveryMin} 分钟` : "关闭（每日一次）") +
+          "\n" +
+          "每日上限：" +
+          reportMaxPerDay;
+        await sendTG(cfg.token, cfg.chat, text);
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -1213,15 +1394,19 @@ const Database = {
             {
               status: 400,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
+            }
           );
         }
         const name = String(data.displayName || data.name || "未命名节点");
         const renewDays = Math.max(0, Math.floor(Number(data.renewDays || 0)));
         const remindBeforeDays = Math.max(
           0,
-          Math.floor(Number(data.remindBeforeDays || 0)),
+          Math.floor(Number(data.remindBeforeDays || 0))
         );
+        const keepaliveAtRaw = String(data.keepaliveAt || "").trim();
+        const keepaliveAt = /^([01]\d|2[0-3]):([0-5]\d)$/.test(keepaliveAtRaw)
+          ? keepaliveAtRaw
+          : "00:00";
         const text =
           "🧪【保号测试通知】\n" +
           "节点：" +
@@ -1233,24 +1418,8 @@ const Database = {
           "提前提醒：" +
           remindBeforeDays +
           "天\n" +
-          "提醒时间：北京时间 00:00（主提醒），12:00（补发）";
-        await sendTG(cfg.token, cfg.chat, text);
-        return new Response(JSON.stringify({ success: true }), {
-          headers: { "Content-Type": "application/json;charset=utf-8" },
-        });
-      }
-      case "tg.test": {
-        const cfg = await this.getTgConfig(env);
-        if (!cfg || !cfg.token || !cfg.chat) {
-          return new Response(
-            JSON.stringify({ error: "请先配置 Bot Token 和 Chat ID" }),
-            {
-              status: 400,
-              headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
-          );
-        }
-        const text = "✅ Telegram 报表测试消息";
+          "提醒时间：北京时间 " +
+          keepaliveAt;
         await sendTG(cfg.token, cfg.chat, text);
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -1308,7 +1477,7 @@ const Database = {
           JSON.stringify({ success: true, name, fav: node.fav }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          },
+          }
         );
       }
       case "saveOrder": {
@@ -1423,7 +1592,7 @@ const Database = {
           }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          },
+          }
         );
       }
       case "delete": {
@@ -1528,7 +1697,7 @@ const Database = {
           }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          },
+          }
         );
       }
       case "checkStatus": {
@@ -1554,7 +1723,7 @@ const Database = {
               .map((x) => x.value);
             const uniq = [...new Set(names)];
             const got = await Promise.all(
-              uniq.map((n) => this.getNode(n, env, null, uid)),
+              uniq.map((n) => this.getNode(n, env, null, uid))
             );
             target = got.filter(Boolean);
           } else {
@@ -1610,8 +1779,8 @@ const Database = {
           await Promise.all(
             Array.from(
               { length: Math.min(concurrency, Math.max(1, target.length)) },
-              () => worker(),
-            ),
+              () => worker()
+            )
           );
           return new Response(JSON.stringify({ success: true, results }), {
             headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -1626,7 +1795,7 @@ const Database = {
             {
               status: 200,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            },
+            }
           );
         }
       }
@@ -1655,10 +1824,15 @@ const Database = {
         } catch {}
       }
     }
-    GLOBALS.NodeHostIndexCache.set(uid, {
-      hostMap,
-      exp: Date.now() + this.getHostIndexTTL(),
-    });
+    const hostIndexTTL = this.getHostIndexTTL();
+    GLOBALS.NodeHostIndexCache.set(
+      uid,
+      {
+        hostMap,
+        exp: Date.now() + hostIndexTTL,
+      },
+      hostIndexTTL
+    );
     return hostMap;
   },
   async getHostIndex(env, uid = "admin") {
@@ -1813,7 +1987,7 @@ const ProxyHandler = {
     targetUrl,
     env,
     node = null,
-    mode = "normal",
+    mode = "normal"
   ) {
     const u = typeof targetUrl === "string" ? new URL(targetUrl) : targetUrl;
     const adapter = this.getDirectAdapter(u);
@@ -1866,7 +2040,7 @@ const ProxyHandler = {
     if (mode === "retry-browserish") {
       h.set(
         "User-Agent",
-        request.headers.get("User-Agent") || "emby-proxy/1.0",
+        request.headers.get("User-Agent") || "emby-proxy/1.0"
       );
       if (!h.get("Referer") && adapter.keepReferer && adapter.referer) {
         h.set("Referer", adapter.referer);
@@ -1902,7 +2076,7 @@ const ProxyHandler = {
         "sec-fetch-site",
         "sec-fetch-mode",
         "sec-fetch-dest",
-        "sec-fetch-user",
+        "sec-fetch-user"
       );
     }
     toDelete.forEach((k) => h.delete(k));
@@ -1938,7 +2112,9 @@ const ProxyHandler = {
     if (!targets.length) {
       return new Response("Invalid node target", { status: 500 });
     }
-    const nodeKey = `${String(uid || "admin").toLowerCase()}:${String(name || node?.name || "")}`;
+    const nodeKey = `${String(uid || "admin").toLowerCase()}:${String(
+      name || node?.name || ""
+    )}`;
     const total = targets.length;
     let start = Number(GLOBALS.LineCursor.get(nodeKey) || 0);
     if (!Number.isFinite(start) || start < 0) start = 0;
@@ -1961,7 +2137,7 @@ const ProxyHandler = {
           key,
           env,
           uid,
-          ctx,
+          ctx
         );
         const status = Number(res?.status || 0);
         const shouldTryNext =
@@ -1994,7 +2170,7 @@ const ProxyHandler = {
             key,
             env,
             uid,
-            ctx,
+            ctx
           );
           const status = Number(res?.status || 0);
           const shouldTryNext =
@@ -2027,7 +2203,7 @@ const ProxyHandler = {
     key,
     env,
     uid = "admin",
-    ctx = null,
+    ctx = null
   ) {
     let base = new URL(node.target);
     const isEmos = this.isEmosNode(node, base, env);
@@ -2073,7 +2249,7 @@ const ProxyHandler = {
     finalUrl.search = reqUrl.search;
     const isStrm = /\.strm$/i.test(finalUrl.pathname);
     const isEmbyStreamStrm = /\/emby\/videos\/[^/]+\/stream\.strm$/i.test(
-      finalUrl.pathname,
+      finalUrl.pathname
     );
     if (isStrm && !isEmbyStreamStrm) {
       try {
@@ -2107,14 +2283,14 @@ const ProxyHandler = {
           reqNoQuery,
           targetUrl.toString(),
           env,
-          node,
+          node
         );
         const logTask = Database.logPlayback(
           env,
           node,
           request,
           resDirect,
-          true,
+          true
         );
         if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
         else logTask.catch(() => {});
@@ -2242,6 +2418,29 @@ const ProxyHandler = {
       }
       if (pp.startsWith("/emby/sessions/playing/progress")) {
         cf = { ...(cf || {}), cacheEverything: false, cacheTtl: 0 };
+        const m = request.method.toUpperCase();
+        if (m !== "OPTIONS") {
+          const rawIp =
+            request.headers.get("CF-Connecting-IP") ||
+            request.headers.get("X-Forwarded-For") ||
+            request.headers.get("X-Real-IP") ||
+            "unknown";
+          const ip = String(rawIp).split(",")[0].trim() || "unknown";
+          const deviceId = String(
+            request.headers.get("X-Emby-Device-Id") || ""
+          ).slice(0, 64);
+          const sessionId =
+            String(finalUrl.searchParams.get("SessionId") || "") ||
+            String(finalUrl.searchParams.get("sessionId") || "");
+          const tk = `${ip}|${deviceId}|${sessionId}`;
+          if (GLOBALS.ProgressThrottle.get(tk)) {
+            return new Response(null, {
+              status: 204,
+              headers: { "Cache-Control": "no-store" },
+            });
+          }
+          GLOBALS.ProgressThrottle.set(tk, 1, 1000);
+        }
       }
     }
     try {
@@ -2252,7 +2451,7 @@ const ProxyHandler = {
           : await request.clone().arrayBuffer();
       const isImageApi = /\/emby\/items\/.+\/images\//i.test(finalUrl.pathname);
       const isAdditionalPartsApi = /\/emby\/videos\/.+\/additionalparts/i.test(
-        finalUrl.pathname,
+        finalUrl.pathname
       );
       const nodeDirect = this.isNodeDirectExternal(node);
       if (
@@ -2283,15 +2482,15 @@ const ProxyHandler = {
           finalUrl,
           node,
           env,
-          { isStreaming },
+          { isStreaming }
         );
         const method = request.method.toUpperCase();
         const body =
           method === "GET" || method === "HEAD"
             ? null
             : replayBody
-              ? replayBody.slice(0)
-              : null;
+            ? replayBody.slice(0)
+            : null;
         let resClean = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: hClean,
@@ -2329,7 +2528,7 @@ const ProxyHandler = {
         if (aoClean !== "*") headersClean.set("Vary", "Origin");
         headersClean.set(
           "Access-Control-Expose-Headers",
-          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type"
         );
         const arClean = resClean.headers.get("Accept-Ranges") || "";
         if (isStreaming) {
@@ -2350,7 +2549,7 @@ const ProxyHandler = {
           node,
           request,
           resClean,
-          isPlaybackApi || isStreaming,
+          isPlaybackApi || isStreaming
         );
         if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
         else logTask.catch(() => {});
@@ -2387,7 +2586,7 @@ const ProxyHandler = {
         h3.set("Host", base.host);
         h3.set(
           "User-Agent",
-          request.headers.get("User-Agent") || "emby-proxy/1.0",
+          request.headers.get("User-Agent") || "emby-proxy/1.0"
         );
         const rg = request.headers.get("Range");
         if (rg) h3.set("Range", rg);
@@ -2413,7 +2612,7 @@ const ProxyHandler = {
           h4.set("Host", base.host);
           h4.set(
             "User-Agent",
-            request.headers.get("User-Agent") || "emby-proxy/1.0",
+            request.headers.get("User-Agent") || "emby-proxy/1.0"
           );
           h4.set("Referer", base.origin + "/");
           h4.set("Origin", base.origin);
@@ -2439,7 +2638,7 @@ const ProxyHandler = {
             h5.set("Host", base.host);
             h5.set(
               "User-Agent",
-              request.headers.get("User-Agent") || "emby-proxy/1.0",
+              request.headers.get("User-Agent") || "emby-proxy/1.0"
             );
             h5.set("Referer", base.origin + "/");
             h5.set("Origin", base.origin);
@@ -2467,14 +2666,14 @@ const ProxyHandler = {
       headers.set("Access-Control-Allow-Origin", ao);
       if (ao !== "*") headers.set("Vary", "Origin");
       const selfPrefix = this.routePrefix(name, key, uid);
-      rewriteSetCookieHeaders(headers, request.url, selfPrefix);
+      rewriteSetCookieHeaders(headers, selfPrefix);
       if (isStatic) {
         headers.set("Access-Control-Allow-Origin", "*");
         headers.delete("Vary");
         headers.delete("Set-Cookie");
         headers.set(
           "Cache-Control",
-          "public, max-age=31536000, s-maxage=86400",
+          "public, max-age=31536000, s-maxage=86400"
         );
       } else if (isStreaming) {
         headers.set("Cache-Control", "no-store, no-transform");
@@ -2523,7 +2722,7 @@ const ProxyHandler = {
                         request,
                         loc.toString(),
                         env,
-                        node,
+                        node
                       );
                     } else {
                       headers.set(
@@ -2531,7 +2730,7 @@ const ProxyHandler = {
                         origin +
                           selfPrefix +
                           "/__raw__/" +
-                          encodeURIComponent(loc.toString()),
+                          encodeURIComponent(loc.toString())
                       );
                       splitLocHit = true;
                     }
@@ -2542,17 +2741,17 @@ const ProxyHandler = {
                     const prefix = this.routePrefix(
                       match.name,
                       match.secret || "",
-                      uid,
+                      uid
                     );
                     headers.set(
                       "Location",
-                      origin + prefix + loc.pathname + loc.search + loc.hash,
+                      origin + prefix + loc.pathname + loc.search + loc.hash
                     );
                   }
                 } else if (splitMode) {
                   headers.set(
                     "Location",
-                    origin + selfPrefix + loc.pathname + loc.search + loc.hash,
+                    origin + selfPrefix + loc.pathname + loc.search + loc.hash
                   );
                 }
               }
@@ -2576,7 +2775,7 @@ const ProxyHandler = {
           uid,
           node,
           name,
-          key,
+          key
         );
         headers.delete("content-length");
         return new Response(rewritten, {
@@ -2603,13 +2802,13 @@ const ProxyHandler = {
     const method = String(init.method || "GET").toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD" && init.body != null;
     const maxBytes = Number(
-      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
+      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024
     );
     let allowFallback = true;
     let preparedBody = null;
     if (hasBody) {
       const cl = Number(
-        (init.headers && new Headers(init.headers).get("content-length")) || 0,
+        (init.headers && new Headers(init.headers).get("content-length")) || 0
       );
       if (cl > maxBytes) allowFallback = false;
       const b = init.body;
@@ -2682,11 +2881,11 @@ const ProxyHandler = {
     }
     const hasBody = method !== "GET" && method !== "HEAD";
     const maxBytes = Number(
-      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
+      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024
     );
     let allowFallback = true;
     let bodyBuf = null;
-    let allowRetry = true; // ✅ 新增
+    let allowRetry = true;
     if (hasBody) {
       const cl = Number(request.headers.get("content-length") || 0);
       if (cl > maxBytes) allowFallback = false;
@@ -2694,10 +2893,10 @@ const ProxyHandler = {
         bodyBuf = await request.clone().arrayBuffer();
         if (bodyBuf.byteLength > maxBytes) allowFallback = false;
       } else {
-        allowRetry = false; // ✅ body 不可复用时禁止重试
+        allowRetry = false;
       }
     }
-    if (hasBody && !bodyBuf) allowRetry = false; // ✅ 保险
+    if (hasBody && !bodyBuf) allowRetry = false;
     let lastErr = null;
     let lastRes = null;
     const targets = allowFallback ? candidates : candidates.slice(0, 1);
@@ -2710,7 +2909,7 @@ const ProxyHandler = {
           u,
           env,
           node,
-          "normal",
+          "normal"
         );
         h.set("Accept-Encoding", "identity");
         this.stripClientIpHeaders(h);
@@ -2754,11 +2953,11 @@ const ProxyHandler = {
             u,
             env,
             node,
-            "retry-no-origin",
+            "retry-no-origin"
           );
           h2.set("Accept-Encoding", "identity");
           this.stripClientIpHeaders(h2);
-          hActive = h2; // 关键
+          hActive = h2;
           res = await fetch(target, {
             method,
             headers: hActive,
@@ -2772,11 +2971,11 @@ const ProxyHandler = {
             u,
             env,
             node,
-            "retry-browserish",
+            "retry-browserish"
           );
           h3.set("Accept-Encoding", "identity");
           this.stripClientIpHeaders(h3);
-          hActive = h3; // 关键
+          hActive = h3;
           res = await fetch(target, {
             method,
             headers: hActive,
@@ -2819,11 +3018,11 @@ const ProxyHandler = {
         const reqU = new URL(request.url);
         const i = reqU.pathname.indexOf("/__raw__/");
         const selfPrefix = i >= 0 ? reqU.pathname.slice(0, i) : "";
-        rewriteSetCookieHeaders(rh, request.url, selfPrefix);
+        rewriteSetCookieHeaders(rh, selfPrefix);
         const cr2 = res.headers.get("Content-Range");
         rh.set(
           "Access-Control-Expose-Headers",
-          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type"
         );
         const ar = res.headers.get("Accept-Ranges") || "";
         if (res.status === 206 || cr2 || /bytes/i.test(ar)) {
@@ -2849,7 +3048,7 @@ const ProxyHandler = {
                       request,
                       abs.toString(),
                       env,
-                      node,
+                      node
                     );
                   } else {
                     rh.set(
@@ -2857,7 +3056,7 @@ const ProxyHandler = {
                       reqU.origin +
                         selfPrefix +
                         "/__raw__/" +
-                        encodeURIComponent(abs.toString()),
+                        encodeURIComponent(abs.toString())
                     );
                   }
                 }
@@ -2911,7 +3110,7 @@ const ProxyHandler = {
     uid,
     currentNode,
     currentName,
-    currentKey,
+    currentKey
   ) {
     if (!text || typeof text !== "string") return text;
     const origin = new URL(requestUrl).origin;
@@ -2956,7 +3155,7 @@ const ProxyHandler = {
         } else {
           map.set(
             full,
-            origin + selfPrefix + "/__raw__/" + encodeURIComponent(full),
+            origin + selfPrefix + "/__raw__/" + encodeURIComponent(full)
           );
         }
         continue;
@@ -2969,7 +3168,7 @@ const ProxyHandler = {
       }
       map.set(
         full,
-        `${origin}/${u.protocol}//${u.host}${u.pathname}${u.search}${u.hash}`,
+        `${origin}/${u.protocol}//${u.host}${u.pathname}${u.search}${u.hash}`
       );
     }
     let out = text;
@@ -2986,7 +3185,7 @@ const ProxyHandler = {
       allow
         .split(",")
         .map((s) => s.trim())
-        .filter(Boolean),
+        .filter(Boolean)
     );
     return set.has(reqOrigin) ? reqOrigin : "null";
   },
@@ -3010,6 +3209,25 @@ const UI = {
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Emby反代管理系统</title>
 <style>
+input, select, textarea, button {
+  font: inherit;
+}
+input[type="time"] {
+  font-family: inherit !important;
+  font-size: 16px;
+  line-height: 1.25;
+  color: var(--text);
+  -webkit-appearance: none;
+  appearance: none;
+}
+input[type="time"]::-webkit-datetime-edit,
+input[type="time"]::-webkit-datetime-edit-hour-field,
+input[type="time"]::-webkit-datetime-edit-minute-field,
+input[type="time"]::-webkit-datetime-edit-ampm-field,
+input[type="time"]::-webkit-datetime-edit-text {
+  font-family: inherit;
+  font-size: 16px;
+}
 @import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap");
 :root{
   --bg:#f3f6fb;
@@ -3360,7 +3578,7 @@ body.modal-open .fab{display:none;}
     flex:0 0 auto;
   }
 }
-.modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:60}
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:1000}
 .modal{
   display:none;
   position:fixed;
@@ -3373,9 +3591,10 @@ body.modal-open .fab{display:none;}
   border:1px solid var(--line);
   border-radius:14px;
   padding:14px;
-  z-index:61;
+  z-index:1001;
   -webkit-overflow-scrolling: touch;
 }
+body.modal-open #menuPanel{display:none !important;}
 .modal h3{margin:0 0 10px;color:var(--text)}
 .modal{
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
@@ -4017,7 +4236,11 @@ button:hover,.btn:hover{
 <input id="inRenewDays" type="number" min="0" max="3650" step="1" placeholder="例如 30（0=不启用）">
 <div class="field-title">提前几天提醒</div>
 <input id="inRemindBeforeDays" type="number" min="0" max="3650" step="1" placeholder="例如 3">
-<div class="field-help">提醒时间：北京时间 00:00（主提醒），12:00（补发）</div>
+<div class="field-title">保号提醒时间（北京时间）</div>
+<input id="inKeepaliveAt" type="time" step="60">
+<div class="field-title">保号每日提醒次数</div>
+<input id="inKeepaliveMaxPerDay" type="number" min="1" max="1440" step="1" placeholder="默认 1">
+<div class="field-help">进入提醒窗口后，按时间提醒；每天最多推送 N 次，次日自动重置。</div>
 <div class="btns">
   <button class="btn btn-g" onclick="App.testKeepaliveNotify()">测试通知</button>
   <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
@@ -4060,11 +4283,14 @@ button:hover,.btn:hover{
 <div id="tgModal" class="modal glass">
   <h3>Telegram 每日报表</h3>
   <label class="small"><input type="checkbox" id="tgEnable"> 启用</label>
-<input id="tgToken" placeholder="Bot Token">
-<input id="tgChat" placeholder="Chat ID">
-<input id="tgFlowGB" placeholder="流量预警阈值 GB（0=关闭，最大10240）" min="0" max="10240">
-<input id="tgErrCount" placeholder="异常预警阈值（0=关闭，最大2000）" min="0" max="2000">
-<div class="small">每天北京时间 00:00 自动发送</div>
+  <input id="tgToken" placeholder="Bot Token">
+  <input id="tgChat" placeholder="Chat ID">
+  <input id="tgFlowGB" placeholder="流量预警阈值 GB（0=关闭，最大10240）" min="0" max="10240">
+  <input id="tgErrCount" placeholder="异常预警阈值（0=关闭，最大2000）" min="0" max="2000">
+  <input id="tgReportEveryMin" type="number" min="0" max="1440" step="1" placeholder="日报推送间隔（分钟，0=关闭间隔模式）">
+  <input id="tgReportMaxPerDay" type="number" min="1" max="1440" step="1" placeholder="日报每日最多推送次数（默认1）">
+<input id="tgReportTime" type="time" step="60">
+<div class="small">按北京时间每日推送一次</div>
   <div class="btns">
     <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
     <button class="btn btn-g" onclick="App.loadTg()">刷新</button>
@@ -4233,6 +4459,20 @@ const API = {
     this._listInflight = null;
   }
 };
+function normalizeHHmmLoose(v) {
+  let s = String(v ?? "").trim();
+  if (!s) return "";
+  s = s.replace(/[\s\u3000]+/g, "");
+  s = s.replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 65248));
+  s = s.replace(/[：﹕∶]/g, ":").replace(/[．。]/g, ".").replace(/[٫]/g, ":");
+  let m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
+  if (!m) m = /(\d{1,2})\D+(\d{1,2})/.exec(s);
+  if (!m) return "";
+  const hh = Math.max(0, Math.min(23, Number(m[1])));
+  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return "";
+  return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+}
 const App = {
   nodes: [],
   filterText: '',
@@ -4252,6 +4492,25 @@ const App = {
     if (this.autoRefreshTimer) clearInterval(this.autoRefreshTimer);
     this.autoRefreshTimer = setInterval(() => this.refresh(), this.autoRefreshMs);
   },
+normalizeHHmm(v, defVal = "00:00") {
+  let s = String(v ?? "").trim();
+  if (!s) return defVal;
+  s = s.replace(/[\s\u3000]+/g, "");
+  s = s.replace(/[０-９]/g, (ch) =>
+    String.fromCharCode(ch.charCodeAt(0) - 65248),
+  );
+  s = s
+    .replace(/[：﹕∶]/g, ":")
+    .replace(/[．。]/g, ".")
+    .replace(/[٫]/g, ":");
+  let m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
+  if (!m) m = /(\d{1,2})\D+(\d{1,2})/.exec(s);
+  if (!m) return defVal;
+  const hh = Math.max(0, Math.min(23, Number(m[1])));
+  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return defVal;
+  return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+},
 async init(prefetchedList = null){
   this.loadPrefs();
   if (prefetchedList && !prefetchedList.error) {
@@ -4335,18 +4594,34 @@ document.documentElement.style.setProperty('--density-mono-size', compact?'12px'
     $('#tgChat').value = r.content.chat || '';
     $('#tgFlowGB').value = r.content.flowGB || 0;
     $('#tgErrCount').value = r.content.errCount || 0;
+    $('#tgReportTime').value = r.content.reportTime || '00:00';
+    $('#tgReportEveryMin').value = Number(r.content.reportEveryMin || 0);
+    $('#tgReportMaxPerDay').value = Number(r.content.reportMaxPerDay || 1);
   },
 async saveTg(){
   const flowGB = Number($('#tgFlowGB').value || 0);
   const errCount = Number($('#tgErrCount').value || 0);
+  const reportRaw = String($('#tgReportTime').value || '').trim();
+ const reportTime = String($('#tgReportTime').value || '').trim();
+  const reportEveryMin = Number($('#tgReportEveryMin').value || 0);
+  const reportMaxPerDay = Number($('#tgReportMaxPerDay').value || 1);
   if (flowGB < 0 || flowGB > 10240) return this.toast('流量阈值范围：0~10240 GB','warn');
   if (errCount < 0 || errCount > 2000) return this.toast('异常阈值范围：0~2000','warn');
+  if (!Number.isFinite(reportEveryMin) || reportEveryMin < 0 || reportEveryMin > 1440) {
+    return this.toast('日报间隔范围：0~1440 分钟','warn');
+  }
+  if (!Number.isFinite(reportMaxPerDay) || reportMaxPerDay < 1 || reportMaxPerDay > 1440) {
+    return this.toast('日报每日次数范围：1~1440','warn');
+  }
   const cfg = {
     enabled: !!$('#tgEnable').checked,
     token: String($('#tgToken').value||'').trim(),
     chat: String($('#tgChat').value||'').trim(),
     flowGB,
-    errCount
+    errCount,
+    reportTime,
+    reportEveryMin: Math.floor(reportEveryMin),
+    reportMaxPerDay: Math.floor(reportMaxPerDay),
   };
   const r = await API.req({ action:'tg.set', content: cfg });
   if(!r || !r.success) return this.toast(r.error || '保存失败','error');
@@ -5036,8 +5311,7 @@ const remindBeforeDays = Math.max(0, Math.floor(Number(n.remindBeforeDays || 0))
 if (periodDays > 0) {
   const b3 = document.createElement('span');
   b3.className = 'badge b-note';
-  const baseTs = Number(n.lastPlayAt || 0); // 先用最后播放
-  if (baseTs <= 0) {
+  const baseTs = Number(n.lastPlayAt || 0);   if (baseTs <= 0) {
     b3.textContent = '保号已启用';
     b3.style.background = '#e5e7eb';
     b3.style.color = '#374151';
@@ -5140,8 +5414,7 @@ v2.addEventListener('click', () => {
   if (!showProxy) return this.toast('请先显示代理地址', 'warn');
   this.copyText(proxyCopyUrl, n.secret ? '已复制含密钥链接' : '已复制代理地址');
 });
-const proxyCopyUrl = fullUrl; // 有密钥=带密钥，无密钥=仅路径
-const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
+const proxyCopyUrl = fullUrl; const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
 eye2.classList.add('eye-toggle', showProxy ? 'on' : 'off');
 const c2 = this.iconBtn(SVG.link, '复制代理地址', () => {
   if (!showProxy) return this.toast('请先显示代理地址', 'warn');
@@ -5356,14 +5629,28 @@ remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
       this.toast(r.error || '检测失败','error');
     }
   },
+hideMenu(){
+  const m = $('#menuPanel');
+  if (m) m.style.display = 'none';
+},
 openModal(id){
-  $('#mask').style.display='block';
-  $('#'+id).style.display='block';
+  this.hideMenu();
+  ['editor','bgModal','tagPicker','cnameModal','tgModal'].forEach(mid=>{
+    const e = $('#'+mid);
+    if (e) e.style.display = 'none';
+  });
+  $('#mask').style.display = 'block';
+  const target = $('#'+id);
+  if (target) target.style.display = 'block';
   document.body.classList.add('modal-open');
 },
 closeAllModals(){
-  $('#mask').style.display='none';
-  ['editor','bgModal','tagPicker','cnameModal','tgModal'].forEach(id=>{ const e=$('#'+id); if(e) e.style.display='none'; });
+  $('#mask').style.display = 'none';
+  ['editor','bgModal','tagPicker','cnameModal','tgModal'].forEach(id=>{
+    const e = $('#'+id);
+    if (e) e.style.display = 'none';
+  });
+  this.hideMenu();
   document.body.classList.remove('modal-open');
 },
 splitTargetsText(v){
@@ -5412,7 +5699,7 @@ collectTargetsText(){
   const arr = [...list.querySelectorAll('input')]
     .map(i => (i.value || '').trim())
     .filter(Boolean);
-  return arr.join('\\n');
+return arr.join('\\n');
 },
 openEditor(name){
   this.editingOldName = '';
@@ -5429,6 +5716,8 @@ openEditor(name){
   $('#inPass').value = '';
   $('#inDirectExternal').checked = false;
   $('#inRemindBeforeDays').value = '';
+  $('#inKeepaliveAt').value = '';
+  $('#inKeepaliveMaxPerDay').value = '1';
   if (name) {
     const n = this.nodes.find(x => x.name === name);
     if (n) {
@@ -5442,7 +5731,11 @@ openEditor(name){
       $('#inSec').value = n.secret || '';
       $('#inDirectExternal').checked = !!n.directExternal;
       $('#inRenewDays').value = Number.isFinite(Number(n.renewDays)) ? String(Number(n.renewDays)) : '';
-$('#inRemindBeforeDays').value = Number.isFinite(Number(n.remindBeforeDays)) ? String(Number(n.remindBeforeDays)) : '';
+      $('#inRemindBeforeDays').value = Number.isFinite(Number(n.remindBeforeDays)) ? String(Number(n.remindBeforeDays)) : '';
+      $('#inKeepaliveAt').value = n.keepaliveAt || '';
+      $('#inKeepaliveMaxPerDay').value = Number.isFinite(Number(n.keepaliveMaxPerDay))
+        ? String(Number(n.keepaliveMaxPerDay))
+        : '1';
       this.currentMode = 'split';
     }
   }
@@ -5467,16 +5760,22 @@ async save(){
   const embyUser = ($('#inUser').value || '').trim();
   const embyPass = ($('#inPass').value || '').trim();
   const directExternal = !!$('#inDirectExternal').checked;
-const renewDaysRaw = ($('#inRenewDays').value || '').trim();
-const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
-if (!Number.isFinite(renewDays) || renewDays < 0 || renewDays > 3650) {
-  return this.toast('保号周期不合法（0~3650）', 'warn');
-}
-const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
-const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
-if (!Number.isFinite(remindBeforeDays) || remindBeforeDays < 0 || remindBeforeDays > 3650) {
-  return this.toast('提前几天提醒不合法（0~3650）', 'warn');
-}
+  const renewDaysRaw = ($('#inRenewDays').value || '').trim();
+  const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
+  if (!Number.isFinite(renewDays) || renewDays < 0 || renewDays > 3650) {
+    return this.toast('保号周期不合法（0~3650）', 'warn');
+  }
+  const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
+  const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
+  if (!Number.isFinite(remindBeforeDays) || remindBeforeDays < 0 || remindBeforeDays > 3650) {
+    return this.toast('提前几天提醒不合法（0~3650）', 'warn');
+  }
+  const keepaliveAt = String($('#inKeepaliveAt').value || '').trim();
+  const keepaliveMaxPerDayRaw = ($('#inKeepaliveMaxPerDay').value || '').trim();
+  const keepaliveMaxPerDay = keepaliveMaxPerDayRaw === '' ? 1 : Number(keepaliveMaxPerDayRaw);
+  if (!Number.isFinite(keepaliveMaxPerDay) || keepaliveMaxPerDay < 1 || keepaliveMaxPerDay > 1440) {
+    return this.toast('保号每日提醒次数不合法（1~1440）', 'warn');
+  }
   if(!name || !target) return this.toast('请求路径和目标地址必填','warn');
   const lower = name.toLowerCase();
   const existed = this.nodes.some(x => String(x.name || '').toLowerCase() === lower);
@@ -5497,10 +5796,12 @@ if (!Number.isFinite(remindBeforeDays) || remindBeforeDays < 0 || remindBeforeDa
     name, displayName, target, mode,
     secret, tag, note, rank, fav,
     embyUser, embyPass,
-directExternal,
-renewDays: Math.floor(renewDays),
-remindBeforeDays: Math.floor(remindBeforeDays),
-oldName: this.editingOldName || ''
+    directExternal,
+    renewDays: Math.floor(renewDays),
+    remindBeforeDays: Math.floor(remindBeforeDays),
+    keepaliveAt,
+    keepaliveMaxPerDay: Math.floor(keepaliveMaxPerDay),
+    oldName: this.editingOldName || ''
   });
   if(!r.success) return this.toast(r.error || '保存失败','error');
   if (r.failed > 0 && Array.isArray(r.errors) && r.errors[0]) {
@@ -5516,15 +5817,20 @@ async testKeepaliveNotify(){
   const displayName = ($('#inDisplayName').value || '').trim();
   const renewDaysRaw = ($('#inRenewDays').value || '').trim();
   const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
-const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
-const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
-const r = await API.req({
-  action: 'keepalive.test',
-  name,
-  displayName: displayName || name,
-  renewDays: Number.isFinite(renewDays) ? Math.floor(renewDays) : 0,
-  remindBeforeDays: Number.isFinite(remindBeforeDays) ? Math.floor(remindBeforeDays) : 0
-});
+  const remindBeforeDaysRaw = ($('#inRemindBeforeDays').value || '').trim();
+  const remindBeforeDays = remindBeforeDaysRaw === '' ? 0 : Number(remindBeforeDaysRaw);
+ const keepaliveAt = String($('#inKeepaliveAt').value || '').trim();
+  const keepaliveMaxPerDayRaw = ($('#inKeepaliveMaxPerDay').value || '').trim();
+  const keepaliveMaxPerDay = keepaliveMaxPerDayRaw === '' ? 1 : Number(keepaliveMaxPerDayRaw);
+  const r = await API.req({
+    action: 'keepalive.test',
+    name,
+    displayName: displayName || name,
+    renewDays: Number.isFinite(renewDays) ? Math.floor(renewDays) : 0,
+    remindBeforeDays: Number.isFinite(remindBeforeDays) ? Math.floor(remindBeforeDays) : 0,
+    keepaliveAt,
+    keepaliveMaxPerDay: Number.isFinite(keepaliveMaxPerDay) ? Math.floor(keepaliveMaxPerDay) : 1
+  });
   if (!r || !r.success) {
     return this.toast((r && r.error) || '测试通知失败', 'error');
   }
@@ -5578,6 +5884,7 @@ const r = await API.req({
     reader.readAsText(file);
   },
 toggleMenu(){
+if (document.body.classList.contains('modal-open')) return;
   const m = $('#menuPanel');
   const open = m.style.display !== 'block';
   m.style.display = open ? 'block' : 'none';
@@ -5699,7 +6006,7 @@ export default {
               secret,
               env,
               "admin",
-              ctx,
+              ctx
             );
           }
           return new Response("Node Not Found", { status: 404 });
@@ -5724,30 +6031,54 @@ export default {
         const cfg = await Database.getTgConfig(env);
         const kv = Database.getKV(env);
         if (cfg && cfg.enabled && cfg.token && cfg.chat) {
-          const day = Database.getDayKey();
-          const reportKey = "report:" + day;
-          const reportSent = kv ? await kv.get(reportKey) : null;
-          if (!reportSent) {
-            const text = await Database.buildDailyReport(env);
-            await sendTG(cfg.token, cfg.chat, text);
-            if (kv) await kv.put(reportKey, "1");
+          const now = Date.now();
+          const shNow = new Date(
+            new Date(now).toLocaleString("en-US", {
+              timeZone: "Asia/Shanghai",
+            })
+          );
+          const curMin = shNow.getHours() * 60 + shNow.getMinutes();
+          const reportTimeRaw = String(cfg.reportTime || "00:00")
+            .trim()
+            .replace(/[：﹕∶]/g, ":");
+          const m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
+            reportTimeRaw
+          );
+          let reportMin = 0;
+          if (m) {
+            const hh = Math.max(0, Math.min(23, Number(m[1])));
+            const mm = Math.max(0, Math.min(59, Number(m[2])));
+            reportMin = hh * 60 + mm;
           }
-          const alerts = await Database.checkAlerts(env);
-          if (alerts && alerts.length) {
-            const day2 = Database.getDayKey();
-            for (const msg of alerts) {
-              const key = "alert:" + day2 + ":" + msg.slice(0, 6);
-              const sent = kv ? await kv.get(key) : null;
-              if (!sent) {
-                await sendTG(cfg.token, cfg.chat, "📢 Emby 告警\n" + msg);
-                if (kv) await kv.put(key, "1");
+          if (curMin >= reportMin) {
+            const day = Database.getDayKey();
+            const everyMin = Math.max(0, Number(cfg.reportEveryMin || 0));
+            const maxPerDay = Math.max(1, Number(cfg.reportMaxPerDay || 1));
+            const cntKey = "report:cnt:" + day;
+            const lastKey = "report:last:" + day;
+            const sentCnt = kv ? Number((await kv.get(cntKey)) || 0) : 0;
+            const lastTs = kv ? Number((await kv.get(lastKey)) || 0) : 0;
+            let shouldSend = false;
+            if (sentCnt < maxPerDay) {
+              if (everyMin <= 0) {
+                shouldSend = sentCnt === 0;
+              } else {
+                shouldSend = !lastTs || now - lastTs >= everyMin * 60 * 1000;
+              }
+            }
+            if (shouldSend) {
+              const text = await Database.buildDailyReport(env);
+              await sendTG(cfg.token, cfg.chat, text);
+              if (kv) {
+                await kv.put(cntKey, String(sentCnt + 1));
+                await kv.put(lastKey, String(now));
               }
             }
           }
           await Database.checkKeepaliveAndNotify(env);
         }
         await Database.cleanupOld(env);
-      })(),
+      })()
     );
   },
 };
