@@ -22,14 +22,15 @@ const GLOBALS = {
   LineCursor: new Map(),
   LineBan: new TTLMap(),
   ProgressThrottle: new TTLMap(),
+  PlaybackRangeDedup: new TTLMap(),
   _lastCleanupAt: 0,
   KeepaliveTableReady: false,
+  ProxyKvReady: false,
   Regex: {
     StaticExt:
-      /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i,
-    EmbyImages: /(?:\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i,
-    Streaming:
-      /\.(?:mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i,
+      /\.(jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i,
+    EmbyImages: /(\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i,
+    Streaming: /\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i,
   },
 };
 const Config = {
@@ -37,8 +38,18 @@ const Config = {
     CacheTTL: 10000,
     ListCacheTTL: 180000,
     MaxRetryBodyBytes: 32 * 1024 * 1024,
+    ImageCacheTtl: 86400, // 海报/图片 1 天
+    PingCacheTtl: 60, // /emby/System/Ping 60 秒
+    StaticCacheTtl: 604800, // 静态资源 7 天
+    ProgressThrottleMs: 1200, // 播放进度节流 1.2 秒
   },
 };
+function toBool(v) {
+  if (v === true || v === 1) return true;
+  if (v === false || v === 0 || v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
 const FIXED_PROXY_RULES = {
   FORCE_EXTERNAL_PROXY: false,
   PAN_302_DIRECT: false,
@@ -178,7 +189,7 @@ function getKV(env) {
         ON CONFLICT(k) DO UPDATE SET
           v = excluded.v,
           updated_at = excluded.updated_at
-      `
+      `,
         )
         .bind(k, v, now)
         .run();
@@ -202,7 +213,7 @@ function getKV(env) {
     WHERE k LIKE ?1
     ORDER BY k
     LIMIT ?2 OFFSET ?3
-  `
+  `,
         )
         .bind(p + "%", lim + 1, off)
         .all();
@@ -228,6 +239,7 @@ function cleanupTTLMaps() {
     GLOBALS.AuthFail,
     GLOBALS.LineBan,
     GLOBALS.ProgressThrottle,
+    GLOBALS.PlaybackRangeDedup,
   ].forEach((map) => {
     for (const [k, v] of map) {
       if (v?.exp && now > v.exp) map.delete(k);
@@ -238,8 +250,8 @@ function rewriteSetCookieHeaders(headers, prefix) {
   const cookies = headers.getSetCookie
     ? headers.getSetCookie()
     : headers.get("Set-Cookie")
-    ? [headers.get("Set-Cookie")]
-    : [];
+      ? [headers.get("Set-Cookie")]
+      : [];
   if (!cookies.length) return;
   headers.delete("Set-Cookie");
   for (let c of cookies) {
@@ -298,6 +310,12 @@ const Auth = {
         }
       }
     }
+    const got = this.extractToken(request);
+    const admin = String(env.ADMIN_TOKEN || "").trim();
+    if (got && admin && safeEqual(got, admin)) {
+      GLOBALS.AuthFail.delete(ip);
+      return { ok: true, uid: "admin", role: "admin", response: null };
+    }
     if (rec.n >= maxFail) {
       return {
         ok: false,
@@ -308,12 +326,6 @@ const Auth = {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         }),
       };
-    }
-    const got = this.extractToken(request);
-    const admin = String(env.ADMIN_TOKEN || "").trim();
-    if (got && admin && safeEqual(got, admin)) {
-      GLOBALS.AuthFail.delete(ip);
-      return { ok: true, uid: "admin", role: "admin", response: null };
     }
     rec.n += 1;
     rec.ts = now;
@@ -334,7 +346,7 @@ const Validators = {
     if (!this.NAME_RE.test(name)) {
       return {
         ok: false,
-        error: "name 非法：仅允许 a-z / 0-9 / _ / -，长度 1~32",
+        error: "name 非法:仅允许 a-z / 0-9 / _ / -，长度 1~32",
       };
     }
     return { ok: true, value: name };
@@ -363,7 +375,7 @@ const Validators = {
         }
         out.push(t.replace(/\/+$/, ""));
       } catch {
-        return { ok: false, error: "target 不是合法 URL：" + t };
+        return { ok: false, error: "target 不是合法 URL:" + t };
       }
     }
     return { ok: true, value: [...new Set(out)].join("\n") };
@@ -382,7 +394,7 @@ const Validators = {
     if (!this.SECRET_RE.test(secret)) {
       return {
         ok: false,
-        error: "secret 非法：不能包含 / ? # 或空白字符，最长128",
+        error: "secret 非法:不能包含 / ? # 或空白字符，最长128",
       };
     }
     return { ok: true, value: secret };
@@ -404,6 +416,23 @@ const Validators = {
     if (name.length > 32) name = name.slice(0, 32);
     return { ok: true, value: name };
   },
+  validateRealClientIpMode(v) {
+    const s = String(v || "smart")
+      .trim()
+      .toLowerCase();
+    if (!s || s === "smart" || s === "auto")
+      return { ok: true, value: "smart" };
+    if (["realip_only", "realip", "strip", "strict", "x-real-ip"].includes(s)) {
+      return { ok: true, value: "realip_only" };
+    }
+    if (["off", "disable", "none", "close"].includes(s)) {
+      return { ok: true, value: "off" };
+    }
+    if (["dual", "both", "full", "forward"].includes(s)) {
+      return { ok: true, value: "dual" };
+    }
+    return { ok: false, error: "网络兼容档位不合法" };
+  },
   validateNodeInput(n) {
     if (!n || typeof n !== "object" || Array.isArray(n)) {
       return { ok: false, error: "节点项不是对象" };
@@ -420,6 +449,8 @@ const Validators = {
     const rg = this.validateTag(n.tag || "");
     const rn2 = this.validateNote(n.note || "");
     const rd = this.validateDisplayName(n.displayName || "");
+    const rr = this.validateRealClientIpMode(n.realClientIpMode || "smart");
+    if (!rr.ok) return { ok: false, error: rr.error };
     let embyUser = String(n.embyUser || "").trim();
     let embyPass = String(n.embyPass || "").trim();
     if (embyUser.length > 128) embyUser = embyUser.slice(0, 128);
@@ -431,12 +462,12 @@ const Validators = {
       String(n.keepaliveMaxPerDay).trim() !== ""
     ) {
       const c = Number(n.keepaliveMaxPerDay);
-      if (!Number.isFinite(c) || c < 1 || c > 1440) {
-        return { ok: false, error: "保号每日提醒次数不合法（1~1440）" };
+      if (!Number.isFinite(c) || c < 1 || c > 24) {
+        return { ok: false, error: "保号每日提醒次数不合法（1~24）" };
       }
       keepaliveMaxPerDay = Math.floor(c);
     }
-    let renewDays = 0;
+    let renewDays = 0; // 保号周期（天）
     if (
       n.renewDays !== undefined &&
       n.renewDays !== null &&
@@ -448,7 +479,7 @@ const Validators = {
       }
       renewDays = Math.floor(d);
     }
-    let remindBeforeDays = 0;
+    let remindBeforeDays = 0; // 提前几天提醒
     if (
       n.remindBeforeDays !== undefined &&
       n.remindBeforeDays !== null &&
@@ -466,11 +497,11 @@ const Validators = {
       let s = keepaliveAtRaw
         .replace(/[\s\u3000]+/g, "")
         .replace(/[０-９]/g, (ch) =>
-          String.fromCharCode(ch.charCodeAt(0) - 65248)
+          String.fromCharCode(ch.charCodeAt(0) - 65248),
         )
-        .replace(/[：﹕∶]/g, ":")
+        .replace(/[:﹕∶]/g, ":")
         .replace(/[．。]/g, ".");
-      let mk = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
+      let mk = /^(\d{1,2}):(\d{1,2})(:(\d{1,2})(\.\d+)?)?$/.exec(s);
       if (!mk) mk = /(\d{1,2})\D+(\d{1,2})/.exec(s);
       if (!mk) {
         return { ok: false, error: "保号提醒时间格式不合法（HH:mm）" };
@@ -479,6 +510,21 @@ const Validators = {
       const mm = Math.max(0, Math.min(59, Number(mk[2])));
       keepaliveAt =
         String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+    }
+    let ipCountryBlacklist = "";
+    if (
+      typeof n.ipCountryBlacklist === "string" &&
+      n.ipCountryBlacklist.trim()
+    ) {
+      ipCountryBlacklist = [
+        ...new Set(
+          n.ipCountryBlacklist
+            .toUpperCase()
+            .split(/[\s,，;；]+/)
+            .map((s) => s.trim())
+            .filter((s) => /^[A-Z]{2}$/.test(s)),
+        ),
+      ].join(",");
     }
     return {
       ok: true,
@@ -495,26 +541,39 @@ const Validators = {
         note: rn2.value,
         embyUser,
         embyPass,
-        directExternal: !!n.directExternal,
+        directExternal: toBool(n.directExternal),
+        realClientIpMode: rr.value,
         renewDays,
         remindBeforeDays,
         keepaliveAt,
         keepaliveMaxPerDay,
+        ipCountryBlacklist,
       },
     };
   },
 };
 async function sendTG(token, chat, text) {
-  if (!token || !chat) return;
-  await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chat,
-      text,
-      disable_web_page_preview: true,
-    }),
-  });
+  if (!token || !chat) throw new Error("tg token/chat empty");
+  const resp = await fetch(
+    "https://api.telegram.org/bot" + token + "/sendMessage",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chat,
+        text,
+        disable_web_page_preview: true,
+      }),
+    },
+  );
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error("TG HTTP " + resp.status + " " + body);
+  }
+  const data = await resp.json().catch(() => null);
+  if (!data || data.ok !== true) {
+    throw new Error("TG API failed: " + JSON.stringify(data || {}));
+  }
 }
 const Database = {
   PREFIX: "node:",
@@ -554,6 +613,23 @@ const Database = {
   getDb(env) {
     return env.EMBY_D1 || env.D1 || env.DB;
   },
+  async ensureProxyKvTable(env) {
+    const db = this.getDb(env);
+    if (!db) return null;
+    if (!GLOBALS.ProxyKvReady) {
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS proxy_kv (" +
+            "k TEXT PRIMARY KEY," +
+            "v TEXT NOT NULL," +
+            "updated_at INTEGER NOT NULL" +
+            ")",
+        )
+        .run();
+      GLOBALS.ProxyKvReady = true;
+    }
+    return db;
+  },
   async ensureKeepaliveStateTable(env) {
     const db = this.getDb(env);
     if (!db) return null;
@@ -567,7 +643,7 @@ const Database = {
             "last_notify_day TEXT," +
             "notify_count_day TEXT," +
             "notify_count INTEGER NOT NULL DEFAULT 0" +
-            ")"
+            ")",
         )
         .run();
       GLOBALS.KeepaliveTableReady = true;
@@ -594,6 +670,31 @@ const Database = {
       "Unknown";
     return String(x).slice(0, 64);
   },
+  normalizeNodeKey(v) {
+    return String(v || "")
+      .trim()
+      .toLowerCase();
+  },
+  pickNodeDisplayName(node) {
+    const dn = String(node?.displayName || "").trim();
+    if (dn) return dn;
+    const n = String(node?.name || "").trim();
+    if (n) return n;
+    return "";
+  },
+  buildNodeDisplayMap(nodes) {
+    const map = new Map();
+    for (const n of nodes || []) {
+      const show = this.pickNodeDisplayName(n);
+      if (!show) continue;
+      const aliases = [n?.name, n?.key, n?.id, n?.path, n?.route, show];
+      for (const a of aliases) {
+        const k = this.normalizeNodeKey(a);
+        if (k && !map.has(k)) map.set(k, show);
+      }
+    }
+    return map;
+  },
   async getTgConfig(env) {
     const kv = this.getKV(env);
     if (!kv) return null;
@@ -603,11 +704,10 @@ const Database = {
         enabled: false,
         token: "",
         chat: "",
-        flowGB: 0,
-        errCount: 0,
         reportTime: "00:00",
-        reportEveryMin: 0,
-        reportMaxPerDay: 1,
+        reportEveryMin: 60, // 最短60分钟
+        reportMaxPerDay: 1, // 1~24
+        reportChangeOnly: true, // 仅内容变化才推送（默认开启）
       }
     );
   },
@@ -616,27 +716,106 @@ const Database = {
     if (!kv) return;
     await kv.put("tg:config", cfg || {});
   },
-  async logPlayback(env, node, request, res, isPlayback) {
+  async logPlayback(
+    env,
+    node,
+    request,
+    res,
+    isPlayback,
+    mode = "proxy",
+    bytesMeasured = null,
+  ) {
     try {
       if (!isPlayback) return;
-      if (res && res.status >= 300 && res.status < 400) return;
+      if (res && res.status >= 300 && res.status < 400 && mode !== "direct")
+        return;
       const method = String(request.method || "GET").toUpperCase();
-      if (method !== "GET" && method !== "HEAD") return;
       const db = await this.ensureKeepaliveStateTable(env);
       if (!db) return;
+      const now = Date.now();
       const day = this.getDayKey();
-      const nodeName = String(
-        node?.displayName || node?.name || "unknown"
-      ).slice(0, 64);
-      const nodeKey = String(node?.name || "")
-        .trim()
-        .toLowerCase();
+      const nodeNameRaw = String(node?.name || "unknown").trim() || "unknown";
+      const nodeName = this.normalizeNodeKey(nodeNameRaw) || "unknown";
+      const nodeKey = nodeName;
+      if (nodeKey) {
+        await db
+          .prepare(
+            "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, ?2, NULL) " +
+              "ON CONFLICT(node) DO UPDATE SET last_play_ts=excluded.last_play_ts",
+          )
+          .bind(nodeKey, now)
+          .run();
+      }
+      if (method !== "GET" && method !== "HEAD") return;
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS play_sessions (" +
+            "k TEXT PRIMARY KEY," +
+            "day TEXT NOT NULL," +
+            "last_ts INTEGER NOT NULL" +
+            ")",
+        )
+        .run();
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS play_stats (" +
+            "day TEXT NOT NULL," +
+            "node TEXT NOT NULL," +
+            "client TEXT NOT NULL," +
+            "plays INTEGER NOT NULL DEFAULT 0," +
+            "bytes INTEGER NOT NULL DEFAULT 0," +
+            "sessions INTEGER NOT NULL DEFAULT 0," +
+            "errors INTEGER NOT NULL DEFAULT 0," +
+            "updated_at INTEGER NOT NULL," +
+            "PRIMARY KEY(day, node, client)" +
+            ")",
+        )
+        .run();
       const client = this.getClientName(request);
       const range = request.headers.get("Range") || "";
       const isRange = /^bytes=\d+-\d*/i.test(range);
-      let bytes = Number(res.headers.get("Content-Length") || 0) || 0;
-      const cr = res.headers.get("Content-Range");
-      if (cr) {
+      const hasMeasuredBytes =
+        typeof bytesMeasured === "number" && Number.isFinite(bytesMeasured);
+      const rawIp =
+        request.headers.get("CF-Connecting-IP") ||
+        request.headers.get("X-Forwarded-For") ||
+        request.headers.get("X-Real-IP") ||
+        "unknown";
+      const ip = String(rawIp).split(",")[0].trim() || "unknown";
+      const u = new URL(request.url);
+      const sessionId =
+        String(u.searchParams.get("SessionId") || "") ||
+        String(u.searchParams.get("sessionId") || "") ||
+        String(u.searchParams.get("PlaySessionId") || "") ||
+        String(u.searchParams.get("playSessionId") || "");
+      const deviceId = String(
+        request.headers.get("X-Emby-Device-Id") ||
+          request.headers.get("X-MediaBrowser-Device-Id") ||
+          "",
+      ).slice(0, 64);
+      let sessInc = 1;
+      const sessToken = `${day}|${nodeName}|${client}|${ip}|${deviceId}|${sessionId}`;
+      if (sessionId || deviceId) {
+        const prev = await db
+          .prepare("SELECT last_ts FROM play_sessions WHERE k=?1")
+          .bind(sessToken)
+          .first();
+        if (prev && Number(now - Number(prev.last_ts || 0)) <= 15 * 60 * 1000) {
+          sessInc = 0;
+        }
+        await db
+          .prepare(
+            "INSERT INTO play_sessions (k,day,last_ts) VALUES (?1,?2,?3) " +
+              "ON CONFLICT(k) DO UPDATE SET day=excluded.day, last_ts=excluded.last_ts",
+          )
+          .bind(sessToken, day, now)
+          .run();
+      }
+      let bytes = hasMeasuredBytes
+        ? bytesMeasured
+        : Number(res?.headers?.get("Content-Length") || 0) || 0;
+      const cr = res?.headers?.get("Content-Range");
+      if (!hasMeasuredBytes && cr) {
         const m = /bytes\s+(\d+)-(\d+)\/\d+/i.exec(cr);
         if (m) {
           const start = Number(m[1]);
@@ -646,35 +825,28 @@ const Database = {
           }
         }
       }
-      const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
-      const ua = (request.headers.get("User-Agent") || "").slice(0, 120);
-      const now = Date.now();
-      const deviceId = request.headers.get("X-Emby-Device-Id") || "";
-      const sessKey =
-        day + "|" + nodeName + "|" + ip + "|" + ua + "|" + deviceId;
-      let sessInc = 0;
-      const row = await db
-        .prepare("SELECT last_ts FROM play_sessions WHERE k=?1")
-        .bind(sessKey)
-        .first();
-      const lastTs = Number(row?.last_ts || 0);
-      if (!row || now - lastTs > 5 * 60 * 1000) sessInc = 1;
-      await db
-        .prepare(
-          "INSERT INTO play_sessions (k, day, last_ts) VALUES (?1, ?2, ?3) " +
-            "ON CONFLICT(k) DO UPDATE SET day=excluded.day, last_ts=excluded.last_ts"
-        )
-        .bind(sessKey, day, now)
-        .run();
-      if (nodeKey) {
-        await db
-          .prepare(
-            "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day) VALUES (?1, ?2, ?2, NULL) " +
-              "ON CONFLICT(node) DO UPDATE SET last_play_ts=excluded.last_play_ts"
-          )
-          .bind(nodeKey, now)
-          .run();
+      if (!hasMeasuredBytes && mode === "proxy" && bytes > 0 && isRange) {
+        let seg = "";
+        if (cr) {
+          const mCr = /bytes\s+(\d+)-(\d+)\/\d+/i.exec(cr);
+          if (mCr) seg = `${mCr[1]}-${mCr[2]}`;
+        }
+        if (!seg) {
+          const mRg = /bytes=(\d+)-(\d*)/i.exec(range);
+          if (mRg) seg = `${mRg[1]}-${mRg[2] || ""}`;
+        }
+        if (seg) {
+          const p = new URL(request.url).pathname;
+          const dedupKey = `${day}|${nodeName}|${ip}|${client}|${p}|${seg}`;
+          if (GLOBALS.PlaybackRangeDedup.get(dedupKey)) {
+            bytes = 0;
+          } else {
+            GLOBALS.PlaybackRangeDedup.set(dedupKey, 1, 15 * 60 * 1000);
+          }
+        }
       }
+      if (mode !== "proxy") bytes = 0;
+      if (!Number.isFinite(bytes) || bytes < 0) bytes = 0;
       const isErr = res && res.status >= 500 ? 1 : 0;
       const playInc = sessInc;
       await db
@@ -683,10 +855,19 @@ const Database = {
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
             "ON CONFLICT(day,node,client) DO UPDATE SET " +
             "plays=plays+excluded.plays, bytes=bytes+excluded.bytes, sessions=sessions+excluded.sessions, " +
-            "errors=errors+excluded.errors, updated_at=excluded.updated_at"
+            "errors=errors+excluded.errors, updated_at=excluded.updated_at",
         )
         .bind(day, nodeName, client, playInc, bytes, sessInc, isErr, now)
         .run();
+      const kv = this.getKV(env);
+      if (kv && playInc > 0) {
+        const key =
+          mode === "direct"
+            ? `stats:directPlays:${day}`
+            : `stats:proxyPlays:${day}`;
+        const cur = Number((await kv.get(key)) || 0);
+        await kv.put(key, String(cur + playInc));
+      }
       if (isErr) {
         const cfg = await this.getTgConfig(env);
         if (cfg?.enabled && cfg?.token && cfg?.chat) {
@@ -699,14 +880,18 @@ const Database = {
   },
   async buildDailyReport(env) {
     const db = this.getDb(env);
-    if (!db) return "❌ D1 未绑定";
+    if (!db) return "❌ D1未绑定! 请检查 EMBY_D1 / D1 / DB";
     const dayToday = this.getDayKey();
     const dayYest = this.getDayKeyOffset(-1);
+    const cfg = await this.getTgConfig(env);
+    const estGBPerDirectPlay = Math.max(
+      0.1,
+      Math.min(10, Number(cfg?.directEstGB || 1.2)),
+    );
     const getSum = async (day) => {
       const total = await db
         .prepare(
-          "SELECT SUM(plays) AS plays, SUM(bytes) AS bytes, SUM(sessions) AS sessions " +
-            "FROM play_stats WHERE day=?1"
+          "SELECT SUM(plays) AS plays, SUM(bytes) AS bytes, SUM(sessions) AS sessions FROM play_stats WHERE day=?1",
         )
         .bind(day)
         .first();
@@ -718,102 +903,159 @@ const Database = {
     };
     const today = await getSum(dayToday);
     const yest = await getSum(dayYest);
+    let cfPlayToday = { bytes: 0, requests: 0 };
+    let cfPlayYest = { bytes: 0, requests: 0 };
+    let cfTotalToday = { bytes: 0, requests: 0 };
+    let cfTotalYest = { bytes: 0, requests: 0 };
+    try {
+      cfPlayToday = await this.getCfPlayback(env, dayToday);
+    } catch (e) {
+      console.log("getCfPlayback today fail:", e?.message || e);
+    }
+    try {
+      cfPlayYest = await this.getCfPlayback(env, dayYest);
+    } catch (e) {
+      console.log("getCfPlayback yest fail:", e?.message || e);
+    }
+    try {
+      cfTotalToday = await this.getCfHttpTotal(env, dayToday);
+    } catch (e) {
+      console.log("getCfHttpTotal today fail:", e?.message || e);
+    }
+    try {
+      cfTotalYest = await this.getCfHttpTotal(env, dayYest);
+    } catch (e) {
+      console.log("getCfHttpTotal yest fail:", e?.message || e);
+    }
+    const kv = this.getKV(env);
+    const proxyPlaysToday = kv
+      ? Number((await kv.get(`stats:proxyPlays:${dayToday}`)) || 0)
+      : 0;
+    const directPlaysToday = kv
+      ? Number((await kv.get(`stats:directPlays:${dayToday}`)) || 0)
+      : 0;
+    const proxyPlaysYest = kv
+      ? Number((await kv.get(`stats:proxyPlays:${dayYest}`)) || 0)
+      : 0;
+    const directPlaysYest = kv
+      ? Number((await kv.get(`stats:directPlays:${dayYest}`)) || 0)
+      : 0;
     const topNodes = await db
       .prepare(
-        "SELECT node, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY node ORDER BY plays DESC LIMIT 99"
+        "SELECT LOWER(TRIM(node)) AS node_key, SUM(plays) AS plays " +
+          "FROM play_stats WHERE day=?1 " +
+          "GROUP BY LOWER(TRIM(node)) " +
+          "ORDER BY plays DESC LIMIT 99",
       )
       .bind(dayToday)
       .all();
     const topClients = await db
       .prepare(
-        "SELECT client, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY client ORDER BY plays DESC LIMIT 99"
+        "SELECT client, SUM(plays) AS plays FROM play_stats WHERE day=?1 GROUP BY client ORDER BY plays DESC LIMIT 99",
       )
       .bind(dayToday)
       .all();
+    let nodeDisplayMap = new Map();
+    try {
+      const nodes = await this.listAllNodes(env, "admin", 0);
+      nodeDisplayMap = this.buildNodeDisplayMap(nodes);
+    } catch (_) {}
     const toGB = (bytes) =>
-      Math.round((bytes / (1024 * 1024 * 1024)) * 10) / 10;
-    const fmtTop = (rows, key) => {
+      Math.round((Number(bytes || 0) / (1024 * 1024 * 1024)) * 10) / 10;
+    const estDirectGB = (n) =>
+      Math.round(Number(n || 0) * estGBPerDirectPlay * 10) / 10;
+    const fmtTopNodes = (rows) => {
       const arr = Array.isArray(rows?.results) ? rows.results : [];
       if (!arr.length) return "暂无";
       return arr
-        .map((r) => "  • " + (r[key] || "未知") + "(" + (r.plays || 0) + ")")
+        .map((r) => {
+          const key = this.normalizeNodeKey(r?.node_key);
+          const show = nodeDisplayMap.get(key) || "未命名节点";
+          return "  • " + show + "(" + (r.plays || 0) + ")";
+        })
+        .join("\n");
+    };
+    const fmtTopClients = (rows) => {
+      const arr = Array.isArray(rows?.results) ? rows.results : [];
+      if (!arr.length) return "暂无";
+      return arr
+        .map((r) => "  • " + (r.client || "未知") + "(" + (r.plays || 0) + ")")
         .join("\n");
     };
     return (
       "📊 Emby 反代每日报表\n" +
-      "🗓 今天（北京）： " +
+      "🗓 今天（北京）: " +
       dayToday +
       "\n" +
-      "▶️ 播放次数： " +
+      "▶️ 播放次数: " +
       today.plays +
       "\n" +
-      "📦 播放流量： " +
-      toGB(today.bytes) +
+      "📦 播放流量(CF): " +
+      toGB(cfPlayToday.bytes) +
       " GB\n" +
-      "🔥 活跃播放： " +
+      "🌐 域名总流量(CF): " +
+      toGB(cfTotalToday.bytes) +
+      " GB\n" +
+      "🧮 直连估算流量: " +
+      estDirectGB(directPlaysToday) +
+      " GB（估算）\n" +
+      "📈 代理/直连播放: " +
+      proxyPlaysToday +
+      " / " +
+      directPlaysToday +
+      "\n" +
+      "🔥 活跃播放: " +
       today.sessions +
       "\n" +
       "━━━━━━━━━━━━━━\n" +
-      "🗓 昨天（北京）： " +
+      "🗓 昨天（北京）: " +
       dayYest +
       "\n" +
-      "▶️ 播放次数： " +
+      "▶️ 播放次数: " +
       yest.plays +
       "\n" +
-      "📦 播放流量： " +
-      toGB(yest.bytes) +
+      "📦 播放流量(CF): " +
+      toGB(cfPlayYest.bytes) +
       " GB\n" +
-      "🔥 活跃播放： " +
+      "🌐 域名总流量(CF): " +
+      toGB(cfTotalYest.bytes) +
+      " GB\n" +
+      "🧮 直连估算流量: " +
+      estDirectGB(directPlaysYest) +
+      " GB（估算）\n" +
+      "📈 代理/直连播放: " +
+      proxyPlaysYest +
+      " / " +
+      directPlaysYest +
+      "\n" +
+      "🔥 活跃播放: " +
       yest.sessions +
       "\n" +
       "━━━━━━━━━━━━━━\n" +
-      "🏷 热门节点（今天）：\n" +
-      fmtTop(topNodes, "node") +
-      "\n" +
-      "📱 热门客户端（今天）：\n" +
-      fmtTop(topClients, "client")
+      "📌 热门节点 TOP\n" +
+      fmtTopNodes(topNodes) +
+      "\n━━━━━━━━━━━━━━\n" +
+      "🧩 客户端 TOP\n" +
+      fmtTopClients(topClients) +
+      "\n━━━━━━━━━━━━━━\n" +
+      "ℹ️ 说明:开启网盘直连后，直连流量为估算值，不代表源站精确账单。"
     );
-  },
-  async checkAlerts(env) {
-    const db = this.getDb(env);
-    if (!db) return null;
-    const cfg = await this.getTgConfig(env);
-    if (!cfg || !cfg.enabled) return null;
-    const day = this.getDayKey();
-    const sum = await db
-      .prepare(
-        "SELECT SUM(bytes) AS bytes, SUM(errors) AS errors FROM play_stats WHERE day=?1"
-      )
-      .bind(day)
-      .first();
-    const bytes = Number(sum?.bytes || 0);
-    const errors = Number(sum?.errors || 0);
-    const flowGB = Number(cfg.flowGB || 0);
-    const errCount = Number(cfg.errCount || 0);
-    const alerts = [];
-    if (flowGB > 0 && bytes >= flowGB * 1024 * 1024 * 1024) {
-      alerts.push(
-        "🚨 流量预警：已达 " + (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB"
-      );
-    }
-    if (errCount > 0 && errors >= errCount) {
-      alerts.push("⚠️ 异常告警：5xx 次数 " + errors);
-    }
-    return alerts.length ? alerts : null;
   },
   async checkKeepaliveAndNotify(env) {
-    const db = await this.ensureKeepaliveStateTable(env);
-    if (!db) return;
     const cfg = await this.getTgConfig(env);
     if (!cfg || !cfg.enabled || !cfg.token || !cfg.chat) return;
+    const db = await this.ensureKeepaliveStateTable(env);
+    if (!db) return;
     const nodes = await this.listAllNodes(env, "admin", 0);
-    const now = Date.now();
+    if (!Array.isArray(nodes) || !nodes.length) return;
     const dayMs = 24 * 3600 * 1000;
+    const now = Date.now();
     const today = this.getDayKey(now);
     const shNow = new Date(
-      new Date(now).toLocaleString("en-US", { timeZone: "Asia/Shanghai" })
+      new Date(now).toLocaleString("en-US", { timeZone: "Asia/Shanghai" }),
     );
     const curMin = shNow.getHours() * 60 + shNow.getMinutes();
+    const kv = this.getKV(env);
     for (const n of nodes) {
       try {
         const nodeKey = String(n?.name || "")
@@ -824,22 +1066,24 @@ const Database = {
         if (periodDays <= 0) continue;
         const beforeDays = Math.max(
           0,
-          Math.floor(Number(n?.remindBeforeDays || 0))
+          Math.floor(Number(n?.remindBeforeDays || 0)),
         );
         const maxPerDay = Math.max(
           1,
-          Math.floor(Number(n?.keepaliveMaxPerDay || 1))
+          Math.min(24, Math.floor(Number(n?.keepaliveMaxPerDay || 1))),
         );
+        const intervalMin = 60; // 固定最短1小时
+        const changeOnly = n?.keepaliveChangeOnly !== false; // 默认开
         let st = await db
           .prepare(
-            "SELECT anchor_ts, last_play_ts, notify_count_day, notify_count FROM keepalive_state WHERE node=?1"
+            "SELECT anchor_ts, last_play_ts, notify_count_day, notify_count FROM keepalive_state WHERE node=?1",
           )
           .bind(nodeKey)
           .first();
         if (!st) {
           await db
             .prepare(
-              "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count_day, notify_count) VALUES (?1, ?2, 0, NULL, NULL, 0)"
+              "INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count_day, notify_count) VALUES (?1, ?2, 0, NULL, NULL, 0)",
             )
             .bind(nodeKey, now)
             .run();
@@ -858,9 +1102,9 @@ const Database = {
         if (now < notifyStartTs) continue;
         const keepaliveAtRaw = String(n?.keepaliveAt || "00:00")
           .trim()
-          .replace(/[：﹕∶]/g, ":");
-        const m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
-          keepaliveAtRaw
+          .replace(/[:﹕∶]/g, ":");
+        const m = /^(\d{1,2}):(\d{1,2})(:(\d{1,2})(\.\d+)?)?$/.exec(
+          keepaliveAtRaw,
         );
         let remindMin = 0;
         let keepaliveAt = "00:00";
@@ -878,50 +1122,79 @@ const Database = {
           cntDay = today;
           cnt = 0;
         }
-        if (cnt >= maxPerDay) continue;
+        const cntKey = `keepalive:cnt:${nodeKey}:${today}`;
+        const lastKey = `keepalive:last:${nodeKey}:${today}`;
+        const digestKey = `keepalive:digest:${nodeKey}:${today}`;
+        const sentCnt = kv ? Number((await kv.get(cntKey)) || cnt || 0) : cnt;
+        const lastTs = kv ? Number((await kv.get(lastKey)) || 0) : 0;
+        if (sentCnt >= maxPerDay) continue;
+        if (lastTs && now - lastTs < intervalMin * 60 * 1000) continue;
         const leftMs = dueTs - now;
         const showName = String(n?.displayName || n?.name || nodeKey);
         const msg =
-          (leftMs <= 0 ? "⛔【保号到期提醒】\n" : "⏰【保号提醒】\n") +
-          "节点：" +
+          "🔔 保号提醒\n" +
+          "节点:" +
           showName +
           "\n" +
-          "保号周期：" +
+          "保号周期:" +
           periodDays +
           "天\n" +
-          "提前提醒：" +
+          "提前提醒:" +
           beforeDays +
           "天\n" +
-          "提醒时间：" +
+          "提醒时间:" +
           keepaliveAt +
           "（北京时间）\n" +
-          "今日次数：" +
-          (cnt + 1) +
+          "今日次数:" +
+          (sentCnt + 1) +
           "/" +
           maxPerDay +
           "\n" +
           (leftMs <= 0
-            ? "状态：已到期（未观看）\n"
-            : "剩余：" + Math.ceil(leftMs / dayMs) + "天\n") +
-          "最后播放：" +
+            ? "状态:已到期（未观看）\n"
+            : "剩余:" + Math.ceil(leftMs / dayMs) + "天\n") +
+          "最后播放:" +
           (lastPlayTs > 0
             ? new Date(lastPlayTs).toLocaleString("zh-CN", {
                 timeZone: "Asia/Shanghai",
                 hour12: false,
               })
             : "无记录");
+        let digest = "";
+        if (changeOnly && kv) {
+          const digestBase = [
+            nodeKey,
+            String(periodDays),
+            String(beforeDays),
+            String(dueTs),
+            String(lastPlayTs > 0 ? lastPlayTs : 0),
+          ].join("|");
+          let h = 2166136261 >>> 0;
+          for (let i = 0; i < digestBase.length; i++) {
+            h ^= digestBase.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+          }
+          digest = String(h >>> 0);
+          const oldDigest = String((await kv.get(digestKey)) || "");
+          if (oldDigest && oldDigest === digest) continue;
+        }
         await sendTG(cfg.token, cfg.chat, msg);
+        if (kv) {
+          if (changeOnly && digest) await kv.put(digestKey, digest);
+          await kv.put(cntKey, String(sentCnt + 1));
+          await kv.put(lastKey, String(now));
+        }
         await db
           .prepare(
-            "UPDATE keepalive_state SET notify_count_day=?2, notify_count=?3, last_notify_day=?2 WHERE node=?1"
+            "UPDATE keepalive_state SET notify_count_day=?2, notify_count=?3, last_notify_day=?2 WHERE node=?1",
           )
-          .bind(nodeKey, today, cnt + 1)
+          .bind(nodeKey, today, sentCnt + 1)
           .run();
       } catch (e) {
         console.error(
           "keepalive node notify failed:",
           n?.name,
-          e?.message || e
+          e?.message || e,
         );
       }
     }
@@ -940,22 +1213,26 @@ const Database = {
     if (n?.embyUser) o.eu = String(n.embyUser);
     if (n?.embyPass) o.ep = String(n.embyPass);
     if (n?.directExternal) o.de = 1;
+    if (n?.realClientIpMode && String(n.realClientIpMode) !== "smart") {
+      o.xrm = String(n.realClientIpMode);
+    }
     if (Number.isFinite(Number(n?.renewDays)) && Number(n.renewDays) > 0) {
-      o.xd = Math.floor(Number(n.renewDays));
+      o.xd = Math.floor(Number(n.renewDays)); // 保号周期
     }
     if (
       Number.isFinite(Number(n?.remindBeforeDays)) &&
       Number(n.remindBeforeDays) >= 0
     ) {
-      o.xb = Math.floor(Number(n.remindBeforeDays));
+      o.xb = Math.floor(Number(n.remindBeforeDays)); // 提前几天提醒
     }
-    if (n?.keepaliveAt) o.xh = String(n.keepaliveAt);
+    if (n?.keepaliveAt) o.xh = String(n.keepaliveAt); // 保号提醒时间 HH:mm
     if (
       Number.isFinite(Number(n?.keepaliveMaxPerDay)) &&
       Number(n.keepaliveMaxPerDay) >= 1
     ) {
       o.xk = Math.floor(Number(n.keepaliveMaxPerDay));
     }
+    if (n?.ipCountryBlacklist) o.xcb = String(n.ipCountryBlacklist);
     return JSON.stringify(o);
   },
   unpackNode(name, raw) {
@@ -966,6 +1243,14 @@ const Database = {
     if (!rm.ok) return null;
     const mode = rm.value;
     const streamTarget = String(raw.st ?? raw.streamTarget ?? "").trim();
+    const xrmRaw = String(raw.xrm ?? raw.realClientIpMode ?? "smart")
+      .trim()
+      .toLowerCase();
+    const realClientIpMode = ["smart", "realip_only", "off", "dual"].includes(
+      xrmRaw,
+    )
+      ? xrmRaw
+      : "smart";
     return {
       name: String(name || "")
         .trim()
@@ -983,7 +1268,8 @@ const Database = {
       note: String(raw.n ?? raw.note ?? ""),
       embyUser: String(raw.eu ?? raw.embyUser ?? ""),
       embyPass: String(raw.ep ?? raw.embyPass ?? ""),
-      directExternal: !!(raw.de ?? raw.directExternal ?? false),
+      directExternal: toBool(raw.de ?? raw.directExternal ?? false),
+      realClientIpMode,
       renewDays: Number.isFinite(Number(raw.xd ?? raw.renewDays))
         ? Math.max(0, Math.floor(Number(raw.xd ?? raw.renewDays)))
         : 0,
@@ -992,10 +1278,11 @@ const Database = {
         : 0,
       keepaliveAt: String(raw.xh ?? raw.keepaliveAt ?? ""),
       keepaliveMaxPerDay: Number.isFinite(
-        Number(raw.xk ?? raw.keepaliveMaxPerDay)
+        Number(raw.xk ?? raw.keepaliveMaxPerDay),
       )
         ? Math.max(1, Math.floor(Number(raw.xk ?? raw.keepaliveMaxPerDay)))
         : 1,
+      ipCountryBlacklist: String(raw.xcb ?? raw.ipCountryBlacklist ?? ""),
     };
   },
   async getNode(nodeName, env, ctx, uid = "admin") {
@@ -1015,7 +1302,7 @@ const Database = {
       GLOBALS.NodeCache.set(
         mk,
         { data, exp: now + Config.Defaults.CacheTTL },
-        Config.Defaults.CacheTTL
+        Config.Defaults.CacheTTL,
       );
       return data;
     }
@@ -1028,7 +1315,7 @@ const Database = {
           headers: {
             "Cache-Control": "public, max-age=5, stale-while-revalidate=30",
           },
-        })
+        }),
       );
       if (ctx && typeof ctx.waitUntil === "function") {
         ctx.waitUntil(putPromise);
@@ -1041,7 +1328,7 @@ const Database = {
           data: nodeData,
           exp: now + Config.Defaults.CacheTTL,
         },
-        Config.Defaults.CacheTTL
+        Config.Defaults.CacheTTL,
       );
       return nodeData;
     }
@@ -1058,8 +1345,8 @@ const Database = {
     const ttl = forceRefresh
       ? 0
       : Number.isFinite(Number(ttlOverride))
-      ? Math.max(0, Number(ttlOverride))
-      : Number(Config?.Defaults?.ListCacheTTL || 15000);
+        ? Math.max(0, Number(ttlOverride))
+        : Number(Config?.Defaults?.ListCacheTTL || 15000);
     const hit = GLOBALS.NodeListCache.get(key);
     if (!forceRefresh && hit && hit.exp > now) return hit.data;
     const inflight = GLOBALS.NodeListInflight.get(key);
@@ -1094,12 +1381,12 @@ const Database = {
                   data: v,
                   exp: now2 + Config.Defaults.CacheTTL,
                 },
-                Config.Defaults.CacheTTL
+                Config.Defaults.CacheTTL,
               );
             }
           }
           return v;
-        })
+        }),
       );
       const out = nodes.filter(Boolean);
       out.sort((a, b) => {
@@ -1112,14 +1399,14 @@ const Database = {
         return String(a?.name || "").localeCompare(
           String(b?.name || ""),
           "zh-Hans-CN",
-          { sensitivity: "base" }
+          { sensitivity: "base" },
         );
       });
       if (ttl > 0) {
         GLOBALS.NodeListCache.set(
           key,
           { data: out, exp: Date.now() + ttl },
-          ttl
+          ttl,
         );
       } else {
         GLOBALS.NodeListCache.delete(key);
@@ -1168,10 +1455,596 @@ const Database = {
       };
     }
   },
+  isIPv4(ip) {
+    return /^(\d{1,3}\.){3}\d{1,3}$/.test(ip);
+  },
+  isIPv6(ip) {
+    return /^[0-9a-f:]+$/i.test(ip) && ip.includes(":");
+  },
+  async cfApi(env, method, path, body) {
+    const token = String(env.CF_API_TOKEN || "").trim();
+    if (!token) throw new Error("CF_API_TOKEN 未配置");
+    const r = await fetch("https://api.cloudflare.com/client/v4" + path, {
+      method,
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d?.success) {
+      const msg =
+        (d?.errors && d.errors[0] && d.errors[0].message) ||
+        "CF API ERROR: " + r.status;
+      throw new Error(msg);
+    }
+    return d;
+  },
+  async cfGraphQL(env, query, variables) {
+    const token = String(env.CF_API_TOKEN || "").trim();
+    if (!token) throw new Error("CF_API_TOKEN 未配置");
+    const r = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d?.errors?.length) {
+      throw new Error(
+        "CF GraphQL ERROR: " + JSON.stringify(d?.errors || r.status),
+      );
+    }
+    return d?.data;
+  },
+  getBeijingDayRange(dayStr) {
+    const [y, m, d] = dayStr.split("-").map(Number);
+    const start = new Date(Date.UTC(y, m - 1, d, -8, 0, 0));
+    const end = new Date(Date.UTC(y, m - 1, d + 1, -8, 0, 0));
+    return { start: start.toISOString(), end: end.toISOString() };
+  },
+  async getCfHttpTotal(env, dayStr) {
+    const zoneId = await this.getZoneId(env);
+    const { start, end } = this.getBeijingDayRange(dayStr);
+    const q = `
+      query($zoneTag: String!, $start: DateTime!, $end: DateTime!) {
+        viewer {
+          zones(filter: {zoneTag: $zoneTag}) {
+            httpRequests1hGroups(
+              limit: 1000,
+              filter: { datetime_geq: $start, datetime_lt: $end }
+            ) { sum { bytes requests } }
+          }
+        }
+      }`;
+    const data = await this.cfGraphQL(env, q, { zoneTag: zoneId, start, end });
+    const groups = data?.viewer?.zones?.[0]?.httpRequests1hGroups || [];
+    let bytes = 0,
+      requests = 0;
+    for (const g of groups) {
+      bytes += Number(g?.sum?.bytes || 0);
+      requests += Number(g?.sum?.requests || 0);
+    }
+    return { bytes, requests };
+  },
+  async getCfPlayback(env, dayStr) {
+    const zoneId = await this.getZoneId(env);
+    const { start, end } = this.getBeijingDayRange(dayStr);
+    const pathRegex =
+      "/(videos|playback|sessions/playing|audio|hls|dash)/|/playbackinfo|\\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$";
+    const sumGroups = (groups) => {
+      let bytes = 0,
+        requests = 0;
+      for (const g of groups || []) {
+        bytes += Number(g?.sum?.bytes || 0);
+        requests += Number(g?.sum?.requests || 0);
+      }
+      return { bytes, requests };
+    };
+    const q1 = `
+    query($zoneTag: String!, $start: DateTime!, $end: DateTime!, $path: String!) {
+      viewer {
+        zones(filter: {zoneTag: $zoneTag}) {
+          httpRequests1hGroups(
+            limit: 1000,
+            filter: {
+              datetime_geq: $start,
+              datetime_lt: $end,
+              clientRequestPath_matches: $path
+            }
+          ) { sum { bytes requests } }
+        }
+      }
+    }`;
+    try {
+      const data = await this.cfGraphQL(env, q1, {
+        zoneTag: zoneId,
+        start,
+        end,
+        path: pathRegex,
+      });
+      const groups = data?.viewer?.zones?.[0]?.httpRequests1hGroups || [];
+      return sumGroups(groups);
+    } catch (e) {
+      const msg = String(e?.message || e || "");
+      if (!msg.includes("clientRequestPath_matches")) throw e;
+      console.log(
+        "getCfPlayback fallback: schema不支持 clientRequestPath_matches，返回0",
+      );
+      return { bytes: 0, requests: 0 };
+    }
+  },
+  async getZoneId(env) {
+    const zoneName = String(env.CF_ZONE_NAME || "").trim();
+    if (!zoneName) throw new Error("CF_ZONE_NAME 未配置");
+    const z = await this.cfApi(
+      env,
+      "GET",
+      "/zones?name=" + encodeURIComponent(zoneName),
+    );
+    const zoneId = z?.result?.[0]?.id;
+    if (!zoneId) throw new Error("未找到 Zone: " + zoneName);
+    return zoneId;
+  },
+  normalizeDnsHost(v) {
+    let s = String(v || "").trim();
+    if (!s) return "";
+    if (/^https?:\/\//i.test(s)) {
+      try {
+        s = new URL(s).hostname;
+      } catch {}
+    }
+    return s.replace(/\/.*$/, "").replace(/\.$/, "").trim();
+  },
+  splitDnsValues(v) {
+    return Array.from(
+      new Set(
+        String(v || "")
+          .split(/\r?\n|[;,，；| ]+/g)
+          .map((x) => x.trim())
+          .filter(Boolean),
+      ),
+    );
+  },
+  async deleteDnsTypeRecords(env, type, recordName) {
+    const zoneId = await this.getZoneId(env);
+    const q = await this.cfApi(
+      env,
+      "GET",
+      `/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(recordName)}`,
+    );
+    const arr = q?.result || [];
+    for (const it of arr) {
+      await this.cfApi(env, "DELETE", `/zones/${zoneId}/dns_records/${it.id}`);
+    }
+    return arr.length;
+  },
+  async upsertDnsRecords(env, type, contents = [], opts = {}) {
+    const recordName = String(env.CF_RECORD_NAME || "").trim();
+    if (!recordName) throw new Error("CF_RECORD_NAME 未配置");
+    const zoneId = await this.getZoneId(env);
+    const ttl = Math.max(1, Math.min(86400, Number(opts.ttl ?? 1)));
+    const proxied = !!opts.proxied;
+    const values = Array.from(new Set((contents || []).filter(Boolean)));
+    const rec = await this.cfApi(
+      env,
+      "GET",
+      `/zones/${zoneId}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(recordName)}`,
+    );
+    const existing = Array.isArray(rec?.result) ? rec.result : [];
+    const out = [];
+    for (let i = 0; i < values.length; i++) {
+      const content = values[i];
+      const old = existing[i];
+      if (old) {
+        const upd = await this.cfApi(
+          env,
+          "PUT",
+          `/zones/${zoneId}/dns_records/${old.id}`,
+          {
+            type,
+            name: recordName,
+            content,
+            ttl,
+            proxied,
+          },
+        );
+        out.push({
+          action: "update",
+          type,
+          name: recordName,
+          before: old.content || "",
+          content: upd?.result?.content || content,
+        });
+      } else {
+        const crt = await this.cfApi(
+          env,
+          "POST",
+          `/zones/${zoneId}/dns_records`,
+          {
+            type,
+            name: recordName,
+            content,
+            ttl,
+            proxied,
+          },
+        );
+        out.push({
+          action: "create",
+          type,
+          name: recordName,
+          before: "",
+          content: crt?.result?.content || content,
+        });
+      }
+    }
+    for (let i = values.length; i < existing.length; i++) {
+      await this.cfApi(
+        env,
+        "DELETE",
+        `/zones/${zoneId}/dns_records/${existing[i].id}`,
+      );
+    }
+    return out;
+  },
+  async resolveEffectiveDnsReplaceMode(env) {
+    const kv = this.getKV(env);
+    let kvMode = "";
+    if (kv) {
+      kvMode = String((await kv.get("sys:dns_replace_mode")) || "")
+        .trim()
+        .toUpperCase();
+      if (!["AUTO", "A", "AAAA", "CNAME"].includes(kvMode)) kvMode = "";
+    }
+    try {
+      const st = await this.getDnsStatus(env);
+      const hasCname = Array.isArray(st?.cname) && st.cname.length > 0;
+      const hasA = Array.isArray(st?.a) && st.a.length > 0;
+      const hasAAAA = Array.isArray(st?.aaaa) && st.aaaa.length > 0;
+      let dnsMode = "AUTO";
+      if (hasCname) dnsMode = "CNAME";
+      else if (hasA && !hasAAAA) dnsMode = "A";
+      else if (!hasA && hasAAAA) dnsMode = "AAAA";
+      if (kvMode === "A" || kvMode === "AAAA" || kvMode === "CNAME")
+        return kvMode;
+      if (dnsMode === "A" || dnsMode === "AAAA" || dnsMode === "CNAME")
+        return dnsMode;
+      return kvMode || "AUTO";
+    } catch {
+      return kvMode || "AUTO";
+    }
+  },
+  async upsertDnsRecord(env, type, content) {
+    const recordName = String(env.CF_RECORD_NAME || "").trim();
+    if (!recordName) throw new Error("CF_RECORD_NAME 未配置");
+    const replaceMode = await this.resolveEffectiveDnsReplaceMode(env);
+    if (replaceMode === "A" && type === "AAAA") {
+      throw new Error("当前为 A 模式，禁止写入 AAAA");
+    }
+    if (replaceMode === "AAAA" && type === "A") {
+      throw new Error("当前为 AAAA 模式，禁止写入 A");
+    }
+    if (replaceMode === "CNAME" && (type === "A" || type === "AAAA")) {
+      throw new Error("当前为 CNAME 模式，禁止写入 A/AAAA");
+    }
+    let removedCname = 0;
+    if (type === "A" || type === "AAAA") {
+      removedCname = await this.deleteDnsTypeRecords(env, "CNAME", recordName);
+    }
+    if (replaceMode === "A" && type === "A") {
+      await this.deleteDnsTypeRecords(env, "AAAA", recordName);
+    } else if (replaceMode === "AAAA" && type === "AAAA") {
+      await this.deleteDnsTypeRecords(env, "A", recordName);
+    }
+    const rs = await this.upsertDnsRecords(env, type, [content], {
+      ttl: 1,
+      proxied: false,
+    });
+    const one = rs[0] || {
+      action: "noop",
+      type,
+      name: recordName,
+      before: "",
+      content: String(content || ""),
+    };
+    return { ...one, removedCname };
+  },
+  async replaceDnsRecords(env, payload = {}) {
+    const recordName = String(env.CF_RECORD_NAME || "").trim();
+    if (!recordName) throw new Error("CF_RECORD_NAME 未配置");
+    const mode = String(payload.mode || "AUTO").toUpperCase(); // CNAME / A / AAAA / AUTO
+    const ttl = Math.max(1, Math.min(86400, Number(payload.ttl || 60)));
+    const proxied = !!payload.proxied;
+    const cname = this.normalizeDnsHost(payload.cname || "");
+    const aList = this.splitDnsValues(payload.aList || "").filter((x) =>
+      this.isIPv4(x),
+    );
+    const aaaaList = this.splitDnsValues(payload.aaaaList || "").filter((x) =>
+      this.isIPv6(x),
+    );
+    if (mode === "CNAME") {
+      if (!cname) throw new Error("CNAME 模式必须填写目标");
+      await this.deleteDnsTypeRecords(env, "A", recordName);
+      await this.deleteDnsTypeRecords(env, "AAAA", recordName);
+      await this.upsertDnsRecords(env, "CNAME", [cname], { ttl, proxied });
+    } else if (mode === "A") {
+      if (!aList.length) throw new Error("A 模式至少填写一个 IPv4");
+      await this.deleteDnsTypeRecords(env, "CNAME", recordName);
+      await this.deleteDnsTypeRecords(env, "AAAA", recordName); // 关键：A时清空AAAA
+      await this.upsertDnsRecords(env, "A", aList, { ttl, proxied });
+    } else if (mode === "AAAA") {
+      if (!aaaaList.length) throw new Error("AAAA 模式至少填写一个 IPv6");
+      await this.deleteDnsTypeRecords(env, "CNAME", recordName);
+      await this.deleteDnsTypeRecords(env, "A", recordName); // 关键：AAAA时清空A
+      await this.upsertDnsRecords(env, "AAAA", aaaaList, { ttl, proxied });
+    } else {
+      if (!aList.length && !aaaaList.length) {
+        throw new Error("AUTO 模式至少填写 A 或 AAAA 其中一项");
+      }
+      await this.deleteDnsTypeRecords(env, "CNAME", recordName);
+      await this.upsertDnsRecords(env, "A", aList, { ttl, proxied });
+      await this.upsertDnsRecords(env, "AAAA", aaaaList, { ttl, proxied });
+    }
+    const kv = this.getKV(env);
+    if (kv) {
+      await kv.put("sys:dns_replace_mode", mode);
+    }
+    return await this.getDnsStatus(env);
+  },
+  async getDnsStatus(env) {
+    const recordName = String(env.CF_RECORD_NAME || "").trim();
+    if (!recordName) throw new Error("CF_RECORD_NAME 未配置");
+    const zoneId = await this.getZoneId(env);
+    const [aRes, aaaaRes, cnameRes] = await Promise.all([
+      this.cfApi(
+        env,
+        "GET",
+        `/zones/${zoneId}/dns_records?type=A&name=${encodeURIComponent(recordName)}`,
+      ),
+      this.cfApi(
+        env,
+        "GET",
+        `/zones/${zoneId}/dns_records?type=AAAA&name=${encodeURIComponent(recordName)}`,
+      ),
+      this.cfApi(
+        env,
+        "GET",
+        `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(recordName)}`,
+      ),
+    ]);
+    const kv = this.getKV(env);
+    let replaceMode = "";
+    if (kv) {
+      const rm = String((await kv.get("sys:dns_replace_mode")) || "")
+        .trim()
+        .toUpperCase();
+      if (["AUTO", "A", "AAAA", "CNAME"].includes(rm)) replaceMode = rm;
+    }
+    let lastSync = null;
+    if (kv) {
+      const raw = await kv.get("sys:dns_last_sync");
+      if (raw) {
+        lastSync = new Date(raw).toLocaleString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+        });
+      }
+    }
+    return {
+      success: true,
+      name: recordName,
+      a: (aRes?.result || []).map((x) => x.content),
+      aaaa: (aaaaRes?.result || []).map((x) => x.content),
+      cname: (cnameRes?.result || []).map((x) => x.content),
+      replaceMode,
+      lastSync,
+    };
+  },
+  num(v, defVal) {
+    if (v === null || v === undefined) return defVal;
+    const n = parseFloat(String(v).replace(/[^\d.-]/g, ""));
+    return Number.isFinite(n) ? n : defVal;
+  },
+  getByPath(obj, path) {
+    try {
+      return String(path || "")
+        .split(".")
+        .filter(Boolean)
+        .reduce((acc, k) => (acc == null ? undefined : acc[k]), obj);
+    } catch {
+      return undefined;
+    }
+  },
+  pickNum(obj, keys = [], defVal = null) {
+    for (const k of keys) {
+      const v = k.includes(".") ? this.getByPath(obj, k) : obj?.[k];
+      if (v === null || v === undefined || v === "") continue;
+      const n = this.num(v, Number.NaN);
+      if (Number.isFinite(n)) return n;
+    }
+    return defVal;
+  },
+  toMetrics(it, line = "CN") {
+    const L = String(line || "CN").toUpperCase();
+    const speedKeys = [
+      "speed",
+      "downloadSpeed",
+      "download_speed",
+      "download",
+      "bw",
+      "bandwidth",
+      "throughput",
+      "rate",
+      "mbps",
+      "speedMbps",
+      "avgSpeed",
+      "speed_avg",
+      "metrics.speed",
+      "metrics.downloadSpeed",
+      "qos.speed",
+    ];
+    const latencyCommon = [
+      "latency",
+      "latencyAvg",
+      "latency_avg",
+      "delay",
+      "ping",
+      "ms",
+      "rtt",
+      "rttAvg",
+      "rtt_avg",
+      "avgLatency",
+      "responseTime",
+      "time",
+      "metrics.latency",
+      "qos.latency",
+    ];
+    const lossCommon = [
+      "loss",
+      "lossRate",
+      "loss_rate",
+      "packetLoss",
+      "packet_loss",
+      "pkgLostRate",
+      "pkg_lost_rate",
+      "avgPkgLostRate",
+      "pkgLostRateAvg",
+      "lost",
+      "dropRate",
+      "drop_rate",
+      "metrics.loss",
+      "qos.loss",
+    ];
+    const latencyByLine = {
+      CT: ["dxLatency", "dxLatencyAvg", "telecomLatency", "telecom.latency"],
+      CU: ["ltLatency", "ltLatencyAvg", "unicomLatency", "unicom.latency"],
+      CM: ["ydLatency", "ydLatencyAvg", "mobileLatency", "mobile.latency"],
+      CN: ["avgLatency"],
+    };
+    const lossByLine = {
+      CT: ["dxPkgLostRate", "dxPkgLostRateAvg", "telecomLoss", "telecom.loss"],
+      CU: ["ltPkgLostRate", "ltPkgLostRateAvg", "unicomLoss", "unicom.loss"],
+      CM: ["ydPkgLostRate", "ydPkgLostRateAvg", "mobileLoss", "mobile.loss"],
+      CN: ["avgPkgLostRate"],
+    };
+    const speed = this.pickNum(it, speedKeys, null);
+    const latency = this.pickNum(
+      it,
+      [...(latencyByLine[L] || []), ...latencyCommon, ...latencyByLine.CN],
+      null,
+    );
+    const loss = this.pickNum(
+      it,
+      [...(lossByLine[L] || []), ...lossCommon, ...lossByLine.CN],
+      null,
+    );
+    return {
+      speed: Number.isFinite(speed) && speed > 0 ? speed : null,
+      latency: Number.isFinite(latency) && latency > 0 ? latency : null,
+      loss: Number.isFinite(loss) && loss >= 0 ? loss : null,
+    };
+  },
+  normalizeLinePrefInput(v) {
+    const base = ["CN", "CT", "CU", "CM"];
+    const arr = String(v || "")
+      .toUpperCase()
+      .replace(/\s+/g, "")
+      .split(/[,;|/]+/)
+      .filter(Boolean)
+      .filter((x) => base.includes(x));
+    const uniq = Array.from(new Set(arr));
+    return uniq.join(",");
+  },
+  getLineOrder(linePrefRaw) {
+    const base = ["CN", "CT", "CU", "CM"];
+    const pref = this.normalizeLinePrefInput(linePrefRaw)
+      .split(",")
+      .filter(Boolean);
+    return Array.from(new Set([...pref, ...base]));
+  },
+  lineRank(line, lineOrder) {
+    const i = lineOrder.indexOf(String(line || "").toUpperCase());
+    return i >= 0 ? i : 99;
+  },
+  candidateCost(c) {
+    const latency =
+      Number.isFinite(Number(c?.latency)) && Number(c.latency) > 0
+        ? Number(c.latency)
+        : null;
+    const loss =
+      Number.isFinite(Number(c?.loss)) && Number(c.loss) >= 0
+        ? Number(c.loss)
+        : null;
+    const linePenalty =
+      Number.isFinite(Number(c?.lineRank)) && Number(c.lineRank) >= 0
+        ? Number(c.lineRank) * 30
+        : 0;
+    let cost = 0;
+    cost += latency == null ? 1800 : latency * 6;
+    cost += loss == null ? 1400 : loss * 260;
+    if (latency == null || loss == null) cost += 1200;
+    if (latency != null && latency > 300) cost += 400;
+    if (loss != null && loss > 2) cost += 500;
+    return cost + linePenalty;
+  },
+  better(a, b) {
+    if (!b) return true;
+    const ca = this.candidateCost(a);
+    const cb = this.candidateCost(b);
+    if (ca !== cb) return ca < cb;
+    const aLat = Number.isFinite(Number(a.latency))
+      ? Number(a.latency)
+      : Number.POSITIVE_INFINITY;
+    const bLat = Number.isFinite(Number(b.latency))
+      ? Number(b.latency)
+      : Number.POSITIVE_INFINITY;
+    if (aLat !== bLat) return aLat < bLat;
+    const aLoss = Number.isFinite(Number(a.loss))
+      ? Number(a.loss)
+      : Number.POSITIVE_INFINITY;
+    const bLoss = Number.isFinite(Number(b.loss))
+      ? Number(b.loss)
+      : Number.POSITIVE_INFINITY;
+    if (aLoss !== bLoss) return aLoss < bLoss;
+    return false;
+  },
+  async getIpCountryCode(ip) {
+    ip = String(ip || "").trim();
+    if (!ip) return "";
+    const key = "geo:" + ip;
+    const hit = GLOBALS.NodeCache.get(key);
+    if (hit !== undefined) return String(hit || "");
+    try {
+      const r = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (r.ok) {
+        const j = await r.json().catch(() => ({}));
+        const cc = String(j?.countryCode || "").toUpperCase();
+        GLOBALS.NodeCache.set(key, cc, 10 * 60 * 1000);
+        return cc;
+      }
+    } catch {}
+    GLOBALS.NodeCache.set(key, "", 5 * 60 * 1000);
+    return "";
+  },
   async handleApi(request, env) {
     const auth = Auth.check(request, env);
     if (!auth.ok) return auth.response;
     const uid = "admin";
+    try {
+      await this.ensureProxyKvTable(env);
+    } catch (e) {
+      return new Response(
+        JSON.stringify({ error: "初始化 proxy_kv 失败: " + (e?.message || e) }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        },
+      );
+    }
     const kv = this.getKV(env);
     if (!kv) {
       return new Response(
@@ -1179,7 +2052,7 @@ const Database = {
         {
           status: 500,
           headers: { "Content-Type": "application/json;charset=utf-8" },
-        }
+        },
       );
     }
     let data = {};
@@ -1202,103 +2075,35 @@ const Database = {
       await cache.delete(this.cacheUrl(uid, name));
     };
     switch (data.action) {
-      case "cname.get":
-      case "cname.set": {
-        const token = String(env.CF_API_TOKEN || "").trim();
-        const zoneName = String(env.CF_ZONE_NAME || "").trim();
-        const recordName = String(env.CF_RECORD_NAME || "").trim();
-        if (!token || !zoneName || !recordName) {
-          return new Response(
-            JSON.stringify({
-              error: "CF_API_TOKEN / CF_ZONE_NAME / CF_RECORD_NAME 未配置",
-            }),
-            {
-              status: 500,
-              headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
-          );
-        }
-        const cfFetch = async (method, path, body) => {
-          const r = await fetch("https://api.cloudflare.com/client/v4" + path, {
-            method,
-            headers: {
-              Authorization: "Bearer " + token,
-              "Content-Type": "application/json",
-            },
-            body: body ? JSON.stringify(body) : undefined,
-          });
-          const d = await r.json().catch(() => ({}));
-          if (!r.ok || !d?.success) {
-            const msg =
-              (d?.errors && d.errors[0] && d.errors[0].message) ||
-              "CF API ERROR: " + r.status;
-            throw new Error(msg);
-          }
-          return d;
-        };
-        const normCname = (v) => {
-          let s = String(v || "").trim();
-          if (!s) return "";
-          if (/^https?:\/\//i.test(s)) {
-            try {
-              s = new URL(s).hostname;
-            } catch {}
-          }
-          s = s.replace(/\/.*$/, "").replace(/\.$/, "");
-          return s;
-        };
+      case "dns.get": {
         try {
-          const z = await cfFetch(
-            "GET",
-            "/zones?name=" + encodeURIComponent(zoneName)
-          );
-          const zoneId = z?.result?.[0]?.id;
-          if (!zoneId) throw new Error("未找到 Zone: " + zoneName);
-          const rec = await cfFetch(
-            "GET",
-            `/zones/${zoneId}/dns_records?type=CNAME&name=${encodeURIComponent(
-              recordName
-            )}`
-          );
-          const record = rec?.result?.[0];
-          if (!record) throw new Error("未找到 CNAME 记录: " + recordName);
-          if (data.action === "cname.get") {
-            return new Response(
-              JSON.stringify({ success: true, content: record.content }),
-              {
-                headers: { "Content-Type": "application/json;charset=utf-8" },
-              }
-            );
-          }
-          const value = normCname(data.value);
-          if (!value) throw new Error("CNAME 目标不能为空");
-          const upd = await cfFetch(
-            "PUT",
-            `/zones/${zoneId}/dns_records/${record.id}`,
-            {
-              type: "CNAME",
-              name: recordName,
-              content: value,
-              ttl: record.ttl ?? 1,
-              proxied: record.proxied ?? false,
-            }
-          );
-          return new Response(
-            JSON.stringify({
-              success: true,
-              content: upd?.result?.content || value,
-            }),
-            {
-              headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
-          );
+          const out = await this.getDnsStatus(env);
+          return new Response(JSON.stringify(out), {
+            headers: { "Content-Type": "application/json;charset=utf-8" },
+          });
         } catch (e) {
           return new Response(
-            JSON.stringify({ error: e?.message || "CF API 调用失败" }),
+            JSON.stringify({ error: e?.message || "获取 DNS 状态失败" }),
             {
               status: 500,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
+            },
+          );
+        }
+      }
+      case "dns.replace": {
+        try {
+          const out = await this.replaceDnsRecords(env, data || {});
+          return new Response(JSON.stringify(out), {
+            headers: { "Content-Type": "application/json;charset=utf-8" },
+          });
+        } catch (e) {
+          return new Response(
+            JSON.stringify({ error: e?.message || "DNS 替换失败" }),
+            {
+              status: 500,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
           );
         }
       }
@@ -1308,16 +2113,16 @@ const Database = {
           JSON.stringify({ success: true, content: cfg || {} }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          }
+          },
         );
       }
       case "tg.set": {
         const cfg = data.content || {};
         let reportTime = String(cfg.reportTime || "")
           .trim()
-          .replace(/[：﹕∶]/g, ":");
-        const mt = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
-          reportTime
+          .replace(/[:﹕∶]/g, ":");
+        const mt = /^(\d{1,2}):(\d{1,2})(:(\d{1,2})(\.\d+)?)?$/.exec(
+          reportTime,
         );
         if (reportTime && !mt) {
           return new Response(
@@ -1325,7 +2130,7 @@ const Database = {
             {
               status: 400,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
+            },
           );
         }
         if (mt) {
@@ -1335,22 +2140,21 @@ const Database = {
             String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
         }
         const reportEveryMin = Math.max(
-          0,
-          Math.min(1440, Number(cfg.reportEveryMin || 0))
+          60,
+          Math.min(1440, Number(cfg.reportEveryMin || 60)),
         );
         const reportMaxPerDay = Math.max(
           1,
-          Math.min(1440, Number(cfg.reportMaxPerDay || 1))
+          Math.min(24, Number(cfg.reportMaxPerDay || 1)),
         );
         await this.setTgConfig(env, {
           enabled: !!cfg.enabled,
           token: String(cfg.token || "").trim(),
           chat: String(cfg.chat || "").trim(),
-          flowGB: Math.min(10240, Math.max(0, Number(cfg.flowGB || 0))),
-          errCount: Math.min(2000, Math.max(0, Number(cfg.errCount || 0))),
           reportTime: reportTime || "00:00",
           reportEveryMin,
           reportMaxPerDay,
+          reportChangeOnly: cfg.reportChangeOnly !== false,
         });
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -1364,23 +2168,30 @@ const Database = {
             {
               status: 400,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
+            },
           );
         }
         const reportTime = String(cfg.reportTime || "00:00");
-        const reportEveryMin = Math.max(0, Number(cfg.reportEveryMin || 0));
-        const reportMaxPerDay = Math.max(1, Number(cfg.reportMaxPerDay || 1));
+        const reportEveryMin = Math.max(
+          60,
+          Math.min(1440, Number(cfg.reportEveryMin || 60)),
+        );
+        const reportMaxPerDay = Math.max(
+          1,
+          Math.min(24, Number(cfg.reportMaxPerDay || 1)),
+        );
         const text =
           "🧪【日报测试通知】\n" +
-          "状态：配置正常\n" +
-          "日报时间：" +
+          "状态:配置正常\n" +
+          "日报时间:" +
           reportTime +
           "（北京时间）\n" +
-          "间隔模式：" +
-          (reportEveryMin > 0 ? `${reportEveryMin} 分钟` : "关闭（每日一次）") +
-          "\n" +
-          "每日上限：" +
-          reportMaxPerDay;
+          "推送间隔:" +
+          reportEveryMin +
+          " 分钟（最短60）\n" +
+          "每日上限:" +
+          reportMaxPerDay +
+          "（1~24）";
         await sendTG(cfg.token, cfg.chat, text);
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -1394,14 +2205,14 @@ const Database = {
             {
               status: 400,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
+            },
           );
         }
         const name = String(data.displayName || data.name || "未命名节点");
         const renewDays = Math.max(0, Math.floor(Number(data.renewDays || 0)));
         const remindBeforeDays = Math.max(
           0,
-          Math.floor(Number(data.remindBeforeDays || 0))
+          Math.floor(Number(data.remindBeforeDays || 0)),
         );
         const keepaliveAtRaw = String(data.keepaliveAt || "").trim();
         const keepaliveAt = /^([01]\d|2[0-3]):([0-5]\d)$/.test(keepaliveAtRaw)
@@ -1409,46 +2220,274 @@ const Database = {
           : "00:00";
         const text =
           "🧪【保号测试通知】\n" +
-          "节点：" +
+          "节点:" +
           name +
           "\n" +
-          "保号周期：" +
+          "保号周期:" +
           renewDays +
           "天\n" +
-          "提前提醒：" +
+          "提前提醒:" +
           remindBeforeDays +
           "天\n" +
-          "提醒时间：北京时间 " +
+          "提醒时间:北京时间 " +
           keepaliveAt;
         await sendTG(cfg.token, cfg.chat, text);
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
       }
-      case "list": {
-        const nodes = await this.listAllNodes(env, uid, 0);
-        const db = await this.ensureKeepaliveStateTable(env);
-        const lastMap = {};
-        if (db) {
-          const rows = await db
-            .prepare("SELECT node, last_play_ts FROM keepalive_state")
-            .all();
-          (rows?.results || []).forEach((r) => {
-            const k = String(r.node || "")
-              .trim()
-              .toLowerCase();
-            lastMap[k] = Number(r.last_play_ts || 0);
+      case "node.compat.autofix": {
+        const vn = Validators.validateName(data.name);
+        if (!vn.ok) {
+          return new Response(JSON.stringify({ error: vn.error }), {
+            status: 400,
+            headers: { "Content-Type": "application/json;charset=utf-8" },
           });
         }
-        const withLast = nodes.map((n) => {
-          const key = String(n.name || "")
+        const name = vn.value;
+        const node = await this.getNode(name, env, null, uid);
+        if (!node) {
+          return new Response(JSON.stringify({ error: "节点不存在" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json;charset=utf-8" },
+          });
+        }
+        const original = String(node.realClientIpMode || "smart")
+          .trim()
+          .toLowerCase();
+        const candidates = [];
+        const pushMode = (m) => {
+          const x = String(m || "")
             .trim()
             .toLowerCase();
-          return {
-            ...n,
-            lastPlayAt: lastMap[key] || 0,
-          };
-        });
+          if (!x) return;
+          if (!candidates.includes(x)) candidates.push(x);
+        };
+        pushMode("realip_only");
+        pushMode("off");
+        pushMode("dual");
+        if (["realip_only", "off", "dual"].includes(original)) {
+          candidates.unshift(original);
+          const uniq = [];
+          for (const m of candidates) if (!uniq.includes(m)) uniq.push(m);
+          candidates.length = 0;
+          candidates.push(...uniq);
+        }
+        const baseOrigin = new URL(request.url).origin;
+        const secret = node?.secret
+          ? "/" + encodeURIComponent(String(node.secret))
+          : "";
+        const probeBase = baseOrigin + "/" + encodeURIComponent(name) + secret;
+        const probeUrl = probeBase + "/System/Info/Public";
+        const mediaProbeUrl = probeBase + "/Items?Limit=1&StartIndex=0";
+        const mediaProbeUrl2 = probeBase + "/Items/Latest?Limit=1";
+        const checkProbe = async (url, timeoutMs = 4500) => {
+          const start = Date.now();
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+          try {
+            const r = await fetch(String(url || ""), {
+              method: "GET",
+              redirect: "manual",
+              signal: ctrl.signal,
+              headers: { "User-Agent": "cf-emby-proxy-check/1.0" },
+            });
+            const rt = Date.now() - start;
+            clearTimeout(timer);
+            let wafHit = false;
+            if (r.status === 403) {
+              const t = await r.text().catch(() => "");
+              const s = String(t || "")
+                .slice(0, 1500)
+                .toLowerCase();
+              if (
+                s.includes("openresty") ||
+                s.includes("forbidden") ||
+                s.includes("cf-chl") ||
+                s.includes("captcha") ||
+                s.includes("/cdn-cgi/challenge")
+              ) {
+                wafHit = true;
+              }
+            }
+            const ok =
+              (r.status >= 200 && r.status < 400) ||
+              r.status === 401 ||
+              (r.status === 403 && !wafHit);
+            return {
+              ok,
+              status: Number(r.status || 0),
+              rt: Number(rt || 0),
+              wafHit: !!wafHit,
+              error: wafHit ? "WAF_BLOCK" : "",
+            };
+          } catch (e) {
+            clearTimeout(timer);
+            const rt = Date.now() - start;
+            return {
+              ok: false,
+              status: 0,
+              rt: Number(rt || 0),
+              wafHit: false,
+              error:
+                e?.name === "AbortError"
+                  ? "TIMEOUT"
+                  : e?.message || "CHECK_FAIL",
+            };
+          }
+        };
+        const scoreOne = (r, weight = 1) => {
+          let s = 0;
+          if (r.wafHit) s -= 1000;
+          if (r.status >= 500) s -= 400;
+          else if (r.status === 403 && !r.wafHit) s -= 80;
+          else if (r.status === 401) s += 120;
+          else if (r.status >= 200 && r.status < 400) s += 220;
+          else if (r.status >= 400) s -= 150;
+          s -= Math.floor((Number(r.rt || 0) / 100) * 8);
+          if (String(r.error || "") === "TIMEOUT") s -= 180;
+          return s * weight;
+        };
+        const tried = [];
+        const modeScores = {};
+        let bestMode = "";
+        let bestScore = -Infinity;
+        for (const mode of candidates) {
+          node.realClientIpMode = mode;
+          await kv.put(this.nodeKey(uid, name), this.packNode(node));
+          await invalidate(name);
+          const r1 = await checkProbe(probeUrl, 4500);
+          const r2 = await checkProbe(mediaProbeUrl, 4500);
+          const r3 = await checkProbe(mediaProbeUrl2, 4500);
+          const pass = !!(r1.ok && (r2.ok || r3.ok));
+          const score =
+            scoreOne(r1, 1.0) +
+            scoreOne(r2, 1.2) +
+            scoreOne(r3, 1.0) +
+            (pass ? 120 : -120);
+          modeScores[mode] = { pass, score };
+          tried.push({
+            mode,
+            pass,
+            score: Number(score.toFixed(2)),
+            probe: {
+              status: r1.status,
+              rt: r1.rt,
+              wafHit: r1.wafHit,
+              error: String(r1.error || ""),
+            },
+            mediaProbe: {
+              status: r2.status,
+              rt: r2.rt,
+              wafHit: r2.wafHit,
+              error: String(r2.error || ""),
+            },
+            mediaProbe2: {
+              status: r3.status,
+              rt: r3.rt,
+              wafHit: r3.wafHit,
+              error: String(r3.error || ""),
+            },
+          });
+          if (pass && score > bestScore) {
+            bestScore = score;
+            bestMode = mode;
+          }
+        }
+        if (!bestMode) {
+          node.realClientIpMode = original || "smart";
+          await kv.put(this.nodeKey(uid, name), this.packNode(node));
+          await invalidate(name);
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: "自动修复未找到可用兼容档位",
+              mode: node.realClientIpMode,
+              tried,
+            }),
+            {
+              status: 400,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+        const STICKY_MARGIN = 0.15; // 15%
+        let picked = bestMode;
+        if (["realip_only", "off", "dual"].includes(original)) {
+          const cur = modeScores[original];
+          if (cur && cur.pass) {
+            const threshold = bestScore * (1 - STICKY_MARGIN);
+            if (cur.score >= threshold) picked = original;
+          }
+        }
+        node.realClientIpMode = picked;
+        await kv.put(this.nodeKey(uid, name), this.packNode(node));
+        await invalidate(name);
+        return new Response(
+          JSON.stringify({
+            success: true,
+            name,
+            mode: picked,
+            bestMode,
+            bestScore: Number(bestScore.toFixed(2)),
+            tried,
+          }),
+          {
+            headers: { "Content-Type": "application/json;charset=utf-8" },
+          },
+        );
+      }
+      case "list": {
+        let nodes = [];
+        try {
+          nodes = await this.listAllNodes(env, uid, 0);
+        } catch (e) {
+          return new Response(
+            JSON.stringify({ error: "读取节点失败: " + (e?.message || e) }),
+            {
+              status: 500,
+              headers: { "Content-Type": "application/json;charset=utf-8" },
+            },
+          );
+        }
+        let withLast = nodes;
+        try {
+          const db = await this.ensureKeepaliveStateTable(env);
+          if (db) {
+            const lastMap = {};
+            let rows = null;
+            try {
+              rows = await db
+                .prepare(
+                  "SELECT node AS n, last_play_ts AS ts FROM keepalive_state",
+                )
+                .all();
+            } catch (_) {}
+            if (!rows) {
+              try {
+                rows = await db
+                  .prepare(
+                    "SELECT node_name AS n, last_run_ts AS ts FROM keepalive_state",
+                  )
+                  .all();
+              } catch (_) {}
+            }
+            (rows?.results || []).forEach((r) => {
+              const k = String(r.n || "")
+                .trim()
+                .toLowerCase();
+              if (k) lastMap[k] = Number(r.ts || 0);
+            });
+            withLast = nodes.map((n) => {
+              const key = String(n.name || "")
+                .trim()
+                .toLowerCase();
+              return { ...n, lastPlayAt: lastMap[key] || 0 };
+            });
+          }
+        } catch (_) {
+          withLast = nodes; // 不阻塞登录
+        }
         return new Response(JSON.stringify({ nodes: withLast, uid }), {
           headers: { "Content-Type": "application/json;charset=utf-8" },
         });
@@ -1477,7 +2516,7 @@ const Database = {
           JSON.stringify({ success: true, name, fav: node.fav }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          }
+          },
         );
       }
       case "saveOrder": {
@@ -1543,14 +2582,14 @@ const Database = {
             if (!oldName && exists) {
               errors.push({
                 name: n.name,
-                error: "请求路径重复：该节点已存在",
+                error: "请求路径重复:该节点已存在",
               });
               continue;
             }
             if (oldName && oldName !== n.name && exists) {
               errors.push({
                 name: n.name,
-                error: "请求路径重复：该节点已存在",
+                error: "请求路径重复:该节点已存在",
               });
               continue;
             }
@@ -1592,7 +2631,7 @@ const Database = {
           }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          }
+          },
         );
       }
       case "delete": {
@@ -1697,7 +2736,7 @@ const Database = {
           }),
           {
             headers: { "Content-Type": "application/json;charset=utf-8" },
-          }
+          },
         );
       }
       case "checkStatus": {
@@ -1723,7 +2762,7 @@ const Database = {
               .map((x) => x.value);
             const uniq = [...new Set(names)];
             const got = await Promise.all(
-              uniq.map((n) => this.getNode(n, env, null, uid))
+              uniq.map((n) => this.getNode(n, env, null, uid)),
             );
             target = got.filter(Boolean);
           } else {
@@ -1779,8 +2818,8 @@ const Database = {
           await Promise.all(
             Array.from(
               { length: Math.min(concurrency, Math.max(1, target.length)) },
-              () => worker()
-            )
+              () => worker(),
+            ),
           );
           return new Response(JSON.stringify({ success: true, results }), {
             headers: { "Content-Type": "application/json;charset=utf-8" },
@@ -1795,7 +2834,7 @@ const Database = {
             {
               status: 200,
               headers: { "Content-Type": "application/json;charset=utf-8" },
-            }
+            },
           );
         }
       }
@@ -1831,7 +2870,7 @@ const Database = {
         hostMap,
         exp: Date.now() + hostIndexTTL,
       },
-      hostIndexTTL
+      hostIndexTTL,
     );
     return hostMap;
   },
@@ -1922,14 +2961,59 @@ const ProxyHandler = {
     const pname = String(env.EMOS_PROXY_NAME || "").trim();
     if (pid) h.set("EMOS-PROXY-ID", pid);
     if (pname) h.set("EMOS-PROXY-NAME", pname);
-    const cip =
+    const rawIp =
       request.headers.get("CF-Connecting-IP") ||
       request.headers.get("X-Forwarded-For") ||
       request.headers.get("X-Real-IP") ||
       "";
-    if (cip) h.set("X-FORWARDED-FOR", cip);
+    if (rawIp) {
+      const ip = String(rawIp).split(",")[0].trim();
+      h.set("X-Forwarded-For", ip);
+      h.set("X-Real-IP", ip);
+      h.set("X-FORWARDED-FOR", ip); // 兼容你原有EMOS侧大小写习惯
+    }
     const rg = request.headers.get("Range");
     if (rg) h.set("Range", rg);
+  },
+  applyClientIpHeaders(h, request, env = null, node = null, forcedMode = "") {
+    const rawIp =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("X-Forwarded-For") ||
+      request.headers.get("X-Real-IP") ||
+      "";
+    const ip = String(rawIp || "")
+      .split(",")[0]
+      .trim();
+    h.delete("X-Forwarded-For");
+    h.delete("X-Real-IP");
+    h.delete("X-FORWARDED-FOR");
+    const norm = (v) => {
+      const s = String(v || "")
+        .trim()
+        .toLowerCase();
+      if (!s) return "";
+      if (["dual", "forward", "both", "full", "on", "1"].includes(s))
+        return "dual";
+      if (["realip_only", "realip", "strip", "x-real-ip", "single"].includes(s))
+        return "realip_only";
+      if (["off", "disable", "none", "close", "0"].includes(s)) return "off";
+      if (["smart", "auto"].includes(s)) return "smart";
+      return "";
+    };
+    let mode =
+      norm(forcedMode) ||
+      norm(node?.realClientIpMode) ||
+      norm(env?.REAL_IP_HEADER_MODE) ||
+      "smart";
+    if (String(env?.DISABLE_REAL_IP_PASS || "0") === "1") mode = "off";
+    if (mode === "smart") mode = "realip_only";
+    if (!ip || mode === "off") return mode;
+    h.set("X-Real-IP", ip);
+    if (mode === "dual") {
+      h.set("X-Forwarded-For", ip);
+      h.set("X-FORWARDED-FOR", ip); // 保留你原有兼容习惯
+    }
+    return mode;
   },
   isPanUrl(urlLike) {
     try {
@@ -1972,22 +3056,21 @@ const ProxyHandler = {
       };
     }
   },
-  shouldProxyDirectUrl(urlLike) {
-    const adapter = this.getDirectAdapter(urlLike);
-    if (adapter && typeof adapter.forceProxy === "boolean") {
-      return adapter.forceProxy;
-    }
-    return !!FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY;
-  },
   isNodeDirectExternal(node) {
-    return !!node?.directExternal;
+    return toBool(node?.directExternal);
+  },
+  isPanLikeUrl(urlLike) {
+    const s = String(urlLike || "").toLowerCase();
+    return (FIXED_PROXY_RULES.WANGPAN_KEYWORDS || []).some((k) =>
+      s.includes(String(k).toLowerCase()),
+    );
   },
   buildDirectOutboundHeaders(
     request,
     targetUrl,
     env,
     node = null,
-    mode = "normal"
+    mode = "normal",
   ) {
     const u = typeof targetUrl === "string" ? new URL(targetUrl) : targetUrl;
     const adapter = this.getDirectAdapter(u);
@@ -2014,6 +3097,7 @@ const ProxyHandler = {
       "origin",
       "referer",
     ].forEach((k) => h.delete(k));
+    this.applyClientIpHeaders(h, request, env, node);
     h.set("Host", u.host);
     const ua = request.headers.get("User-Agent") || "";
     if (ua) h.set("User-Agent", ua);
@@ -2040,7 +3124,7 @@ const ProxyHandler = {
     if (mode === "retry-browserish") {
       h.set(
         "User-Agent",
-        request.headers.get("User-Agent") || "emby-proxy/1.0"
+        request.headers.get("User-Agent") || "emby-proxy/1.0",
       );
       if (!h.get("Referer") && adapter.keepReferer && adapter.referer) {
         h.set("Referer", adapter.referer);
@@ -2076,10 +3160,11 @@ const ProxyHandler = {
         "sec-fetch-site",
         "sec-fetch-mode",
         "sec-fetch-dest",
-        "sec-fetch-user"
+        "sec-fetch-user",
       );
     }
     toDelete.forEach((k) => h.delete(k));
+    this.applyClientIpHeaders(h, request, env, node);
     h.set("Host", targetUrl.host);
     const ua = request.headers.get("User-Agent") || "";
     if (ua) h.set("User-Agent", ua);
@@ -2112,9 +3197,7 @@ const ProxyHandler = {
     if (!targets.length) {
       return new Response("Invalid node target", { status: 500 });
     }
-    const nodeKey = `${String(uid || "admin").toLowerCase()}:${String(
-      name || node?.name || ""
-    )}`;
+    const nodeKey = `${String(uid || "admin").toLowerCase()}:${String(name || node?.name || "")}`;
     const total = targets.length;
     let start = Number(GLOBALS.LineCursor.get(nodeKey) || 0);
     if (!Number.isFinite(start) || start < 0) start = 0;
@@ -2137,7 +3220,7 @@ const ProxyHandler = {
           key,
           env,
           uid,
-          ctx
+          ctx,
         );
         const status = Number(res?.status || 0);
         const shouldTryNext =
@@ -2170,7 +3253,7 @@ const ProxyHandler = {
             key,
             env,
             uid,
-            ctx
+            ctx,
           );
           const status = Number(res?.status || 0);
           const shouldTryNext =
@@ -2203,7 +3286,7 @@ const ProxyHandler = {
     key,
     env,
     uid = "admin",
-    ctx = null
+    ctx = null,
   ) {
     let base = new URL(node.target);
     const isEmos = this.isEmosNode(node, base, env);
@@ -2249,7 +3332,7 @@ const ProxyHandler = {
     finalUrl.search = reqUrl.search;
     const isStrm = /\.strm$/i.test(finalUrl.pathname);
     const isEmbyStreamStrm = /\/emby\/videos\/[^/]+\/stream\.strm$/i.test(
-      finalUrl.pathname
+      finalUrl.pathname,
     );
     if (isStrm && !isEmbyStreamStrm) {
       try {
@@ -2283,14 +3366,17 @@ const ProxyHandler = {
           reqNoQuery,
           targetUrl.toString(),
           env,
-          node
+          node,
         );
         const logTask = Database.logPlayback(
           env,
           node,
           request,
           resDirect,
-          true
+          true,
+          resDirect && resDirect.status >= 300 && resDirect.status < 400
+            ? "direct"
+            : "proxy",
         );
         if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
         else logTask.catch(() => {});
@@ -2309,6 +3395,7 @@ const ProxyHandler = {
         GLOBALS.Regex.EmbyImages.test(forwardPath)) &&
       request.method === "GET";
     const h = new Headers(request.headers);
+    this.stripClientIpHeaders(h);
     const p = finalUrl.pathname.toLowerCase();
     const isAuthApi = /\/users\/authenticate(byname)?/i.test(p);
     const isPlaybackApi =
@@ -2377,6 +3464,7 @@ const ProxyHandler = {
       "cf-visitor",
       "cf-worker",
     ].forEach((x) => h.delete(x));
+    this.applyClientIpHeaders(h, request, env, node);
     if (isPlaybackApi) {
       [
         "sec-fetch-site",
@@ -2403,18 +3491,31 @@ const ProxyHandler = {
       ck.searchParams.sort();
       cf = {
         cacheEverything: true,
-        cacheTtl: 86400 * 30,
+        cacheTtl: Number(Config.Defaults.StaticCacheTtl || 604800),
         cacheKey: ck.toString(),
-        cacheTtlByStatus: { "200-299": 86400 * 30, 404: 60, "500-599": 0 },
+        cacheTtlByStatus: {
+          "200-299": Number(Config.Defaults.StaticCacheTtl || 604800),
+          404: 60,
+          "500-599": 0,
+        },
       };
     }
     if (isEmos) {
       const pp = finalUrl.pathname.toLowerCase();
+      const d = Config.Defaults;
       if (/^\/emby\/items\/.+\/images\//i.test(pp)) {
-        cf = { ...(cf || {}), cacheEverything: true, cacheTtl: 600 };
+        cf = {
+          ...(cf || {}),
+          cacheEverything: true,
+          cacheTtl: Number(d.ImageCacheTtl || 86400),
+        };
       }
       if (pp === "/emby/system/ping") {
-        cf = { ...(cf || {}), cacheEverything: true, cacheTtl: 30 };
+        cf = {
+          ...(cf || {}),
+          cacheEverything: true,
+          cacheTtl: Number(d.PingCacheTtl || 60),
+        };
       }
       if (pp.startsWith("/emby/sessions/playing/progress")) {
         cf = { ...(cf || {}), cacheEverything: false, cacheTtl: 0 };
@@ -2427,7 +3528,7 @@ const ProxyHandler = {
             "unknown";
           const ip = String(rawIp).split(",")[0].trim() || "unknown";
           const deviceId = String(
-            request.headers.get("X-Emby-Device-Id") || ""
+            request.headers.get("X-Emby-Device-Id") || "",
           ).slice(0, 64);
           const sessionId =
             String(finalUrl.searchParams.get("SessionId") || "") ||
@@ -2439,7 +3540,11 @@ const ProxyHandler = {
               headers: { "Cache-Control": "no-store" },
             });
           }
-          GLOBALS.ProgressThrottle.set(tk, 1, 1000);
+          GLOBALS.ProgressThrottle.set(
+            tk,
+            1,
+            Number(d.ProgressThrottleMs || 1200),
+          );
         }
       }
     }
@@ -2449,32 +3554,129 @@ const ProxyHandler = {
         method === "GET" || method === "HEAD"
           ? null
           : await request.clone().arrayBuffer();
-      const isImageApi = /\/emby\/items\/.+\/images\//i.test(finalUrl.pathname);
-      const isAdditionalPartsApi = /\/emby\/videos\/.+\/additionalparts/i.test(
-        finalUrl.pathname
-      );
-      const nodeDirect = this.isNodeDirectExternal(node);
+      const isImageApi =
+        /\/emby\/items\/.+\/images\//i.test(finalUrl.pathname) ||
+        GLOBALS.Regex.EmbyImages.test(finalUrl.pathname);
       if (
-        nodeDirect &&
-        (isPlaybackApi || isImageApi || isAdditionalPartsApi) &&
+        isImageApi &&
         (request.method === "GET" || request.method === "HEAD")
       ) {
-        const fakeRes = new Response(null, { status: 200 });
-        const logTask = Database.logPlayback(env, node, request, fakeRes, true);
-        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
-        else logTask.catch(() => {});
-        return new Response(null, {
+        const ck = new URL(finalUrl.toString());
+        [
+          "X-Emby-Token",
+          "api_key",
+          "X-Emby-Authorization",
+          "_",
+          "t",
+          "stamp",
+          "random",
+        ].forEach((k) => ck.searchParams.delete(k));
+        ck.searchParams.sort();
+        cf = {
+          cacheEverything: true,
+          cacheTtl: Number(Config.Defaults.StaticCacheTtl || 604800),
+          cacheKey: ck.toString(),
+          cacheTtlByStatus: {
+            "200-299": Number(Config.Defaults.StaticCacheTtl || 604800),
+            404: 60,
+            "500-599": 0,
+          },
+        };
+      }
+      const isAdditionalPartsApi = /\/emby\/videos\/.+\/additionalparts/i.test(
+        finalUrl.pathname,
+      );
+      if (isAuthApi && request.method.toUpperCase() === "POST") {
+        const rawAuthUrl = new URL(finalUrl.toString());
+        const embyAuthUrl = new URL(finalUrl.toString());
+        if (!/^\/emby\//i.test(embyAuthUrl.pathname)) {
+          embyAuthUrl.pathname = "/emby" + embyAuthUrl.pathname;
+        }
+        const authUrls = [];
+        const pushUrl = (u) => {
+          const s = u.toString();
+          if (!authUrls.some((x) => x.toString() === s)) authUrls.push(u);
+        };
+        pushUrl(embyAuthUrl);
+        pushUrl(rawAuthUrl);
+        const makeHeaders = (mode) => {
+          const hh = new Headers(h);
+          hh.set("Accept", "application/json, text/plain, */*");
+          hh.set("Content-Type", "application/json;charset=utf-8");
+          hh.set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          );
+          if (mode === "with-origin") {
+            hh.set("Origin", reqUrl.origin);
+            hh.set("Referer", reqUrl.origin + "/");
+          } else {
+            hh.delete("Origin");
+            hh.delete("Referer");
+          }
+          return hh;
+        };
+        const isAuthApiSuccessLike = (resp) => {
+          if ([301, 302, 303, 307, 308].includes(resp.status)) return false;
+          const ct = String(
+            resp.headers.get("Content-Type") || "",
+          ).toLowerCase();
+          if (!ct.includes("application/json")) return false;
+          return resp.status === 200 || resp.status === 401;
+        };
+        let authResp = null;
+        for (const u of authUrls) {
+          for (const mode of ["with-origin", "no-origin"]) {
+            const resp = await this.fetchWithProtocolFallback(u, {
+              method: request.method,
+              headers: makeHeaders(mode),
+              body: replayBody ? replayBody.slice(0) : null,
+              redirect: "manual",
+              cf: { cacheEverything: false, cacheTtl: 0 },
+            });
+            if (isAuthApiSuccessLike(resp)) {
+              authResp = resp;
+              break;
+            }
+          }
+          if (authResp) break;
+        }
+        if (authResp) {
+          return new Response(authResp.body, {
+            status: authResp.status,
+            statusText: authResp.statusText,
+            headers: new Headers(authResp.headers),
+          });
+        }
+      }
+      const nodeDirect = this.isNodeDirectExternal(node);
+      const isGetLike = request.method === "GET" || request.method === "HEAD";
+      if (nodeDirect && isPlaybackApi && !isAdditionalPartsApi && isGetLike) {
+        const redirectRes = new Response(null, {
           status: 302,
           headers: {
             Location: finalUrl.toString(),
             "Cache-Control": "no-store",
+            "X-FD-Stage": "playback-direct-302",
           },
         });
+        const logTask = Database.logPlayback(
+          env,
+          node,
+          request,
+          redirectRes,
+          true,
+          "direct",
+        );
+        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
+        else logTask.catch(() => {});
+        return redirectRes;
       }
-      if (
-        !nodeDirect &&
-        (isPlaybackApi || isImageApi || isAdditionalPartsApi)
-      ) {
+      const shouldProxyMedia =
+        (!nodeDirect &&
+          (isPlaybackApi || isImageApi || isAdditionalPartsApi)) ||
+        (nodeDirect && (isAdditionalPartsApi || isImageApi)); // 直连时仅附加流/图片反代
+      if (shouldProxyMedia) {
         const isStreaming =
           isPlaybackApi || GLOBALS.Regex.Streaming.test(finalUrl.pathname);
         const hClean = this.buildCleanProxyHeaders(
@@ -2482,15 +3684,30 @@ const ProxyHandler = {
           finalUrl,
           node,
           env,
-          { isStreaming }
+          { isStreaming },
         );
+        for (const k of [
+          "X-Emby-Authorization",
+          "X-Emby-Token",
+          "X-MediaBrowser-Token",
+          "Authorization",
+          "Cookie",
+        ]) {
+          const v = request.headers.get(k);
+          if (v) hClean.set(k, v);
+        }
+        const reqU2 = new URL(request.url);
+        if (!finalUrl.searchParams.get("api_key")) {
+          const apiKey = reqU2.searchParams.get("api_key");
+          if (apiKey) finalUrl.searchParams.set("api_key", apiKey);
+        }
         const method = request.method.toUpperCase();
         const body =
           method === "GET" || method === "HEAD"
             ? null
             : replayBody
-            ? replayBody.slice(0)
-            : null;
+              ? replayBody.slice(0)
+              : null;
         let resClean = await this.fetchWithProtocolFallback(finalUrl, {
           method: request.method,
           headers: hClean,
@@ -2498,25 +3715,36 @@ const ProxyHandler = {
           redirect: "follow",
           cf,
         });
-        const reqRange = request.headers.get("Range");
-        if (isStreaming && reqRange) {
-          const m = /^\s*bytes\s*=\s*(\d+)-/i.exec(reqRange || "");
-          const start = m ? Number(m[1]) : NaN;
-          const cr = resClean.headers.get("Content-Range");
-          const is206 = resClean.status === 206;
-          const shouldFallbackNoRange =
-            Number.isFinite(start) &&
-            start === 0 &&
-            ((!is206 && !cr) || resClean.status === 416);
-          if (shouldFallbackNoRange) {
-            const hNoRange = new Headers(hClean);
-            hNoRange.delete("Range");
-            hNoRange.delete("If-Range");
+        if (isImageApi && resClean.status === 403) {
+          const hImg1 = new Headers(hClean);
+          this.stripClientIpHeaders(hImg1);
+          hImg1.delete("Origin");
+          hImg1.delete("Referer");
+          hImg1.delete("Range");
+          hImg1.delete("If-Range");
+          hImg1.set(
+            "User-Agent",
+            request.headers.get("User-Agent") ||
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          );
+          hImg1.set("Accept", "image/avif,image/webp,image/apng,image*;q=0.8");
+          hImg1.set("Accept-Encoding", "identity");
+          resClean = await this.fetchWithProtocolFallback(finalUrl, {
+            method: request.method,
+            headers: hImg1,
+            body: null,
+            redirect: "manual",
+            cf,
+          });
+          if (resClean.status === 403) {
+            const hImg2 = new Headers(hImg1);
+            hImg2.set("Referer", base.origin + "/");
+            hImg2.set("Origin", base.origin);
             resClean = await this.fetchWithProtocolFallback(finalUrl, {
               method: request.method,
-              headers: hNoRange,
-              body,
-              redirect: "follow",
+              headers: hImg2,
+              body: null,
+              redirect: "manual",
               cf,
             });
           }
@@ -2528,7 +3756,7 @@ const ProxyHandler = {
         if (aoClean !== "*") headersClean.set("Vary", "Origin");
         headersClean.set(
           "Access-Control-Expose-Headers",
-          "Accept-Ranges, Content-Range, Content-Length, Content-Type"
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
         );
         const arClean = resClean.headers.get("Accept-Ranges") || "";
         if (isStreaming) {
@@ -2540,16 +3768,22 @@ const ProxyHandler = {
         }
         if (isStreaming) {
           headersClean.set("Cache-Control", "no-store, no-transform");
+          if (/\.m3u8($|\?)/i.test(finalUrl.pathname)) {
+            headersClean.set("Content-Type", "application/vnd.apple.mpegurl");
+          }
         }
-        if (/\.m3u8($|\?)/i.test(finalUrl.pathname)) {
-          headersClean.set("Content-Type", "application/vnd.apple.mpegurl");
+        if (isImageApi) {
+          headersClean.delete("Set-Cookie");
+          headersClean.delete("Vary");
+          headersClean.set("Cache-Control", "public, max-age=60, s-maxage=60");
         }
         const logTask = Database.logPlayback(
           env,
           node,
           request,
           resClean,
-          isPlaybackApi || isStreaming
+          isPlaybackApi || isStreaming,
+          "proxy",
         );
         if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(logTask);
         else logTask.catch(() => {});
@@ -2583,10 +3817,11 @@ const ProxyHandler = {
       if (res.status === 403) {
         const h3 = new Headers(h);
         this.stripClientIpHeaders(h3);
+        this.applyClientIpHeaders(h3, request, env, node, "off");
         h3.set("Host", base.host);
         h3.set(
           "User-Agent",
-          request.headers.get("User-Agent") || "emby-proxy/1.0"
+          request.headers.get("User-Agent") || "emby-proxy/1.0",
         );
         const rg = request.headers.get("Range");
         if (rg) h3.set("Range", rg);
@@ -2609,10 +3844,11 @@ const ProxyHandler = {
         if (res.status === 403) {
           const h4 = new Headers(h3);
           this.stripClientIpHeaders(h4);
+          this.applyClientIpHeaders(h4, request, env, node, "dual");
           h4.set("Host", base.host);
           h4.set(
             "User-Agent",
-            request.headers.get("User-Agent") || "emby-proxy/1.0"
+            request.headers.get("User-Agent") || "emby-proxy/1.0",
           );
           h4.set("Referer", base.origin + "/");
           h4.set("Origin", base.origin);
@@ -2635,10 +3871,11 @@ const ProxyHandler = {
           if (res.status === 403) {
             const h5 = new Headers(h4);
             this.stripClientIpHeaders(h5);
+            this.applyClientIpHeaders(h5, request, env, node, "realip_only");
             h5.set("Host", base.host);
             h5.set(
               "User-Agent",
-              request.headers.get("User-Agent") || "emby-proxy/1.0"
+              request.headers.get("User-Agent") || "emby-proxy/1.0",
             );
             h5.set("Referer", base.origin + "/");
             h5.set("Origin", base.origin);
@@ -2673,7 +3910,14 @@ const ProxyHandler = {
         headers.delete("Set-Cookie");
         headers.set(
           "Cache-Control",
-          "public, max-age=31536000, s-maxage=86400"
+          "public, max-age=31536000, s-maxage=86400",
+        );
+      } else if (isImageApi) {
+        headers.delete("Set-Cookie");
+        headers.delete("Vary");
+        headers.set(
+          "Cache-Control",
+          "public, max-age=2592000, s-maxage=2592000, immutable",
         );
       } else if (isStreaming) {
         headers.set("Cache-Control", "no-store, no-transform");
@@ -2685,79 +3929,61 @@ const ProxyHandler = {
       } catch {
         hostMap = null;
       }
-      if (res.status >= 300 && res.status < 400) {
-        const location = headers.get("Location");
-        if (location) {
-          try {
-            const origin = new URL(request.url).origin;
-            const selfPrefix = this.routePrefix(name, key, uid);
-            const selfPrefixNoSlash = selfPrefix.endsWith("/")
-              ? selfPrefix.slice(0, -1)
-              : selfPrefix;
-            const splitMode = node?.mode === "split";
-            if (location.startsWith("/")) {
-              const alreadyPrefixed =
-                location === selfPrefixNoSlash ||
-                location.startsWith(selfPrefixNoSlash + "/");
-              if (!splitMode) {
-              } else if (!alreadyPrefixed) {
-                headers.set("Location", origin + selfPrefix + location);
-              }
-            } else {
-              const loc = new URL(location);
-              const locHost = loc.host.toLowerCase();
-              const baseHost = String(base.host || "").toLowerCase();
-              const alreadyPrefixed =
-                loc.pathname === selfPrefixNoSlash ||
-                loc.pathname.startsWith(selfPrefixNoSlash + "/");
-              if (!alreadyPrefixed) {
-                if (splitMode && !node?.streamTarget && locHost !== baseHost) {
-                  const shouldProxy = this.shouldProxyDirectUrl(loc);
-                  const nodeDirect = this.isNodeDirectExternal(node);
-                  if (nodeDirect || !shouldProxy) {
-                    headers.set("Location", loc.toString());
-                  } else {
-                    if (!FIXED_PROXY_RULES.PAN_302_DIRECT) {
-                      return await this.handleDirect(
-                        request,
-                        loc.toString(),
-                        env,
-                        node
-                      );
-                    } else {
-                      headers.set(
-                        "Location",
-                        origin +
-                          selfPrefix +
-                          "/__raw__/" +
-                          encodeURIComponent(loc.toString())
-                      );
-                      splitLocHit = true;
-                    }
-                  }
-                } else if (locHost !== baseHost) {
-                  const match = hostMap ? hostMap.get(locHost) || null : null;
-                  if (match) {
-                    const prefix = this.routePrefix(
-                      match.name,
-                      match.secret || "",
-                      uid
+      const location = headers.get("Location");
+      if (location) {
+        try {
+          const origin = new URL(request.url).origin;
+          const selfPrefix = this.routePrefix(name, key, uid);
+          const selfPrefixNoSlash = selfPrefix.endsWith("/")
+            ? selfPrefix.slice(0, -1)
+            : selfPrefix;
+          if (location.startsWith("/")) {
+            const alreadyPrefixed =
+              location === selfPrefixNoSlash ||
+              location.startsWith(selfPrefixNoSlash + "/");
+            if (!alreadyPrefixed) {
+              headers.set("Location", origin + selfPrefix + location);
+            }
+          } else {
+            const loc = new URL(location);
+            const locHost = loc.host.toLowerCase();
+            const baseHost = String(base.host || "").toLowerCase();
+            const nodeDirect = this.isNodeDirectExternal(node);
+            const alreadyPrefixed =
+              loc.pathname === selfPrefixNoSlash ||
+              loc.pathname.startsWith(selfPrefixNoSlash + "/");
+            if (!alreadyPrefixed) {
+              if (locHost === baseHost) {
+                headers.set(
+                  "Location",
+                  origin + selfPrefix + loc.pathname + loc.search + loc.hash,
+                );
+              } else {
+                if (!nodeDirect) {
+                  if (!FIXED_PROXY_RULES.PAN_302_DIRECT) {
+                    return await this.handleDirect(
+                      request,
+                      loc.toString(),
+                      env,
+                      node,
                     );
+                  } else {
                     headers.set(
                       "Location",
-                      origin + prefix + loc.pathname + loc.search + loc.hash
+                      origin +
+                        selfPrefix +
+                        "/__raw__/" +
+                        encodeURIComponent(loc.toString()),
                     );
+                    splitLocHit = true;
                   }
-                } else if (splitMode) {
-                  headers.set(
-                    "Location",
-                    origin + selfPrefix + loc.pathname + loc.search + loc.hash
-                  );
+                } else {
+                  headers.set("Location", loc.toString());
                 }
               }
             }
-          } catch {}
-        }
+          }
+        } catch {}
       }
       const ct = (headers.get("content-type") || "").toLowerCase();
       if (
@@ -2767,15 +3993,15 @@ const ProxyHandler = {
           ct.includes("application/x-mpegurl") ||
           ct.includes("application/dash+xml"))
       ) {
-        const raw = await res.text();
+        const rawBody = await res.text();
         const rewritten = await this.rewriteBodyLinks(
-          raw,
+          rawBody,
           request.url,
           env,
           uid,
           node,
           name,
-          key
+          key,
         );
         headers.delete("content-length");
         return new Response(rewritten, {
@@ -2783,6 +4009,32 @@ const ProxyHandler = {
           statusText: res.statusText,
           headers,
         });
+      }
+      if (
+        res.status >= 200 &&
+        res.status < 300 &&
+        ct.includes("application/json")
+      ) {
+        const reqPath = new URL(request.url).pathname.toLowerCase();
+        const isPlaybackInfo = reqPath.includes("/playbackinfo");
+        if (isPlaybackInfo) {
+          const rawBody = await res.text();
+          const rewritten = await this.rewriteBodyLinks(
+            rawBody,
+            request.url,
+            env,
+            uid,
+            node,
+            name,
+            key,
+          );
+          headers.delete("content-length");
+          return new Response(rewritten, {
+            status: res.status,
+            statusText: res.statusText,
+            headers,
+          });
+        }
       }
       return new Response(res.body, {
         status: res.status,
@@ -2802,13 +4054,13 @@ const ProxyHandler = {
     const method = String(init.method || "GET").toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD" && init.body != null;
     const maxBytes = Number(
-      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024
+      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
     );
     let allowFallback = true;
     let preparedBody = null;
     if (hasBody) {
       const cl = Number(
-        (init.headers && new Headers(init.headers).get("content-length")) || 0
+        (init.headers && new Headers(init.headers).get("content-length")) || 0,
       );
       if (cl > maxBytes) allowFallback = false;
       const b = init.body;
@@ -2881,11 +4133,11 @@ const ProxyHandler = {
     }
     const hasBody = method !== "GET" && method !== "HEAD";
     const maxBytes = Number(
-      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024
+      Config?.Defaults?.MaxRetryBodyBytes || 8 * 1024 * 1024,
     );
     let allowFallback = true;
     let bodyBuf = null;
-    let allowRetry = true;
+    let allowRetry = true; // ✅ 新增
     if (hasBody) {
       const cl = Number(request.headers.get("content-length") || 0);
       if (cl > maxBytes) allowFallback = false;
@@ -2893,10 +4145,10 @@ const ProxyHandler = {
         bodyBuf = await request.clone().arrayBuffer();
         if (bodyBuf.byteLength > maxBytes) allowFallback = false;
       } else {
-        allowRetry = false;
+        allowRetry = false; // ✅ body 不可复用时禁止重试
       }
     }
-    if (hasBody && !bodyBuf) allowRetry = false;
+    if (hasBody && !bodyBuf) allowRetry = false; // ✅ 保险
     let lastErr = null;
     let lastRes = null;
     const targets = allowFallback ? candidates : candidates.slice(0, 1);
@@ -2909,10 +4161,9 @@ const ProxyHandler = {
           u,
           env,
           node,
-          "normal"
+          "normal",
         );
         h.set("Accept-Encoding", "identity");
-        this.stripClientIpHeaders(h);
         let hActive = h;
         let res = await fetch(target, {
           method,
@@ -2953,11 +4204,10 @@ const ProxyHandler = {
             u,
             env,
             node,
-            "retry-no-origin"
+            "retry-no-origin",
           );
           h2.set("Accept-Encoding", "identity");
-          this.stripClientIpHeaders(h2);
-          hActive = h2;
+          hActive = h2; // 关键
           res = await fetch(target, {
             method,
             headers: hActive,
@@ -2971,11 +4221,10 @@ const ProxyHandler = {
             u,
             env,
             node,
-            "retry-browserish"
+            "retry-browserish",
           );
           h3.set("Accept-Encoding", "identity");
-          this.stripClientIpHeaders(h3);
-          hActive = h3;
+          hActive = h3; // 关键
           res = await fetch(target, {
             method,
             headers: hActive,
@@ -3022,7 +4271,7 @@ const ProxyHandler = {
         const cr2 = res.headers.get("Content-Range");
         rh.set(
           "Access-Control-Expose-Headers",
-          "Accept-Ranges, Content-Range, Content-Length, Content-Type"
+          "Accept-Ranges, Content-Range, Content-Length, Content-Type",
         );
         const ar = res.headers.get("Accept-Ranges") || "";
         if (res.status === 206 || cr2 || /bytes/i.test(ar)) {
@@ -3039,8 +4288,8 @@ const ProxyHandler = {
             if (loc && selfPrefix) {
               const abs = new URL(loc, target);
               if (/^https?:$/i.test(abs.protocol)) {
-                const shouldProxy = this.shouldProxyDirectUrl(abs);
-                if (!shouldProxy) {
+                const nodeDirect = this.isNodeDirectExternal(node);
+                if (nodeDirect) {
                   rh.set("Location", abs.toString());
                 } else {
                   if (!FIXED_PROXY_RULES.PAN_302_DIRECT) {
@@ -3048,7 +4297,7 @@ const ProxyHandler = {
                       request,
                       abs.toString(),
                       env,
-                      node
+                      node,
                     );
                   } else {
                     rh.set(
@@ -3056,7 +4305,7 @@ const ProxyHandler = {
                       reqU.origin +
                         selfPrefix +
                         "/__raw__/" +
-                        encodeURIComponent(abs.toString())
+                        encodeURIComponent(abs.toString()),
                     );
                   }
                 }
@@ -3110,32 +4359,29 @@ const ProxyHandler = {
     uid,
     currentNode,
     currentName,
-    currentKey
+    currentKey,
   ) {
     if (!text || typeof text !== "string") return text;
-    const origin = new URL(requestUrl).origin;
+    const reqU = new URL(requestUrl);
+    const origin = reqU.origin;
+    const selfPrefix = this.routePrefix(currentName, currentKey, uid);
+    const nodeDirect = this.isNodeDirectExternal(currentNode);
     const urlRe = /https?:\/\/[^\s"'<>\\]+/gi;
     const urls = [...new Set(text.match(urlRe) || [])];
     if (!urls.length) return text;
-    const map = new Map();
-    let hostMap = null;
-    try {
-      hostMap = await Database.getHostIndex(env, uid);
-    } catch {
-      hostMap = null;
-    }
     const curBaseHosts = new Set();
     for (const t of this.getNodeTargets(currentNode)) {
       try {
         curBaseHosts.add(new URL(t).host.toLowerCase());
       } catch {}
     }
-    const selfPrefix = this.routePrefix(currentName, currentKey, uid);
-    const nodeDirect = this.isNodeDirectExternal(currentNode);
-    const splitNoStream =
-      nodeDirect ||
-      FIXED_PROXY_RULES.FORCE_EXTERNAL_PROXY ||
-      (currentNode?.mode === "split" && !currentNode?.streamTarget);
+    let hostMap = null;
+    try {
+      hostMap = await Database.getHostIndex(env, uid);
+    } catch {
+      hostMap = null;
+    }
+    const map = new Map();
     for (const full of urls) {
       let u;
       try {
@@ -3144,23 +4390,21 @@ const ProxyHandler = {
         continue;
       }
       if (
-        splitNoStream &&
-        curBaseHosts.size &&
-        !curBaseHosts.has(u.host.toLowerCase())
+        u.origin === origin &&
+        (u.pathname === selfPrefix || u.pathname.startsWith(selfPrefix + "/"))
       ) {
-        const shouldProxy = this.shouldProxyDirectUrl(u);
-        const nodeDirect = this.isNodeDirectExternal(currentNode);
-        if (nodeDirect || !shouldProxy) {
-          map.set(full, full);
-        } else {
-          map.set(
-            full,
-            origin + selfPrefix + "/__raw__/" + encodeURIComponent(full)
-          );
-        }
         continue;
       }
-      const match = hostMap ? hostMap.get(u.host.toLowerCase()) || null : null;
+      if (nodeDirect) {
+        map.set(full, full);
+        continue;
+      }
+      const h = u.host.toLowerCase();
+      if (curBaseHosts.has(h)) {
+        map.set(full, origin + selfPrefix + u.pathname + u.search + u.hash);
+        continue;
+      }
+      const match = hostMap ? hostMap.get(h) || null : null;
       if (match) {
         const prefix = this.routePrefix(match.name, match.secret || "", uid);
         map.set(full, origin + prefix + u.pathname + u.search + u.hash);
@@ -3168,7 +4412,7 @@ const ProxyHandler = {
       }
       map.set(
         full,
-        `${origin}/${u.protocol}//${u.host}${u.pathname}${u.search}${u.hash}`
+        origin + selfPrefix + "/__raw__/" + encodeURIComponent(full),
       );
     }
     let out = text;
@@ -3185,7 +4429,7 @@ const ProxyHandler = {
       allow
         .split(",")
         .map((s) => s.trim())
-        .filter(Boolean)
+        .filter(Boolean),
     );
     return set.has(reqOrigin) ? reqOrigin : "null";
   },
@@ -3209,26 +4453,7 @@ const UI = {
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Emby反代管理系统</title>
 <style>
-input, select, textarea, button {
-  font: inherit;
-}
-input[type="time"] {
-  font-family: inherit !important;
-  font-size: 16px;
-  line-height: 1.25;
-  color: var(--text);
-  -webkit-appearance: none;
-  appearance: none;
-}
-input[type="time"]::-webkit-datetime-edit,
-input[type="time"]::-webkit-datetime-edit-hour-field,
-input[type="time"]::-webkit-datetime-edit-minute-field,
-input[type="time"]::-webkit-datetime-edit-ampm-field,
-input[type="time"]::-webkit-datetime-edit-text {
-  font-family: inherit;
-  font-size: 16px;
-}
-@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap");
 :root{
   --bg:#f3f6fb;
   --panel:#ffffff;
@@ -3248,116 +4473,382 @@ input[type="time"]::-webkit-datetime-edit-text {
   --card-text:#1e293b;
   --card-muted:#64748b;
   --card-line:#dbe4f2;
+  --density-name-size: clamp(24px, 2vw, 30px);
+  --density-label-size: clamp(13px, 1.1vw, 15px);
+  --density-mono-size: clamp(12px, 1vw, 13px);
 }
 *{box-sizing:border-box}
 html,body{
-  margin:0;
-  padding:0;
+  margin:0;padding:0;
   font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
-  background:var(--bg);
-  color:var(--text);
+  background:var(--bg);color:var(--text);
 }
-gLayer{position:fixed;inset:0;z-index:-3;background-size:cover;background-position:center;background-repeat:no-repeat;filter:brightness(var(--bg-brightness,100%)) blur(var(--bg-blur,0px));transform:scale(1.04);display:none}
-#bgOverlay{position:fixed;inset:0;z-index:-2;pointer-events:none;background:rgba(0,0,0,var(--bg-overlay,0.2));display:none}
-body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
-.glass{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);background:color-mix(in oklab, var(--panel) 80%, transparent)}
+.glass{
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+  background:color-mix(in oklab, var(--panel) 80%, transparent);
+}
 .wrap{max-width:min(96vw,1880px);margin:0 auto;padding:12px 8px 88px}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .title{font-size:40px;font-weight:800;display:flex;gap:8px;align-items:flex-end;color:var(--text2)}
-.title::after{content:"";display:inline-block;width:36px;height:4px;margin-left:8px;margin-bottom:8px;border-radius:999px;background:linear-gradient(90deg,var(--brand),#60a5fa)}
+.title::after{
+  content:"";display:inline-block;width:36px;height:4px;margin-left:8px;margin-bottom:8px;
+  border-radius:999px;background:linear-gradient(90deg,var(--brand),#60a5fa)
+}
 .title small{
-  font-size:15px;
-  font-weight:700;
-  color:#2563eb;
-  background:rgba(59,130,246,.14);
-  border:1px solid rgba(59,130,246,.32);
-  border-radius:999px;
-  padding:4px 12px;
-  line-height:1.35;
-  margin:0 0 4px 0;
-  letter-spacing:.2px;
+  font-size:15px;font-weight:700;color:#2563eb;background:rgba(59,130,246,.14);
+  border:1px solid rgba(59,130,246,.32);border-radius:999px;padding:4px 12px;line-height:1.35;
+  margin:0 0 4px 0;letter-spacing:.2px;
 }
 .right-actions{display:flex;gap:2px;align-items:center}
-.top-ver{
-  font-size:12px;
-  color:var(--muted);
-  font-weight:600;
-  margin-right:8px;
-  user-select:none;
+.top-ver{font-size:12px;color:var(--muted);font-weight:600;margin-right:8px;user-select:none}
+.icon-btn{
+  border:none;background:transparent;color:var(--icon);padding:8px;border-radius:10px;
+  cursor:pointer;line-height:0
 }
-.icon-btn{border:none;background:transparent;color:var(--icon);padding:8px;border-radius:10px;cursor:pointer;line-height:0}
-.icon-btn.is-fav{ color:#f59e0b; }
 .icon-btn:hover{background:rgba(148,163,184,.16)}
-.icon-btn.eye-toggle{transition:.15s ease}
-.icon-btn.eye-toggle.on,
-.icon-btn.eye-toggle.off{
-  color:var(--icon);
-  background:transparent;
-  opacity:.9;
+.controls{
+  display:grid;
+  grid-template-columns:120px minmax(0,1fr) 140px 94px 94px 40px;
+  gap:10px;margin-bottom:12px;width:100%;
 }
-.controls{display:grid;grid-template-columns:120px minmax(0,1fr) 140px 94px 94px 40px;gap:10px;margin-bottom:12px;width:100%}
 .controls select,.controls input,.controls button{
-  height:40px;
-  border:1px solid var(--inborder);
-  background:var(--inbg);
-  color:var(--intext);
-  border-radius:10px;
-  padding:0 12px;
-  font-size:13px;
-  outline:none;
-  min-width:0;
-  font-weight:600;
+  height:40px;border:1px solid var(--inborder);background:var(--inbg);color:var(--intext);
+  border-radius:10px;padding:0 12px;font-size:13px;outline:none;min-width:0;font-weight:600;
 }
 .controls button{cursor:pointer}
 .controls button:hover{border-color:#bcd0ee;background:#f7fbff}
-.controls .fab{
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  padding:0;
-  background:var(--brand) !important;
-  color:#fff !important;
-  border:none !important;
+input,select,textarea,button{font:inherit}
+input[type="time"]{
+  font-family:inherit!important;font-size:16px;line-height:1.25;color:var(--text);
+  -webkit-appearance:none;appearance:none;
 }
+input[type="time"]::-webkit-datetime-edit,
+input[type="time"]::-webkit-datetime-edit-hour-field,
+input[type="time"]::-webkit-datetime-edit-minute-field,
+input[type="time"]::-webkit-datetime-edit-ampm-field,
+input[type="time"]::-webkit-datetime-edit-text{font-family:inherit;font-size:16px}
+  position:fixed;inset:0;z-index:-3;
+  background-size:cover;background-position:center;background-repeat:no-repeat;
+}
+  filter:brightness(var(--bg-brightness,100%)) blur(var(--bg-blur,0px));
+  transform:scale(1.04);display:none;
+}
+  z-index:-2;
+  background:rgba(0,0,0,var(--bg-overlay,0.2));
+  display:none;
+}
+body.has-bg #bgLayer,body.has-bg #bgOverlay{display:block}
+.controls .fab{
+  display:flex;align-items:center;justify-content:center;padding:0;
+  background:var(--brand)!important;color:#fff!important;border:none!important;
+}
+.controls .fab:hover{
+  display:flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;
+  background:var(--brand-soft);border-color:#cfe0ff;color:#1e40af;
+}
+.controls #btnCheckSel,.controls #btnCheckAll{
+  display:flex;align-items:center;justify-content:center;white-space:nowrap;
+}
+.state-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 8px}
+.state-dot.off{background:#9ca3af}.state-dot.on{background:#3b82f6}
+.batchbar{
+  display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;padding:10px;
+  border:1px dashed var(--line);border-radius:12px
+}
+.batchbar input,.batchbar button{
+  height:36px;border:1px solid var(--inborder);background:var(--inbg);color:var(--intext);
+  border-radius:10px;padding:0 10px;font-size:13px
+}
+.batchbar button{cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media(max-width:1500px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:960px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.grid{grid-template-columns:1fr}}
+.card[draggable="true"]{cursor:grab}
+.card.dragging{opacity:.55}
+.card.drag-over{outline:2px dashed #60a5fa;outline-offset:-2px}
+.card{
+  border:1px solid var(--card-line);border-radius:10px;padding:10px 10px 8px;min-height:120px;
+  box-shadow:0 1px 2px rgba(0,0,0,.04);
+  background:linear-gradient(180deg,var(--card-bg) 0%,var(--card-bg2) 100%);
+  transition:all .18s ease;
+  --head-indent:30px;
+}
+.card:hover{
+  border-color:color-mix(in oklab, var(--card-line) 70%, #93c5fd 30%);
+  box-shadow:0 10px 22px rgba(15,23,42,.08);transform:translateY(-1px)
+}
+.row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;min-width:0}
+.left-wrap,.info{min-width:0;flex:1 1 auto;overflow:hidden}
+.left-head{display:flex;align-items:flex-start;gap:8px;min-width:0;flex:1 1 auto}
+.selbox{margin-top:6px;flex:0 0 auto}
+.selbox input{width:16px;height:16px;cursor:pointer}
+.name{
+  margin:0;font-size:var(--density-name-size);line-height:1.15;font-weight:800;color:var(--card-text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
+}
+.subline{display:flex;gap:6px;color:var(--card-muted);margin-top:4px}
+.subline .v{color:var(--card-text)}
+.path-tip{margin-top:2px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.status{margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--card-muted);position:relative}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:0 0 7px}
+.dot.online{background:#16a34a}.dot.offline{background:#ef4444}.dot.unknown{background:#94a3b8}
+.actions{display:flex;gap:4px;flex:0 0 auto;margin-left:8px}
+.actions .icon-btn{padding:6px}
+.actions .icon-btn.is-fav{
+  color:#f59e0b;
+  background:rgba(245,158,11,.10);
+  border-radius:8px;
+}
+.actions .icon-btn.is-fav:hover{
+  color:#d97706;
+  background:rgba(245,158,11,.18);
+}
+.badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.badge{
+  display:inline-flex;align-items:center;height:20px;padding:0 9px;border-radius:999px;
+  font-size:12px;line-height:20px;font-weight:700;white-space:nowrap;
+}
+.b-mode-normal{background:#dbeafe;color:#1d4ed8}
+.b-mode-direct{background:#fff3e0;color:#c2410c;border:1px solid #fed7aa}
+.b-green{background:#dcfce7;color:#166534}
+.b-blue{background:#e0f2fe;color:#075985}
+.b-orange{background:#ffedd5;color:#9a3412}
+.b-gray{background:#e5e7eb;color:#374151}
+.b-note{background:#ede9fe;color:#5b21b6}
+.line,.app-row{padding-left:var(--head-indent)}
+.line{
+  margin-top:6px;display:grid;grid-template-columns:56px minmax(0,1fr) auto;gap:6px 8px;align-items:flex-start;
+}
+.label{text-align:left;font-size:var(--density-mono-size);line-height:1.2;color:var(--card-muted);padding-top:2px}
+.line-actions{display:flex;gap:8px;align-items:center;padding-top:2px}
+.line-actions .icon-btn{
+  width:22px;height:22px;padding:0;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;
+  color:var(--icon);background:transparent;opacity:.9;
+}
+.line-actions .icon-btn svg{width:20px;height:20px;display:block}
+.line .copy-ghost{opacity:1;transform:none;transition:none;pointer-events:auto}
+.app-row{margin-top:6px;display:flex;gap:6px;justify-content:flex-start;flex-wrap:wrap}
+.app-btn{
+  border:1px solid var(--inborder);background:var(--inbg);color:var(--intext);border-radius:8px;
+  padding:0 9px;height:26px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;
+}
+.app-btn:hover{border-color:#93c5fd;background:#eef4ff}
+.app-btn.capy{opacity:.9}
+.menu{position:relative;z-index:90}
+.menu-panel{
+  position:absolute;right:0;left:auto;top:calc(100% + 8px);
+  min-width:190px;max-width:min(92vw,280px);max-height:min(72vh,520px);overflow:auto;
+  padding:6px;border:1px solid var(--line);border-radius:10px;display:none;z-index:120;
+  box-shadow:0 8px 20px rgba(0,0,0,.08);
+}
+.menu-panel button{
+  width:100%;border:none;background:transparent;color:var(--text);text-align:left;
+  padding:8px 10px;border-radius:8px;cursor:pointer
+}
+.menu-panel button:hover{background:rgba(148,163,184,.14)}
+.fab{
+  position:fixed;right:20px;bottom:24px;top:auto;width:52px;height:52px;border:none;border-radius:999px;
+  font-size:28px;background:var(--brand);color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(59,130,246,.35);z-index:80;
+}
+body.modal-open .fab{display:none}
 @media (min-width:981px){
-  .controls .fab{
-    width:36px;
-    height:36px;
-    font-size:22px;
-    line-height:36px;
+  .controls .fab{width:36px;height:36px;font-size:22px;line-height:36px}
+  .fab{
+    position:static;right:auto;bottom:auto;top:auto;width:34px;height:34px;font-size:20px;line-height:34px;
+    box-shadow:none;margin-left:6px;flex:0 0 auto;
   }
 }
-#tagFilterBtn,#btnCheckSel,#btnCheckAll{color:var(--intext);border-color:var(--inborder)}
-#tagFilterBtn:hover,#btnCheckSel:hover,#btnCheckAll:hover{
-  border-color:color-mix(in oklab, var(--inborder) 60%, #93c5fd 40%);
-  background:color-mix(in oklab, var(--inbg) 85%, #1d4ed8 15%);
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:1000}
+.modal{
+  display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:min(94vw,560px);max-height:92vh;overflow-y:auto;
+  border:1px solid var(--line);border-radius:14px;padding:14px;z-index:1001;
+  -webkit-overflow-scrolling:touch;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.45;
 }
-#searchInput{width:100%;min-width:0;max-width:none}
-@media(max-width:900px){
-  .controls{grid-template-columns:120px 1fr 140px}
+body.modal-open #menuPanel{display:none!important}
+.modal h3{margin:0 0 10px;color:var(--text2);font-size:24px;font-weight:800;line-height:1.2}
+.modal .field-title{font-size:18px;font-weight:700;color:var(--text2);line-height:1.3;margin:10px 0 8px}
+.req{color:#ef4444;font-weight:800;margin-right:4px;font-size:16px}
+.modal label,.modal .small,.modal .hint,.modal .tips,.modal .muted{
+  font-size:12.5px;font-weight:400;color:#64748b;letter-spacing:.1px;line-height:1.45;
 }
+.modal input:not([type="checkbox"]),.modal select,.modal textarea{
+  width:100%;border:1px solid var(--inborder);background:#fff;color:var(--intext);
+  border-radius:10px;outline:none;font-size:14px;font-weight:500;letter-spacing:.1px;
+}
+.modal input:not([type="checkbox"]),.modal select{height:40px;padding:0 10px;margin-bottom:8px}
+.modal textarea{min-height:110px;padding:10px;margin-bottom:8px;resize:vertical}
+.pass-wrap{position:relative;margin-bottom:8px}
+.pass-wrap #inPass{margin-bottom:0;padding-right:64px;width:100%;display:block}
+.pass-eye{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  border:1px solid var(--inborder);background:#fff;color:var(--muted);
+  border-radius:8px;height:28px;min-width:48px;padding:0 8px;cursor:pointer;
+}
+.tagbar{position:relative;margin-bottom:8px}
+.tagbar input{margin:0;padding-right:12px}
+.tagbar datalist{opacity:0;display:none}
+input[type="number"]{appearance:textfield;-moz-appearance:textfield}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.modal .btns{
+  display:flex;justify-content:flex-end;gap:8px;margin-top:12px;position:sticky;
+  bottom:-14px;background:var(--panel);padding:10px 0 2px;border-top:1px solid var(--line);
+}
+.btn{border:none;border-radius:10px;padding:9px 14px;cursor:pointer}
+.btn-p{background:var(--blue);color:#fff}
+.btn-g{background:rgba(148,163,184,.2);color:var(--text)}
+.range{display:grid;grid-template-columns:90px 1fr 46px;gap:8px;align-items:center;margin:6px 0}
+.small{font-size:12px;color:var(--muted)}
+.tag-list{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}
+.tag-item{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:8px}
+.tag-item:hover{background:#f8fafc}
+.tag-item input[type="checkbox"]{width:16px;height:16px;margin:0;flex:0 0 auto}
+.tag-empty{font-size:13px;color:var(--muted);padding:8px}
+.gate{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:70}
+.gate-box{width:min(92vw,360px);background:#fff;border:1px solid #d7dce4;border-radius:14px;padding:16px}
+.gate-box h3{margin:0 0 10px}
+.gate-pass{position:relative}
+.gate-pass #gatePwd{padding-right:34px}
+.gate-box input{width:100%;height:42px;border:1px solid #d7dce4;border-radius:10px;padding:0 10px;outline:none}
+.gate-box #gateBtn{
+  width:100%;height:42px;margin-top:10px;font-size:14px;font-weight:700;cursor:pointer;
+  background:var(--brand)!important;color:#fff!important;border:none!important;border-radius:10px!important;
+}
+.gate-pass .pass-eye{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  width:20px;height:20px;border:none;background:transparent;padding:0;border-radius:0;
+  color:#94a3b8;display:flex;align-items:center;justify-content:center;cursor:pointer;
+}
+.gate-pass .pass-eye:hover{color:#64748b}
+.gate-pass .pass-eye svg{width:20px;height:20px;display:block}
+.gate-pass .pass-eye span{display:flex}
+.tip{min-height:16px;margin-top:7px;font-size:12px;color:#ef4444;display:none}
+.tip.ok{color:#16a34a}
+.tip.show{display:block}
+.toast-wrap{
+  position:fixed;
+  left:50%;
+  top:var(--toast-top, 18px);
+  transform:translateX(-50%);
+  z-index:9999;
+  width:min(92vw,560px);
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  pointer-events:none;
+}
+.toast{
+  width:100%;
+  box-sizing:border-box;
+  border-radius:10px;
+  padding:11px 14px;
+  font-size:14px;
+  line-height:1.45;
+  border:1px solid transparent;
+  box-shadow:0 6px 14px rgba(15,23,42,.12);
+  pointer-events:auto;
+  opacity:.98;
+}
+.toast.success{
+  background:#ecfdf3;
+  border-color:#bbf7d0;
+  color:#14532d;
+}
+.toast.warn{
+  background:#fff7ed;
+  border-color:#fed7aa;
+  color:#9a3412;
+}
+.toast.error{
+  background:#fef2f2;
+  border-color:#fecaca;
+  color:#991b1b;
+}
+@media (max-width:768px){
+  .toast-wrap{ width:calc(100vw - 16px); }
+  .toast{ font-size:15px; padding:12px 14px; }
+}
+.gate-box,.modal,.menu-panel{
+  background:var(--panel)!important;color:var(--text)!important;border:1px solid var(--line)!important;
+  border-radius:12px!important;box-shadow:0 8px 24px rgba(15,23,42,.08)!important;
+}
+.gate-box input,
+.modal input:not([type="checkbox"]),
+.modal select,
+.modal textarea,
+.menu-panel input,
+.menu-panel select{
+  width:100%;box-sizing:border-box;
+}
+.gate-box input,
+.modal input:not([type="checkbox"]),
+.modal select,
+.modal textarea{
+  font:inherit;font-size:14px;color:var(--text);font-family:inherit;
+}
+.menu-panel input,.menu-panel select{
+  background:var(--inbg)!important;color:var(--intext)!important;
+  border:1px solid var(--inborder)!important;border-radius:10px!important;
+}
+button:focus-visible,.btn:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[role="button"]:focus-visible{
+  outline:2px solid color-mix(in oklab, var(--brand) 72%, white 28%);
+  outline-offset:1px;
+  box-shadow:0 0 0 3px color-mix(in oklab, var(--brand) 18%, transparent 82%);
+}
+.card,.menu-panel,.modal,button,.btn{
+  transition:background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease;
+}
+button:hover,.btn:hover{transform:translateY(-1px)}
+.project-links{
+  width:min(1100px,calc(100% - 24px));margin:10px auto 8px;padding:0;border:none;background:transparent;box-shadow:none;
+  display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:10px;font:inherit;font-size:14px;color:var(--muted);
+}
+.project-links .label{color:var(--muted);margin-right:2px;font:inherit}
+.project-links a{
+  text-decoration:none;font:inherit;font-size:14px;color:var(--text2);border:1px solid var(--line);
+  background:#fff;border-radius:999px;padding:6px 10px;line-height:1;transition:.15s ease;
+}
+.project-links a:hover{border-color:var(--blue);color:var(--blue);transform:translateY(-1px)}
+.disclaimer{
+  width:min(1100px,calc(100% - 24px));margin:16px auto 12px;padding:10px 12px;border:1px dashed #cbd5e1;
+  border-radius:10px;font-size:12px;line-height:1.6;color:#64748b;background:rgba(255,255,255,.55);text-align:center;
+}
+.page-hint{
+  margin-top:18px;text-align:center;color:var(--muted);font-size:13px;opacity:.75;user-select:none;
+}
+@media(max-width:900px){.controls{grid-template-columns:120px 1fr 140px}}
 @media(max-width:760px){
   .title{font-size:32px}
   .controls{grid-template-columns:1fr 1fr}
-  #searchInput{grid-column:1/-1}
 }
-@media (max-width: 640px){
-  .top{
-    align-items:flex-start;
-    gap:8px;
-  }
+@media (max-width:640px){
+  .top{align-items:flex-start;gap:8px}
   .title{
-    display:flex;
-    flex-wrap:wrap;
-    align-items:flex-end;
-    gap:6px;
-    line-height:1.08;
-    min-width:0;
-    max-width:calc(100vw - 120px);
+    display:flex;flex-wrap:wrap;align-items:flex-end;gap:6px;line-height:1.08;
+    min-width:0;max-width:calc(100vw - 120px);
   }
-  #nodeCount,.right-actions{
-    flex:0 0 auto;
+  .right-actions{flex:0 0 auto}
+  .menu-panel{right:-4px;top:calc(100% + 6px);max-width:calc(100vw - 12px);max-height:70vh}
+  .modal{
+    width:94vw;
+    max-height:84dvh;
+    padding:10px;
+    border-radius:12px;
+    overflow:auto;
+    -webkit-overflow-scrolling:touch;
   }
+  .modal label,.modal .small,.modal .hint,.modal .tips,.modal .muted{font-size:13px}
+  .modal h3{font-size:20px;margin:0 0 10px}
+  .modal .field-title{font-size:16px;margin:8px 0 6px}
+  .modal input:not([type="checkbox"]),.modal select{height:38px;font-size:14px;padding:0 10px}
+  .row2{display:flex;gap:8px;flex-wrap:wrap}
+  .row2 > *{flex:1 1 calc(50% - 6px)}
+  .modal .btns{position:sticky;bottom:-1px;background:var(--panel);padding-top:6px}
 }
 @media (max-width:480px){
   .card{padding:8px}
@@ -3366,761 +4857,10 @@ body.has-bg #bgLayer, body.has-bg #bgOverlay{display:block}
   .badge{height:22px;font-size:12px;padding:0 10px}
   .actions .icon-btn{padding:8px}
 }
-#toggleAllVisBtn{
-  display:flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;
-  background:var(--brand-soft);border-color:#cfe0ff;color:#1e40af;
-}
-#tagFilterBtn{
-  display:flex;align-items:center;justify-content:center;white-space:nowrap;
-}
-.state-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 8px}
-.state-dot.off{background:#9ca3af}
-.state-dot.on{background:#3b82f6}
-.batchbar{display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;padding:10px;border:1px dashed var(--line);border-radius:12px}
-.batchbar input,.batchbar button{height:36px;border:1px solid var(--inborder);background:var(--inbg);color:var(--intext);border-radius:10px;padding:0 10px;font-size:13px}
-.batchbar button{cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
-@media(max-width:1500px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:960px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:720px){.grid{grid-template-columns:1fr}}
-.page-hint{
-  margin-top:18px;
-  text-align:center;
-  color:var(--muted);
-  font-size:13px;
-  opacity:.75;
-  user-select:none;
-}
-.card[draggable="true"]{ cursor:grab; }
-.card.dragging{ opacity:.55; }
-.card.drag-over{ outline:2px dashed #60a5fa; outline-offset:-2px; }
-.card{
-  border:1px solid var(--card-line);
-  border-radius:10px;
-  padding:10px 10px 8px;
-  box-shadow:0 1px 2px rgba(0,0,0,.04);
-  min-height:120px;
-  background:linear-gradient(180deg,var(--card-bg) 0%,var(--card-bg2) 100%);
-  transition:all .18s ease;
-}
-.card:hover{
-  border-color:color-mix(in oklab, var(--card-line) 70%, #93c5fd 30%);
-  box-shadow:0 10px 22px rgba(15,23,42,.08);
-  transform:translateY(-1px);
-}
-.row{
-  display:flex;
-  justify-content:space-between;
-  align-items:flex-start;
-  gap:8px;
-  min-width:0;
-}
-.left-wrap{
-  min-width:0;
-  flex:1 1 auto;
-  overflow:hidden;
-}
-.left-head{
-  display:flex;
-  align-items:flex-start;
-  gap:8px;
-  min-width:0;
-  flex:1 1 auto;
-}
-.selbox{ margin-top:6px; flex:0 0 auto; }
-.selbox input{ width:16px; height:16px; cursor:pointer; }
-.info{
-  min-width:0;
-  flex:1 1 auto;
-}
-.name{
-  margin:0;
-  font-size:var(--density-name-size);
-  line-height:1.15;
-  font-weight:800;
-  color:var(--card-text);
-  white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
-  max-width:100%;
-}
-.subline .v{color:var(--card-text)}
-.subline{display:flex;gap:6px;color:var(--card-muted);margin-top:4px}
-.path-tip{margin-top:2px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
-.status{margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--card-muted)}
-.actions{
-  display:flex;
-  gap:4px;
-  flex:0 0 auto;
-  margin-left:8px;
-}
-.actions .icon-btn{ padding:6px; }
-.badges{
-  display:flex;
-  flex-wrap:wrap;
-  gap:6px;
-  margin-top:6px;
-}
-.badge{
-  display:inline-flex;
-  align-items:center;
-  height:20px;
-  padding:0 9px;
-  border-radius:999px;
-  font-size:12px;
-  line-height:20px;
-  font-weight:700;
-  white-space:nowrap;
-}
-.b-mode-normal{ background:#dbeafe; color:#1d4ed8; }
-.b-mode-direct{ background:#fff3e0; color:#c2410c; border:1px solid #fed7aa; }
-.b-green{  background:#dcfce7; color:#166534; }
-.b-blue{   background:#e0f2fe; color:#075985; }
-.b-orange{ background:#ffedd5; color:#9a3412; }
-.b-gray{   background:#e5e7eb; color:#374151; }
-.b-note{   background:#ede9fe; color:#5b21b6; }
-.dot{
-  width:7px;
-  height:7px;
-  border-radius:50%;
-  display:inline-block;
-  flex:0 0 7px;
-}
-.dot.online{  background:#16a34a; }
-.dot.offline{ background:#ef4444; }
-.dot.unknown{ background:#94a3b8; }
-.card{ --head-indent: 30px; }
-.line,
-.app-row{
-  padding-left: var(--head-indent);
-}
-.line .copy-ghost{
-  opacity:1;
-  transform:none;
-  transition:none;
-  pointer-events:auto;
-}
-.app-row{margin-top:6px;display:flex;gap:6px;justify-content:flex-start;flex-wrap:wrap}
-.app-btn{
-  border:1px solid var(--inborder);
-  background:var(--inbg);
-  color:var(--intext);
-  border-radius:8px;
-  padding:0 9px;
-  height:26px;
-  font-size:12px;
-  font-weight:700;
-  cursor:pointer;
-  white-space:nowrap;
-}
-.app-btn:hover{
-  border-color:#93c5fd;
-  background:#eef4ff;
-}
-.app-btn.capy{opacity:.9}
-.menu{position:relative;z-index:90}
-.right-actions{position:relative;overflow:visible}
-.menu-panel{
-  position:absolute;
-  right:0;
-  left:auto;
-  top:calc(100% + 8px);
-  min-width:190px;
-  max-width:min(92vw,280px);
-  max-height:min(72vh,520px);
-  overflow:auto;
-  padding:6px;
-  border:1px solid var(--line);
-  border-radius:10px;
-  display:none;
-  z-index:120;
-  box-shadow:0 8px 20px rgba(0,0,0,.08);
-}
-@media (max-width:640px){
-  .menu-panel{
-    right:-4px;
-    top:calc(100% + 6px);
-    max-width:calc(100vw - 12px);
-    max-height:70vh;
-  }
-}
-.menu-panel button{width:100%;border:none;background:transparent;color:var(--text);text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer}
-.menu-panel button:hover{background:rgba(148,163,184,.14)}
-.fab{
-  position:fixed;
-  right:20px;
-  bottom:24px;
-  top:auto;
-  width:52px;
-  height:52px;
-  border:none;
-  border-radius:999px;
-  font-size:28px;
-  background:var(--brand);
-  color:#fff;
-  cursor:pointer;
-  box-shadow:0 10px 22px rgba(59,130,246,.35);
-  z-index:80;
-}
-body.modal-open .fab{display:none;}
-@media (min-width:981px){
-  .fab{
-    position:static;
-    right:auto;
-    bottom:auto;
-    top:auto;
-    width:34px;
-    height:34px;
-    font-size:20px;
-    line-height:34px;
-    box-shadow:none;
-    margin-left:6px;
-    flex:0 0 auto;
-  }
-}
-.modal-mask{display:none;position:fixed;inset:0;background:rgba(15,23,42,.38);z-index:1000}
-.modal{
-  display:none;
-  position:fixed;
-  left:50%;
-  top:50%;
-  transform:translate(-50%,-50%);
-  width:min(94vw,560px);
-  max-height: 92vh;
-  overflow-y: auto;
-  border:1px solid var(--line);
-  border-radius:14px;
-  padding:14px;
-  z-index:1001;
-  -webkit-overflow-scrolling: touch;
-}
-body.modal-open #menuPanel{display:none !important;}
-.modal h3{margin:0 0 10px;color:var(--text)}
-.modal{
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-}
-.modal .field-title{
-  font-size:15px;
-  font-weight:600;
-  color:#0f172a;
-  letter-spacing:.1px;
-}
-.modal label,
-.modal .small,
-.modal .hint,
-.modal .tips,
-.modal .muted{
-  font-size:12.5px;
-  font-weight:400;
-  color:#64748b;
-  letter-spacing:.1px;
-  line-height:1.45;
-}
-.modal input:not([type="checkbox"]),
-.modal select,
-.modal textarea{
-  font-size:14px;
-  font-weight:500;
-  color:#111827;
-  letter-spacing:.1px;
-}
-.modal input:not([type="checkbox"]),.modal select{
-  width:100%;height:40px;border:1px solid var(--inborder);background:#fff;color:var(--intext);
-  border-radius:10px;padding:0 10px;margin-bottom:8px;outline:none
-}
- .pass-wrap{
-  position:relative;
-  margin-bottom:8px;
-}
-.pass-wrap #inPass{
-  margin-bottom:0;
-  padding-right:64px;
-}
-.pass-eye{
-  position:absolute;
-  right:8px;
-  top:50%;
-  transform:translateY(-50%);
-  border:1px solid var(--inborder);
-  background:#fff;
-  color:var(--muted);
-  border-radius:8px;
-  height:28px;
-  min-width:48px;
-  padding:0 8px;
-  cursor:pointer;
-} 
- #editor #targetList .target-item{
-  width:100%;
-  display:block;
-} 
-.field-title{
-  font-size:15px;
-  font-weight:700;
-  color:#334155;
-  margin:4px 0 8px;
-  letter-spacing:.2px;
-}
-.req{
-  color:#ef4444;
-  font-weight:800;
-  margin-right:4px;
-}
-.tagbar{position:relative;margin-bottom:8px}
-.tagbar input{margin:0;padding-right:12px}
-#inTag::-webkit-calendar-picker-indicator{
-  opacity:0;
-  display:none;
-}
-#inTag{
-  appearance:textfield;
-  -moz-appearance:textfield;
-}
-.project-links{
-  width: min(1100px, calc(100% - 24px));
-  margin: 10px auto 8px;
-  padding: 0;                 
-  border: none;               
-  background: transparent;    
-  box-shadow: none;           
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  font: inherit;
-  font-size: 14px;
-  color: var(--muted);
-}
-.project-links .label{
-  color: var(--muted);
-  margin-right: 2px;
-  font: inherit;              
-}
-.project-links a{
-  text-decoration: none;
-  font: inherit;              
-  font-size: 14px;
-  color: var(--text2);
-  border: 1px solid var(--line);
-  background: #fff;
-  border-radius: 999px;
-  padding: 6px 10px;
-  line-height: 1;
-  transition: .15s ease;
-}
-.project-links a:hover{
-  border-color: var(--blue);
-  color: var(--blue);
-  transform: translateY(-1px);
-}
 @media (max-width:768px){
-  .project-links{
-    margin: 8px 12px 6px;
-    font-size: 13px;
-  }
-  .project-links a{
-    font-size: 13px;
-  }
-}
-.disclaimer{
-  width: min(1100px, calc(100% - 24px));
-  margin: 16px auto 12px;   
-  padding: 10px 12px;
-  border: 1px dashed #cbd5e1;
-  border-radius: 10px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #64748b;
-  background: rgba(255,255,255,.55);
-  text-align: center;       
-}
-@media (max-width:768px){
-  .disclaimer{ margin: 12px; font-size: 11.5px; }
-}
-.modal .btns{
-  display:flex;
-  justify-content:flex-end;
-  gap:8px;
-  margin-top:12px;
-  position: sticky;
-  bottom: -14px; 
-  background: var(--panel);
-  padding: 10px 0 2px;
-  border-top: 1px solid var(--line);
-}
-.btn{border:none;border-radius:10px;padding:9px 14px;cursor:pointer}
-@media (max-width: 640px){
-  .modal{
-    width: calc(100vw - 16px);
-    max-height: calc(100dvh - 16px);
-    padding: 12px;
-    border-radius: 12px;
-    overflow: auto;
-    -webkit-overflow-scrolling: touch;
-  }
-  #editor{
-    font-size: 13px;
-  }
-  #editor h3{
-    font-size: 20px;
-    margin: 0 0 10px;
-  }
-  #editor .field-title{
-    font-size: 16px;
-    margin: 8px 0 6px;
-  }
-  #editor input:not([type="checkbox"]),
-  #editor textarea,
-  #editor select{
-    height: 38px;
-    font-size: 14px;
-    padding: 0 10px;
-  }
-  #editor .btn-row{
-    flex-wrap: wrap;
-  }
-  #editor .btn-row .btn{
-    flex: 1 1 calc(50% - 6px);
-  }
-  #editor .btns{
-    position: sticky;
-    bottom: -1px;
-    background: var(--panel);
-    padding-top: 6px;
-  }
-}
-.btn-p{background:var(--blue);color:#fff}.btn-g{background:rgba(148,163,184,.2);color:var(--text)}
-.range{display:grid;grid-template-columns:90px 1fr 46px;gap:8px;align-items:center;margin:6px 0}
-.small{font-size:12px;color:var(--muted)}
-.tag-list{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}
-.tag-item{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:8px}
-.tag-item:hover{background:#f8fafc}
-.tag-item input{margin:0}
-.tag-item input[type="checkbox"]{
-  width:16px;
-  height:16px;
-  margin:0;
-  flex:0 0 auto;
-}
-.tag-empty{font-size:13px;color:var(--muted);padding:8px}
-.gate{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:70}
-.gate-box{width:min(92vw,360px);background:#fff;border:1px solid #d7dce4;border-radius:14px;padding:16px}
-.gate-box h3{margin:0 0 10px}
-.gate-pass{ position:relative; }
-.gate-pass #gatePwd{ padding-right:34px; }
-.gate-box input{width:100%;height:42px;border:1px solid #d7dce4;border-radius:10px;padding:0 10px;outline:none}
-.tip{min-height:16px;margin-top:7px;font-size:12px;color:#ef4444;display:none}
-.tip.ok{color:#16a34a}
-.tip.show{display:block}
-.toast-wrap{position:fixed;right:16px;bottom:16px;z-index:90;display:flex;flex-direction:column;gap:8px}
-.toast{
-  min-width:180px;max-width:360px;background:#111827;color:#fff;border-radius:10px;padding:10px 12px;font-size:13px;
-  box-shadow:0 8px 18px rgba(0,0,0,.2);opacity:.97
-}
-.toast.success{background:#065f46}.toast.warn{background:#92400e}.toast.error{background:#991b1b}
-.gate-box,
-.modal,
-.menu-panel{
-  background: var(--panel) !important;
-  color: var(--text) !important;
-  border: 1px solid var(--line) !important;
-  border-radius: 12px !important;
-  box-shadow: 0 8px 24px rgba(15,23,42,.08) !important;
-}
-.gate-box input,
-.modal input:not([type="checkbox"]),
-.modal select,
-.modal textarea,
-#cnameModal input,
-#cnameModal textarea{
-  width: 100%;
-  box-sizing: border-box;
-}
-#cnameModal textarea{
-  min-height: 110px;
-}
-#cnameModal input,
-#cnameModal textarea{
-  font: inherit;
-  font-size: 14px;
-  color: var(--text);
-}
-#cnameModal textarea{
-  font-family: inherit;
-}
-.menu-panel input,
-.menu-panel select{
-  background: var(--inbg) !important;
-  color: var(--intext) !important;
-  border: 1px solid var(--inborder) !important;
-  border-radius: 10px !important;
-}
-.gate-box #gateBtn{
-  width:100%;
-  height:42px;
-  margin-top:10px;
-  font-size:14px;
-  font-weight:700;
-  cursor:pointer;
-  background: var(--brand) !important;
-  color: #fff !important;
-  border: none !important;
-  border-radius: 10px !important;
-}
-.gate-pass .pass-eye{
-  position:absolute;
-  right:8px;
-  top:50%;
-  transform:translateY(-50%);
-  width:20px;
-  height:20px;
-  border:none;
-  background:transparent;
-  padding:0;
-  border-radius:0;
-  color:#94a3b8;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  cursor:pointer;
-}
-.gate-pass .pass-eye:hover{ color:#64748b; }
-.gate-pass .pass-eye svg{ width:20px; height:20px; display:block; }
-.gate-pass .pass-eye span{ display:flex; }  
-button:focus-visible,
-.btn:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-[role="button"]:focus-visible{
-  outline: 2px solid color-mix(in oklab, var(--brand) 72%, white 28%);
-  outline-offset: 1px;
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand) 18%, transparent 82%);
-}
-.card,
-.menu-panel,
-.modal,
-button,
-.btn{
-  transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease;
-}
-button:hover,.btn:hover{
-  transform: translateY(-1px);
-}
-#editor{
-  font-size:14px;
-  line-height:1.45;
-}
-#editor h3{
-  font-size:24px;
-  font-weight:800;
-  line-height:1.2;
-  margin:0 0 14px 0;
-  color:var(--text2);
-}
-#editor .field-title{
-  font-size:18px;
-  font-weight:700;
-  line-height:1.3;
-  margin:10px 0 8px;
-  color:var(--text2);
-}
-#editor .req{
-  font-size:16px;
-  margin-right:4px;
-}
-#editor input:not([type="checkbox"]),
-#editor textarea,
-#editor select{
-  height:42px;
-  font-size:15px;
-  border-radius:10px;
-  padding:0 12px;
-  margin-bottom:8px;
-}
-#editor input::placeholder,
-#editor textarea::placeholder{
-  color:#9aa4b2;
-  font-size:14px;
-}
-#editor .exp-row{
-  display:flex;
-  gap:8px;
-  align-items:center;
-  margin-bottom:8px;
-}
-#editor .exp-row .exp-date{
-  flex: 1 1 62%;
-  min-width: 170px;
-}
-#editor .exp-row .exp-time{
-  flex: 1 1 38%;
-  min-width: 120px;
-}
-#editor input.exp-date,
-#editor input.exp-time{
-  height:42px;
-  font-size:15px;
-  border-radius:10px;
-  padding:0 12px;
-  margin-bottom:0;
-  font-family: inherit;
-  font-weight: 500;
-}
-#editor .field-help{
-  font-size:12px;
-  line-height:1.5;
-  color:var(--muted);
-  margin:2px 0 10px 24px;
-}
-#editor .btn-row{
-  display:flex;
-  gap:8px;
-  margin:4px 0 8px;
-}
-#editor .btn-row .btn{
-  height:36px;
-  padding:0 12px;
-  font-size:14px;
-  border-radius:10px;
-}
-#editor .btns .btn{
-  min-width:80px;
-  height:38px;
-  font-size:15px;
-  font-weight:700;
-}
-#editor .check-row{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  margin:6px 0 4px;
-}
-#editor .check-row input[type="checkbox"]{
-  width:18px;
-  height:18px;
-  margin:0;
-  accent-color: var(--blue);
-  cursor:pointer;
-}
-#editor .check-row span{
-  font-size:16px;
-  line-height:1.25;
-}
-#editor .pass-wrap{
-  position: relative;
-}
-#editor .pass-wrap #inPass{
-  padding-right: 34px; 
-}
-#editor .pass-eye{
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  margin: 0;
-  border: none;
-  background: transparent;
-  color: #7b8798;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  line-height: 1;
-}
-#editor .pass-eye:hover{
-  color: #4b5563;
-}
-#editor .pass-eye:focus{
-  outline: none;
-}
-#editor .check-row input[type="checkbox"]{
-  width: 20px;
-  height: 20px;
-  margin: 0;
-  accent-color: var(--blue);
-}
-#editor #togglePassIcon,
-#editor #togglePassIcon svg{
-  width: 22px;
-  height: 22px;
-}
-:root{
-  --density-name-size: clamp(24px, 2vw, 30px);
-  --density-label-size: clamp(13px, 1.1vw, 15px);
-  --density-mono-size: clamp(12px, 1vw, 13px);
-  --density-card-pad: 12px;
-  --density-gap: 10px;
-  --status-indent: 13px;
-}
-.title{font-size:34px;font-weight:800}
-.title::after{width:28px;height:3px;margin-bottom:6px}
-.title small{font-size:12px;padding:3px 10px}
-.controls select,
-.controls input,
-.controls button{
-  height:36px;
-  font-size:13px;
-  border-radius:10px;
-}
-.subline,
-.path-tip,
-.status,
-.k,
-.mono,
-.mono.muted{
-  font-size:var(--density-mono-size);
-  line-height:1.35;
-}
-.line{
-  margin-top:6px;
-  display:grid;
-  grid-template-columns:56px minmax(0,1fr) auto;
-  gap:6px 8px;
-  align-items:flex-start;
-}
-.label{
-  text-align:left;
-  font-size:var(--density-mono-size);
-  line-height:1.2;
-  color:var(--card-muted);
-  padding-top:2px;
-}
-.status{
-  position:relative;
-}
-.status .dot{
-  position:absolute;
-  left:-12px;
-  top:50%;
-  transform:translateY(-50%);
-}
-.line-actions{
-  display:flex;
-  gap:8px;
-  align-items:center;
-  padding-top:2px;
-}
-.line-actions .icon-btn{
-  width:22px;
-  height:22px;
-  padding:0;
-  border-radius:6px;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  color:var(--icon);
-  background:transparent;
-  opacity:.9;
-}
-.line-actions .icon-btn svg{
-  width:20px;
-  height:20px;
-  display:block;
+  .project-links{margin:8px 12px 6px;font-size:13px}
+  .project-links a{font-size:13px}
+  .disclaimer{margin:12px;font-size:11.5px}
 }
 </style>
 </head>
@@ -4136,7 +4876,7 @@ button:hover,.btn:hover{
     <span id="gatePassIcon"></span>
   </button>
 </div>
-<button id="gateBtn" onclick="window.Gate && Gate.check && Gate.check()">进入面板</button>
+<button id="gateBtn">进入面板</button>
     <div id="gateTip" class="tip">请先在 Worker 环境变量设置 ADMIN_TOKEN</div>
   </div>
 </div>
@@ -4148,7 +4888,7 @@ button:hover,.btn:hover{
   <small id="nodeCount">0个</small>
 </div>
       <div class="right-actions">
-  <span class="top-ver">v1.6</span>
+  <span class="top-ver">免费版v1.7</span>
   <button class="icon-btn" title="切换主题" onclick="App.quickTheme()">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"></path></svg>
         </button>
@@ -4158,15 +4898,15 @@ button:hover,.btn:hover{
           </button>
           <div id="menuPanel" class="menu-panel glass">
   <button onclick="App.openTgModal()">TG 每日报表设置</button>
-  <button onclick="App.openCnameModal()">CNAME 优选设置</button>
+  <button onclick="App.openCnameModal()">CNAME 更换</button>
   <button onclick="App.exportData()">导出配置</button>
   <button onclick="document.getElementById('fIn').click()">导入配置</button>
   <button onclick="App.openBgModal()">背景高级设置</button>
-  <button onclick="App.setDensity('compact')">密度：紧凑</button>
-  <button onclick="App.setDensity('cozy')">密度：舒适</button>
-  <button onclick="App.setPreset('deepblue')">主题：深蓝</button>
-  <button onclick="App.setPreset('graphite')">主题：石墨</button>
-  <button onclick="App.setPreset('light')">主题：浅灰</button>
+  <button onclick="App.setDensity('compact')">密度:紧凑</button>
+  <button onclick="App.setDensity('cozy')">密度:舒适</button>
+  <button onclick="App.setPreset('deepblue')">主题:深蓝</button>
+  <button onclick="App.setPreset('graphite')">主题:石墨</button>
+  <button onclick="App.setPreset('light')">主题:浅灰</button>
   <button onclick="Gate.logout()">退出登录</button>
   <input type="file" id="fIn" hidden accept=".json" onchange="App.importFile(this)">
 </div>
@@ -4174,7 +4914,7 @@ button:hover,.btn:hover{
       </div>
     </div>
     <div class="controls">
-      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">标签：全部</button>
+      <button id="tagFilterBtn" class="glass" onclick="App.openTagPicker()">标签:全部</button>
 <input id="searchInput" class="full-sm glass" placeholder="搜索节点名称、备注..." oninput="App.filter(this.value)">
       <button id="toggleAllVisBtn" class="glass" onclick="App.toggleAllVisibility()"><span class="state-dot off"></span>显示全部地址</button>
       <button id="btnCheckSel" class="glass" onclick="App.checkSelectedStatus()">检测选中</button>
@@ -4210,14 +4950,6 @@ button:hover,.btn:hover{
 <div class="field-title"><span class="req">*</span> 请求路径和密钥路径</div>
 <input id="inName" placeholder="请输入唯一英文路径（a-z0-9_-，1~32）">
 <input id="inSec" placeholder="密钥路径（可选，不能含 / ? #）">
-<div class="field-title">Emby 账号（用于一键导入）</div>
-<input id="inUser" placeholder="用户名（可留空）">
-<div class="pass-wrap">
-  <input id="inPass" type="password" placeholder="密码（可留空）">
-  <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="显示/隐藏密码">
-    <span id="togglePassIcon"></span>
-  </button>
-</div>
 <div class="field-title">播放策略</div>
 <label class="check-row">
   <input id="inDirectExternal" type="checkbox">
@@ -4226,23 +4958,51 @@ button:hover,.btn:hover{
 <div class="field-help">
   开启后，网盘外链由播放器直接访问（不经 Worker 反代），可能更快但受客户端网络影响。
 </div>
-<div class="field-title">标签和备注</div>
-<div class="tagbar">
-  <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
+<div class="field-title">网络兼容</div>
+<select id="inRealIpMode">
+  <option value="smart">自动（推荐）</option>
+  <option value="realip_only">严格（推荐）</option>
+  <option value="off">保守（疑难时）</option>
+  <option value="dual">最大兼容（少数站点，慎用）</option>
+</select>
+<div class="field-help">默认"自动（推荐）"即可，出现登录/播放异常时再改高级档位。</div>
+<div style="margin-top:8px;">
+  <button class="btn btn-g" type="button" onclick="App.compatAutoFixEditor()">一键修复（推荐）</button>
 </div>
-<datalist id="tagSuggestions"></datalist>
-<input id="inNote" placeholder="备注（如 保号规则 / 等）">
-<div class="field-title">保号周期（天）</div>
-<input id="inRenewDays" type="number" min="0" max="3650" step="1" placeholder="例如 30（0=不启用）">
-<div class="field-title">提前几天提醒</div>
-<input id="inRemindBeforeDays" type="number" min="0" max="3650" step="1" placeholder="例如 3">
-<div class="field-title">保号提醒时间（北京时间）</div>
-<input id="inKeepaliveAt" type="time" step="60">
-<div class="field-title">保号每日提醒次数</div>
-<input id="inKeepaliveMaxPerDay" type="number" min="1" max="1440" step="1" placeholder="默认 1">
-<div class="field-help">进入提醒窗口后，按时间提醒；每天最多推送 N 次，次日自动重置。</div>
+<details style="margin-top:10px;">
+  <summary class="field-title" style="cursor:pointer;">账号导入（可选）</summary>
+  <input id="inUser" placeholder="用户名（可留空）">
+  <div class="pass-wrap">
+    <input id="inPass" type="password" placeholder="密码（可留空）">
+    <button type="button" id="togglePassBtn" class="pass-eye" onclick="App.toggleEditorPass()" title="显示/隐藏密码">
+      <span id="togglePassIcon"></span>
+    </button>
+  </div>
+</details>
+<details style="margin-top:10px;">
+  <summary class="field-title" style="cursor:pointer;">标签和备注（可选）</summary>
+  <div class="tagbar">
+    <input id="inTag" list="tagSuggestions" placeholder="标签（如 公费服 / 公益服 / 白名单 / 等）">
+  </div>
+  <datalist id="tagSuggestions"></datalist>
+  <input id="inNote" placeholder="备注（如 保号规则 / 等）">
+</details>
+<details style="margin-top:10px;">
+  <summary class="field-title" style="cursor:pointer;">保号提醒（可选）</summary>
+  <div class="field-title">保号周期（天）</div>
+  <input id="inRenewDays" type="number" min="0" max="3650" step="1" placeholder="例如 30（0=不启用）">
+  <div class="field-title">提前几天提醒</div>
+  <input id="inRemindBeforeDays" type="number" min="0" max="3650" step="1" placeholder="例如 3">
+  <div class="field-title">保号提醒时间（北京时间）</div>
+  <input id="inKeepaliveAt" type="time" step="60">
+  <div class="field-title">保号每日提醒次数</div>
+  <input id="inKeepaliveMaxPerDay" type="number" min="1" max="24" step="1" placeholder="默认 1（1~24）">
+  <div class="field-help">进入提醒窗口后，最短间隔固定 60 分钟；每天最多提醒 1~24 次，次日自动重置。</div>
+  <div style="margin-top:8px;">
+    <button class="btn btn-g" type="button" onclick="App.testKeepaliveNotify()">测试通知</button>
+  </div>
+</details>
 <div class="btns">
-  <button class="btn btn-g" onclick="App.testKeepaliveNotify()">测试通知</button>
   <button class="btn btn-g" onclick="App.closeAllModals()">取消</button>
   <button class="btn btn-p" onclick="App.save()">保存</button>
 </div>
@@ -4262,40 +5022,48 @@ button:hover,.btn:hover{
     <div class="range"><label>亮度</label><input id="bgBrightness" type="range" min="40" max="140" step="1"><span id="bgBrightnessVal">100%</span></div>
     <div class="range"><label>模糊</label><input id="bgBlur" type="range" min="0" max="20" step="1"><span id="bgBlurVal">0px</span></div>
     <div class="range"><label>遮罩</label><input id="bgOverlayRange" type="range" min="0" max="80" step="1"><span id="bgOverlayVal">20%</span></div>
-    <div class="small">建议：深色主题 + 亮度 75~90 + 模糊 4~8</div>
+    <div class="small">建议:深色主题 + 亮度 75~90 + 模糊 4~8</div>
     <div class="btns">
       <button class="btn btn-g" onclick="App.clearBg()">清除背景</button>
       <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
       <button class="btn btn-p" onclick="App.saveBg()">保存背景设置</button>
     </div>
   </div>
+  <div id="tgModal" class="modal glass">
+  <h3>TG 每日报表设置</h3>
+  <label class="check-row">
+    <input id="tgEnable" type="checkbox">
+    <span>启用 TG 通知</span>
+  </label>
+  <div class="field-title">Bot Token</div>
+  <input id="tgToken" placeholder="如 123456:ABCDEF...">
+  <div class="field-title">Chat ID</div>
+  <input id="tgChat" placeholder="如 -100xxxxxxxxxx">
+  <div class="field-title">日报时间（北京时间）</div>
+  <input id="tgReportTime" type="time" step="60">
+  <div class="field-title">日报间隔（分钟）</div>
+  <input id="tgReportEveryMin" type="number" min="60" max="1440" step="1" placeholder="60~1440">
+  <div class="field-title">每日最大发送次数</div>
+  <input id="tgReportMaxPerDay" type="number" min="1" max="24" step="1" placeholder="1~24">
+  <label class="check-row">
+    <input id="tgAllowRepeat" type="checkbox">
+    <span>允许重复发送（关闭则仅变化时发送）</span>
+  </label>
+  <div class="btns">
+    <button class="btn btn-g" onclick="App.testTg()">测试发送</button>
+    <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
+    <button class="btn btn-p" onclick="App.saveTg()">保存设置</button>
+  </div>
+</div>
 <div id="cnameModal" class="modal glass">
-  <h3>CNAME 优选设置</h3>
-  <div class="small">当前记录：<b id="cnameCurrent">-</b></div>
-  <input id="cnameValue" placeholder="输入新的CNAME目标域名（如 cf.xxx.com）">
-  <div class="small">提示：仅支持域名，不要带 https://</div>
+  <h3>CNAME 更换</h3>
+  <div class="small">当前 CNAME：<b id="cnameCurrent">-</b></div>
+  <input id="cnameValue" placeholder="输入新的 CNAME 目标域名（例如 cf.example.com）">
+  <div class="small">提示：只填域名，不要带 http:// 或 https://</div>
   <div class="btns">
     <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
     <button class="btn btn-g" onclick="App.loadCnameStatus()">刷新</button>
     <button class="btn btn-p" onclick="App.saveCname()">保存</button>
-  </div>
-</div>
-<div id="tgModal" class="modal glass">
-  <h3>Telegram 每日报表</h3>
-  <label class="small"><input type="checkbox" id="tgEnable"> 启用</label>
-  <input id="tgToken" placeholder="Bot Token">
-  <input id="tgChat" placeholder="Chat ID">
-  <input id="tgFlowGB" placeholder="流量预警阈值 GB（0=关闭，最大10240）" min="0" max="10240">
-  <input id="tgErrCount" placeholder="异常预警阈值（0=关闭，最大2000）" min="0" max="2000">
-  <input id="tgReportEveryMin" type="number" min="0" max="1440" step="1" placeholder="日报推送间隔（分钟，0=关闭间隔模式）">
-  <input id="tgReportMaxPerDay" type="number" min="1" max="1440" step="1" placeholder="日报每日最多推送次数（默认1）">
-<input id="tgReportTime" type="time" step="60">
-<div class="small">按北京时间每日推送一次</div>
-  <div class="btns">
-    <button class="btn btn-g" onclick="App.closeAllModals()">关闭</button>
-    <button class="btn btn-g" onclick="App.loadTg()">刷新</button>
-    <button class="btn btn-g" onclick="App.testTg()">发送测试</button>
-    <button class="btn btn-p" onclick="App.saveTg()">保存</button>
   </div>
 </div>
 <div id="toastWrap" class="toast-wrap"></div>
@@ -4373,30 +5141,42 @@ bindEvents() {
 },
 async check() {
   const tip = $('#gateTip');
-  tip.classList.remove('ok');
-  tip.classList.add('show');
-  tip.innerText = '登录中...';
-  const v = ($('#gatePwd').value || '').trim();
+  if (tip) {
+    tip.classList.remove('ok');
+    tip.classList.add('show');
+    tip.innerText = '登录中...';
+  }
+  const v = ($('#gatePwd')?.value || '').trim();
   if (!v) {
-    tip.innerText = '请输入 ADMIN_TOKEN';
+    if (tip) tip.innerText = '请输入 ADMIN_TOKEN';
     return;
   }
-  this.setToken(v);
-const d = await API.listCached({ ttl: 0, force: true });
-if (d && !d.error) {
-  tip.classList.add('ok');
-  tip.innerText = '登录成功';
-  tip.classList.remove('show');
-  $('#gate').style.display='none';
-  $('#app').style.display='block';
-  App.init(d); 
-  return;
-}
-  this.clearToken();
-  tip.classList.remove('ok');
-  tip.classList.add('show');
-  if (d && d.error === 'UNAUTHORIZED') tip.innerText = '令牌错误';
-  else tip.innerText = d?.error || '登录失败';
+  try {
+    this.setToken(v);
+    const d = await API.listCached({ ttl: 0, force: true });
+    if (!d || d.error) {
+      throw new Error(d?.error || '登录失败');
+    }
+    const gate = $('#gate');
+    const app = $('#app');
+    if (gate) gate.style.display = 'none';
+    if (app) app.style.display = 'block';
+    await App.init(d);
+    if (tip) {
+      tip.classList.add('ok');
+      tip.innerText = '登录成功';
+      tip.classList.remove('show');
+    }
+  } catch (e) {
+    this.clearToken();
+    const msg = String(e?.message || e || '登录失败');
+    if (tip) {
+      tip.classList.remove('ok');
+      tip.classList.add('show');
+      tip.innerText = msg === 'UNAUTHORIZED' ? '令牌错误' : ('登录失败: ' + msg);
+    }
+    console.error('Gate.check failed:', e);
+  }
 },
 async boot() {
   this.bindEvents();
@@ -4426,9 +5206,9 @@ const API = {
     let r;
     try {
       r = await fetch('/admin', { method:'POST', headers, body: JSON.stringify(data) });
-    } catch {
-      return { error:'网络异常' };
-    }
+    } catch (e) {
+  return { error: '网络异常: ' + (e?.message || e) };
+}
     let d = {};
     try { d = await r.json(); } catch {}
     if (!r.ok) return { error: d.error || ('HTTP_' + r.status), status: r.status };
@@ -4464,12 +5244,11 @@ function normalizeHHmmLoose(v) {
   if (!s) return "";
   s = s.replace(/[\s\u3000]+/g, "");
   s = s.replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 65248));
-  s = s.replace(/[：﹕∶]/g, ":").replace(/[．。]/g, ".").replace(/[٫]/g, ":");
-  let m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
-  if (!m) m = /(\d{1,2})\D+(\d{1,2})/.exec(s);
-  if (!m) return "";
-  const hh = Math.max(0, Math.min(23, Number(m[1])));
-  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  s = s.replace(/[﹕∶٫]/g, ":").replace(/[．。]/g, ".");
+  const nums = s.split(/[^0-9]+/).filter(Boolean);
+  if (nums.length < 2) return "";
+  const hh = Math.max(0, Math.min(23, Number(nums[0])));
+  const mm = Math.max(0, Math.min(59, Number(nums[1])));
   if (!Number.isFinite(hh) || !Number.isFinite(mm)) return "";
   return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
 }
@@ -4492,6 +5271,29 @@ const App = {
     if (this.autoRefreshTimer) clearInterval(this.autoRefreshTimer);
     this.autoRefreshTimer = setInterval(() => this.refresh(), this.autoRefreshMs);
   },
+  compatAutoFixEditor: async function () {
+    const el = $("#inRealIpMode");
+    if (!el) return;
+    const baseName = this.editingOldName || ($("#inName") && $("#inName").value) || "";
+    const nameRaw = String(baseName).trim().toLowerCase();
+    if (!nameRaw) {
+      this.toast("请先保存节点路径，再执行一键修复。", "warn");
+      return;
+    }
+    this.toast("正在执行兼容性一键修复...", "warn");
+    const r = await API.req({ action: "node.compat.autofix", name: nameRaw });
+    if (!r || !r.success) {
+      this.toast((r && r.error) || "一键修复失败", "error");
+      return;
+    }
+    const mode = String(r.mode || "smart").toLowerCase();
+    el.value = mode;
+    let label = "自动（推荐）";
+    if (mode === "realip_only") label = "严格（推荐）";
+    else if (mode === "off") label = "保守";
+    else if (mode === "dual") label = "最大兼容";
+    this.toast("已应用一键修复：" + label, "success");
+  },
 normalizeHHmm(v, defVal = "00:00") {
   let s = String(v ?? "").trim();
   if (!s) return defVal;
@@ -4499,15 +5301,11 @@ normalizeHHmm(v, defVal = "00:00") {
   s = s.replace(/[０-９]/g, (ch) =>
     String.fromCharCode(ch.charCodeAt(0) - 65248),
   );
-  s = s
-    .replace(/[：﹕∶]/g, ":")
-    .replace(/[．。]/g, ".")
-    .replace(/[٫]/g, ":");
-  let m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(s);
-  if (!m) m = /(\d{1,2})\D+(\d{1,2})/.exec(s);
-  if (!m) return defVal;
-  const hh = Math.max(0, Math.min(23, Number(m[1])));
-  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  s = s.replace(/[﹕∶٫]/g, ":").replace(/[．。]/g, ".");
+  const nums = s.split(/[^0-9]+/).filter(Boolean);
+  if (nums.length < 2) return defVal;
+  const hh = Math.max(0, Math.min(23, Number(nums[0])));
+  const mm = Math.max(0, Math.min(59, Number(nums[1])));
   if (!Number.isFinite(hh) || !Number.isFinite(mm)) return defVal;
   return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
 },
@@ -4555,24 +5353,31 @@ document.documentElement.style.setProperty('--density-mono-size', compact?'12px'
     if(needToast) this.toast('密度已切换','success');
   },
   getBgCfg(){ try{return JSON.parse(localStorage.getItem(this.kBg)||'{}');}catch{return {};} },
-  applyBg(cfg){
-    const url = String(cfg.url||'').trim();
-    const brightness = Number(cfg.brightness ?? 100);
-    const blur = Number(cfg.blur ?? 0);
-    const overlay = Number(cfg.overlay ?? 20);
-    document.documentElement.style.setProperty('--bg-brightness', brightness+'%');
-    document.documentElement.style.setProperty('--bg-blur', blur+'px');
-    document.documentElement.style.setProperty('--bg-overlay', String(overlay/100));
-    $('#bgLayer').style.filter = 'brightness('+brightness+'%) blur('+blur+'px)';
-    $('#bgOverlay').style.background = 'rgba(0,0,0,'+(Math.max(0,Math.min(80,overlay))/100)+')';
-    if(url){
-      $('#bgLayer').style.backgroundImage='url("'+url.replace(/"/g,'\\\\\\"')+'")';
-      document.body.classList.add('has-bg');
-    }else{
-      $('#bgLayer').style.backgroundImage='none';
-      document.body.classList.remove('has-bg');
-    }
-  },
+applyBg(cfg){
+  const url = String((cfg && cfg.url) || "").trim();
+  const brightness = Number((cfg && cfg.brightness) ?? 100);
+  const blur = Number((cfg && cfg.blur) ?? 0);
+  const overlay = Number((cfg && cfg.overlay) ?? 20);
+  document.documentElement.style.setProperty("--bg-brightness", brightness + "%");
+  document.documentElement.style.setProperty("--bg-blur", blur + "px");
+  document.documentElement.style.setProperty("--bg-overlay", String(overlay / 100));
+  const bgLayer = $("#bgLayer");
+  const bgOverlay = $("#bgOverlay");
+  if (!bgLayer || !bgOverlay) return;
+  bgLayer.style.filter = "brightness(" + brightness + "%) blur(" + blur + "px)";
+  bgOverlay.style.background = "rgba(0,0,0," + (Math.max(0, Math.min(80, overlay)) / 100) + ")";
+  if (url) {
+    const safeUrl = String(url)
+      .split('"').join("%22")
+      .split("(").join("%28")
+      .split(")").join("%29");
+    bgLayer.style.backgroundImage = 'url("' + safeUrl + '")';
+    document.body.classList.add("has-bg");
+  } else {
+    bgLayer.style.backgroundImage = "none";
+    document.body.classList.remove("has-bg");
+  }
+},
   openBgModal(){
     const cfg = this.getBgCfg();
     $('#bgUrl').value = cfg.url || '';
@@ -4582,77 +5387,101 @@ document.documentElement.style.setProperty('--density-mono-size', compact?'12px'
     this.refreshBgRangeText();
     this.openModal('bgModal');
   },
-    openTgModal(){
+     openTgModal() {
     this.loadTg();
-    this.openModal('tgModal');
+    this.openModal("tgModal");
   },
-  async loadTg(){
-    const r = await API.req({ action:'tg.get' });
-    if(!r || !r.success) return this.toast(r.error || '读取失败','error');
-    $('#tgEnable').checked = !!r.content.enabled;
-    $('#tgToken').value = r.content.token || '';
-    $('#tgChat').value = r.content.chat || '';
-    $('#tgFlowGB').value = r.content.flowGB || 0;
-    $('#tgErrCount').value = r.content.errCount || 0;
-    $('#tgReportTime').value = r.content.reportTime || '00:00';
-    $('#tgReportEveryMin').value = Number(r.content.reportEveryMin || 0);
-    $('#tgReportMaxPerDay').value = Number(r.content.reportMaxPerDay || 1);
+  openCnameModal() {
+    this.loadCnameStatus();
+    this.openModal("cnameModal");
   },
-async saveTg(){
-  const flowGB = Number($('#tgFlowGB').value || 0);
-  const errCount = Number($('#tgErrCount').value || 0);
-  const reportRaw = String($('#tgReportTime').value || '').trim();
- const reportTime = String($('#tgReportTime').value || '').trim();
-  const reportEveryMin = Number($('#tgReportEveryMin').value || 0);
-  const reportMaxPerDay = Number($('#tgReportMaxPerDay').value || 1);
-  if (flowGB < 0 || flowGB > 10240) return this.toast('流量阈值范围：0~10240 GB','warn');
-  if (errCount < 0 || errCount > 2000) return this.toast('异常阈值范围：0~2000','warn');
-  if (!Number.isFinite(reportEveryMin) || reportEveryMin < 0 || reportEveryMin > 1440) {
-    return this.toast('日报间隔范围：0~1440 分钟','warn');
-  }
-  if (!Number.isFinite(reportMaxPerDay) || reportMaxPerDay < 1 || reportMaxPerDay > 1440) {
-    return this.toast('日报每日次数范围：1~1440','warn');
-  }
-  const cfg = {
-    enabled: !!$('#tgEnable').checked,
-    token: String($('#tgToken').value||'').trim(),
-    chat: String($('#tgChat').value||'').trim(),
-    flowGB,
-    errCount,
-    reportTime,
-    reportEveryMin: Math.floor(reportEveryMin),
-    reportMaxPerDay: Math.floor(reportMaxPerDay),
-  };
-  const r = await API.req({ action:'tg.set', content: cfg });
-  if(!r || !r.success) return this.toast(r.error || '保存失败','error');
-  this.toast('保存成功','success');
-},
+  async loadCnameStatus() {
+    const r = await API.req({ action: "dns.get" });
+    if (!r || !r.success) {
+      this.toast((r && r.error) || "获取 DNS 状态失败", "error");
+      return;
+    }
+    const cur = (Array.isArray(r.cname) && r.cname.length > 0) ? r.cname[0] : "";
+    $("#cnameCurrent").textContent = cur || "--";
+    $("#cnameValue").value = cur || "";
+  },
+  async saveCname() {
+    let v = String($("#cnameValue").value || "").trim();
+    const low = v.toLowerCase();
+    if (low.startsWith("https://")) v = v.slice(8);
+    else if (low.startsWith("http://")) v = v.slice(7);
+    while (v.endsWith("/")) v = v.slice(0, -1);
+    v = v.trim();
+    if (!v) return this.toast("请输入 CNAME 目标域名", "warn");
+    const okChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-";
+    for (let i = 0; i < v.length; i++) {
+      if (!okChars.includes(v[i])) {
+        return this.toast("CNAME 格式不正确", "warn");
+      }
+    }
+    const r = await API.req({
+      action: "dns.replace",
+      mode: "CNAME",
+      cname: v,
+    });
+    if (!r || !r.success) return this.toast((r && r.error) || "保存失败", "error");
+    this.toast("保存成功", "success");
+    await this.loadCnameStatus();
+  },
+  async loadTg() {
+    const r = await API.req({ action: "tg.get" });
+    if (!r || !r.success) return this.toast(r.error || "读取失败", "error");
+    const lineName = (c) => ({ CN: "中国通用", CT: "电信优先", CU: "联通优先", CM: "移动优先" }[String(c || "").toUpperCase()] || "-");
+    const typeName = (t) => (String(t || "").toUpperCase() === "AAAA" ? "IPv6(AAAA)" : "IPv4(A)");
+    $("#tgEnable").checked = !!r.content.enabled;
+    $("#tgToken").value = r.content.token || "";
+    $("#tgChat").value = r.content.chat || "";
+    $("#tgReportTime").value = r.content.reportTime || "00:00";
+    $("#tgReportEveryMin").value = Math.max(
+      60,
+      Number(r.content.reportEveryMin || 60),
+    );
+    $("#tgReportMaxPerDay").value = Math.min(
+      24,
+      Math.max(1, Number(r.content.reportMaxPerDay || 1)),
+    );
+    $("#tgAllowRepeat").checked = r.content.reportChangeOnly === false;
+  },
+  async saveTg() {
+    const reportTime = String($("#tgReportTime").value || "").trim();
+    const reportEveryMin = Number($("#tgReportEveryMin").value || 60);
+    const reportMaxPerDay = Number($("#tgReportMaxPerDay").value || 1);
+    if (
+      !Number.isFinite(reportEveryMin) ||
+      reportEveryMin < 60 ||
+      reportEveryMin > 1440
+    ) {
+      return this.toast("日报间隔范围:60~1440 分钟（最小60）", "warn");
+    }
+    if (
+      !Number.isFinite(reportMaxPerDay) ||
+      reportMaxPerDay < 1 ||
+      reportMaxPerDay > 24
+    ) {
+      return this.toast("日报每日次数范围:1~24", "warn");
+    }
+    const cfg = {
+      enabled: !!$("#tgEnable").checked,
+      token: String($("#tgToken").value || "").trim(),
+      chat: String($("#tgChat").value || "").trim(),
+      reportTime,
+      reportEveryMin: Math.floor(reportEveryMin),
+      reportMaxPerDay: Math.floor(reportMaxPerDay),
+      reportChangeOnly: !$("#tgAllowRepeat").checked,
+    };
+    const r = await API.req({ action: "tg.set", content: cfg });
+    if (!r || !r.success) return this.toast(r.error || "保存失败", "error");
+    this.toast("保存成功", "success");
+  },
   async testTg(){
     const r = await API.req({ action:'tg.test' });
     if(!r || !r.success) return this.toast(r.error || '发送失败','error');
     this.toast('测试消息已发送','success');
-  },
-    openCnameModal(){
-    this.loadCnameStatus();
-    this.openModal('cnameModal');
-  },
-  async loadCnameStatus(){
-    const r = await API.req({ action:'cname.get' });
-    if(!r || !r.success){
-      return this.toast(r.error || '获取 CNAME 失败','error');
-    }
-    $('#cnameCurrent').textContent = r.content || '-';
-    $('#cnameValue').value = r.content || '';
-  },
-  async saveCname(){
-    let v = String($('#cnameValue').value || '').trim();
-    if(!v) return this.toast('请输入 CNAME 目标域名','warn');
-    const r = await API.req({ action:'cname.set', value: v });
-    if(!r || !r.success){
-      return this.toast(r.error || '更新失败','error');
-    }
-    $('#cnameCurrent').textContent = r.content || v;
-    this.toast('更新成功','success');
   },
   bindBgRangePreview(){
     ['bgBrightness','bgBlur','bgOverlayRange'].forEach(id=>{
@@ -4719,9 +5548,9 @@ async refresh(){
   updateTagFilterBtn(){
     const btn = $('#tagFilterBtn');
     if(!btn) return;
-    if(this.selectedTags.size===0){ btn.textContent = '标签：全部'; return; }
+    if(this.selectedTags.size===0){ btn.textContent = '标签:全部'; return; }
     const arr = [...this.selectedTags];
-    btn.textContent = arr.length===1 ? ('标签：' + arr[0]) : ('标签：' + arr[0] + ' +' + (arr.length-1));
+    btn.textContent = arr.length===1 ? ('标签:' + arr[0]) : ('标签:' + arr[0] + ' +' + (arr.length-1));
   },
   openTagPicker(){
     const box = $('#tagPickerList');
@@ -4993,8 +5822,8 @@ showPathModal(text, appName, onOpen, opts = {}){
   sub.style.opacity = '.9';
   sub.style.marginBottom = '8px';
   sub.textContent = isManual
-    ? '该播放器可能不支持自动导入，请复制以下信息手动填写：'
-    : '该播放器暂不支持自动写入 Path，请复制后粘贴到 Path：';
+    ? '该播放器可能不支持自动导入，请复制以下信息手动填写:'
+    : '该播放器暂不支持自动写入 Path，请复制后粘贴到 Path:';
   const code = document.createElement('div');
   code.style.padding = '10px';
   code.style.border = '1px dashed #64748b';
@@ -5031,7 +5860,7 @@ showPathModal(text, appName, onOpen, opts = {}){
   btnCancel.onclick = close;
   btnCopy.onclick = async () => {
     try { await navigator.clipboard.writeText(text); } catch {}
-    this.toast(isManual ? '导入信息已复制' : '路径已复制：' + text, 'success');
+    this.toast(isManual ? '导入信息已复制' : '路径已复制:' + text, 'success');
   };
   btnOpen.onclick = () => {
     close();
@@ -5062,144 +5891,135 @@ openWithPathModal(app, schemeUrl, text, opts = {}){
     this.toast('已打开 ' + appName, 'success');
   }, opts);
 },
-buildPathQuery(pathOnly){
-  const p = String(pathOnly || '').trim();
-  if (!p) return '';
-  const norm = p.startsWith('/') ? p : ('/' + p);
+buildPathQuery(pathOnly) {
+  const p = String(pathOnly || "").trim();
+  if (!p) return "";
+  const norm = p.startsWith("/") ? p : ("/" + p);
   const ep = encodeURIComponent(norm);
-  return '&path=' + ep + '&basePath=' + ep + '&serverPath=' + ep;
+  return "&path=" + ep + "&basePath=" + ep + "&serverPath=" + ep;
 },
-toggleEditorPass(){
-  const ip = $('#inPass');
-  const icon = $('#togglePassIcon');
+toggleEditorPass() {
+  const ip = $("#inPass");
+  const icon = $("#togglePassIcon");
   if (!ip) return;
-  const show = ip.type === 'password';
-  ip.type = show ? 'text' : 'password';
-  if (icon) {
-    icon.innerHTML = show ? SVG.eyeOff : SVG.eye;
-  }
-  const btn = $('#togglePassBtn'); if (btn) btn.blur();
+  const show = ip.type === "password";
+  ip.type = show ? "text" : "password";
+  if (icon) icon.innerHTML = show ? SVG.eyeOff : SVG.eye;
+  const btn = $("#togglePassBtn");
+  if (btn) btn.blur();
 },
-async quickAddThirdParty(app, node, fullUrl){
-  const address = String(fullUrl || '').trim();
+async quickAddThirdParty(app, node, fullUrl) {
+  const address = String(fullUrl || "").trim();
   if (!address) {
-    this.toast('缺少代理地址', 'error');
+    this.toast("缺少代理地址", "error");
     return;
   }
   let origin = address;
   let full = address;
-  let pathOnly = '';
-  let host = '';
-  let port = '';
-  let scheme = '';
+  let pathOnly = "";
+  let host = "";
+  let port = "";
+  let scheme = "";
   try {
     const u = new URL(address);
     origin = u.origin;
-    full = u.origin + (u.pathname || '/');
-    pathOnly = (u.pathname && u.pathname !== '/') ? u.pathname : '';
-    host = u.hostname || '';
-    scheme = (u.protocol || '').replace(':', '');
-    port = u.port || (u.protocol === 'https:' ? '443' : '80');
-  } catch {}
-  const userTrim = String((node && node.embyUser) || '').trim();
-  const passTrim = String((node && node.embyPass) || '').trim();
+    full = u.origin + (u.pathname || "/");
+    pathOnly = (u.pathname && u.pathname !== "/") ? u.pathname : "";
+    host = u.hostname || "";
+    scheme = String(u.protocol || "").replace(":", "");
+    port = u.port || (u.protocol === "https:" ? "443" : "80");
+  } catch (e) {}
+  const userTrim = String((node && node.embyUser) || "").trim();
+  const passTrim = String((node && node.embyPass) || "").trim();
   const uName = encodeURIComponent(userTrim);
   const pWord = encodeURIComponent(passTrim);
   const pqs = this.buildPathQuery(pathOnly);
-  if (app === 'sen') {
+  if (app === "sen") {
     const url =
-      'senplayer://importserver?type=emby' +
-      '&address=' + encodeURIComponent(origin) +
-      '&username=' + uName +
-      '&password=' + pWord +
-      '&scheme=' + encodeURIComponent(scheme) +
-      '&host=' + encodeURIComponent(host) +
-      '&port=' + encodeURIComponent(String(port)) +
+      "senplayer://importserver?type=emby" +
+      "&address=" + encodeURIComponent(origin) +
+      "&username=" + uName +
+      "&password=" + pWord +
+      "&scheme=" + encodeURIComponent(scheme) +
+      "&host=" + encodeURIComponent(host) +
+      "&port=" + encodeURIComponent(String(port)) +
       pqs;
-    this.openWithPathModal('sen', url, pathOnly);
+    this.openWithPathModal("sen", url, pathOnly);
     return;
   }
-  if (app === 'epx') {
+  if (app === "epx") {
     const url =
-      'eplayerx://add-or-update?type=emby' +
-      '&href=' + encodeURIComponent(full) +
-      '&username=' + uName +
-      '&password=' + pWord +
-      '&scheme=' + encodeURIComponent(scheme) +
-      '&host=' + encodeURIComponent(host) +
-      '&port=' + encodeURIComponent(String(port)) +
+      "eplayerx://add-or-update?type=emby" +
+      "&href=" + encodeURIComponent(full) +
+      "&username=" + uName +
+      "&password=" + pWord +
+      "&scheme=" + encodeURIComponent(scheme) +
+      "&host=" + encodeURIComponent(host) +
+      "&port=" + encodeURIComponent(String(port)) +
       pqs;
-    this.openWithPathModal('epx', url, pathOnly);
+    this.openWithPathModal("epx", url, pathOnly);
     return;
   }
-  if (app === 'capy') {
-    try { await navigator.clipboard.writeText(address); } catch {}
-    this.toast('已复制代理地址（Capy 请手动粘贴）', 'warn');
+  if (app === "capy") {
+    try { await navigator.clipboard.writeText(address); } catch (e) {}
+    this.toast("已复制代理地址（请在 Capy 手动粘贴）", "warn");
     return;
   }
- if (app === 'hills') {
-  const built = this.buildHillsImportUrls(address, userTrim, passTrim);
-  if (!built) {
-    this.toast('生成 Hills 导入链接失败', 'error');
-    return;
-  }
-  const ua = (navigator.userAgent || '').toLowerCase();
-  const isWindows = ua.includes('windows nt');
-  const hillsUrl = isWindows ? built.windowsUrl : built.mobileUrl;
-  if (isWindows) {
-    const manualText = this.buildManualImportText(address, userTrim, passTrim);
-    let copied = false;
-    try {
-      await navigator.clipboard.writeText(manualText);
-      copied = true;
-    } catch (e) {}
-    if (copied) {
-      this.toast('已复制手动导入信息（地址/用户名/密码/路径）', 'warn');
-    } else {
-      this.toast('剪贴板被浏览器拦截，已弹出手动复制框', 'warn');
-      window.prompt('请复制以下导入信息：', manualText);
-    }
-    this.openWithPathModal('hills', hillsUrl, manualText, { manual: true });
-    return;
-  }
-  this.openWithPathModal('hills', hillsUrl, built.pathOnly);
-  return;
-}
-  if (app === 'rodel') {
+  if (app === "hills") {
     const built = this.buildHillsImportUrls(address, userTrim, passTrim);
     if (!built) {
-      this.toast('生成小幻导入链接失败', 'error');
+      this.toast("生成 Hills 导入链接失败", "error");
       return;
     }
-    const rodelUrl = String(built.windowsUrl || '').replace('hills://', 'rodelplayer://');
-    const ua = (navigator.userAgent || '').toLowerCase();
-    const isWindows = ua.includes('windows nt');
+    const ua = String(navigator.userAgent || "").toLowerCase();
+    const isWindows = ua.indexOf("windows nt") >= 0;
+    const hillsUrl = isWindows ? built.windowsUrl : built.mobileUrl;
     if (isWindows) {
       const manualText = this.buildManualImportText(address, userTrim, passTrim);
       let copied = false;
-      try {
-        await navigator.clipboard.writeText(manualText);
-        copied = true;
-      } catch {}
-      if (copied) {
-        this.toast('已复制手动导入信息（地址/用户名/密码/路径）', 'warn');
-      } else {
-        this.toast('剪贴板被浏览器拦截，已弹出手动复制框', 'warn');
-        window.prompt('请复制以下导入信息：', manualText);
+      try { await navigator.clipboard.writeText(manualText); copied = true; } catch (e) {}
+      if (copied) this.toast("已复制手动导入信息", "warn");
+      else {
+        this.toast("剪贴板被拦截，已弹出手动复制框", "warn");
+        window.prompt("请复制导入信息：", manualText);
       }
-      this.openWithPathModal('rodel', rodelUrl, manualText, { manual: true });
+      this.openWithPathModal("hills", hillsUrl, manualText, { manual: true });
       return;
     }
-    this.openWithPathModal('rodel', rodelUrl, built.pathOnly);
+    this.openWithPathModal("hills", hillsUrl, built.pathOnly);
     return;
   }
-  if (app === 'forward') {
-    const built = this.buildEmbyImportUrl(app, address, userTrim, passTrim);
+  if (app === "rodel") {
+    const built = this.buildHillsImportUrls(address, userTrim, passTrim);
     if (!built) {
-      this.toast('生成导入链接失败', 'error');
+      this.toast("生成 Rodel 导入链接失败", "error");
       return;
     }
-    this.openWithPathModal('forward', built.schemeUrl, built.pathOnly);
+    const rodelUrl = String(built.windowsUrl || "").replace("hills://", "rodelplayer://");
+    const ua = String(navigator.userAgent || "").toLowerCase();
+    const isWindows = ua.indexOf("windows nt") >= 0;
+    if (isWindows) {
+      const manualText = this.buildManualImportText(address, userTrim, passTrim);
+      let copied = false;
+      try { await navigator.clipboard.writeText(manualText); copied = true; } catch (e) {}
+      if (copied) this.toast("已复制手动导入信息", "warn");
+      else {
+        this.toast("剪贴板被拦截，已弹出手动复制框", "warn");
+        window.prompt("请复制导入信息：", manualText);
+      }
+      this.openWithPathModal("rodel", rodelUrl, manualText, { manual: true });
+      return;
+    }
+    this.openWithPathModal("rodel", rodelUrl, built.pathOnly);
+    return;
+  }
+  if (app === "forward") {
+    const built = this.buildEmbyImportUrl(app, address, userTrim, passTrim);
+    if (!built) {
+      this.toast("生成导入链接失败", "error");
+      return;
+    }
+    this.openWithPathModal("forward", built.schemeUrl, built.pathOnly);
     return;
   }
 },
@@ -5311,7 +6131,8 @@ const remindBeforeDays = Math.max(0, Math.floor(Number(n.remindBeforeDays || 0))
 if (periodDays > 0) {
   const b3 = document.createElement('span');
   b3.className = 'badge b-note';
-  const baseTs = Number(n.lastPlayAt || 0);   if (baseTs <= 0) {
+  const baseTs = Number(n.lastPlayAt || 0); // 先用最后播放
+  if (baseTs <= 0) {
     b3.textContent = '保号已启用';
     b3.style.background = '#e5e7eb';
     b3.style.color = '#374151';
@@ -5414,7 +6235,8 @@ v2.addEventListener('click', () => {
   if (!showProxy) return this.toast('请先显示代理地址', 'warn');
   this.copyText(proxyCopyUrl, n.secret ? '已复制含密钥链接' : '已复制代理地址');
 });
-const proxyCopyUrl = fullUrl; const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
+const proxyCopyUrl = fullUrl; // 有密钥=带密钥，无密钥=仅路径
+const eye2 = this.iconBtn(showProxy ? SVG.eyeOff : SVG.eye, showProxy ? '隐藏代理地址' : '显示代理地址', () => this.toggleVisibility(kProxyVis));
 eye2.classList.add('eye-toggle', showProxy ? 'on' : 'off');
 const c2 = this.iconBtn(SVG.link, '复制代理地址', () => {
   if (!showProxy) return this.toast('请先显示代理地址', 'warn');
@@ -5534,7 +6356,8 @@ if (appRow.childElementCount > 0) {
         fav: !!n.fav,
         embyUser: setUser ? setUser : (n.embyUser || ''),
         embyPass: setPass ? setPass : (n.embyPass || ''),
-directExternal: !!n.directExternal,
+directExternal: toBool(n.directExternal),
+realClientIpMode: n.realClientIpMode || 'smart',
 renewDays: Number.isFinite(Number(n.renewDays)) ? Number(n.renewDays) : 0,
 remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
   ? Number(n.remindBeforeDays)
@@ -5546,7 +6369,7 @@ remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
     }
     API.clearListCache();
     await this.refresh();
-    this.toast('批量账号密码完成：成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
+    this.toast('批量账号密码完成:成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
   },
   async clearBatchCred(){
     const names = Array.from(this.selected || []);
@@ -5570,7 +6393,8 @@ remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
         fav: !!n.fav,
         embyUser: '',
         embyPass: '',
-directExternal: !!n.directExternal,
+directExternal: toBool(n.directExternal),
+realClientIpMode: n.realClientIpMode || 'smart',
 renewDays: Number.isFinite(Number(n.renewDays)) ? Number(n.renewDays) : 0,
 remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
   ? Number(n.remindBeforeDays)
@@ -5582,7 +6406,7 @@ remindBeforeDays: Number.isFinite(Number(n.remindBeforeDays))
     }
     API.clearListCache();
     await this.refresh();
-    this.toast('清空账号密码完成：成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
+    this.toast('清空账号密码完成:成功 ' + ok + '，失败 ' + fail, fail ? 'warn' : 'success');
   },
   async batchDelete(){
     const names = Array.from(this.selected);
@@ -5633,6 +6457,20 @@ hideMenu(){
   const m = $('#menuPanel');
   if (m) m.style.display = 'none';
 },
+updateToastAnchor(){
+  const modalIds = ['editor','bgModal','tagPicker','cnameModal','tgModal'];
+  let opened = null;
+  for (const id of modalIds) {
+    const el = $('#' + id);
+    if (el && el.style.display === 'block') { opened = el; break; }
+  }
+  let topPx = 18;
+  if (opened) {
+    const rect = opened.getBoundingClientRect();
+    topPx = Math.max(8, Math.round(rect.top - 56));
+  }
+  document.documentElement.style.setProperty('--toast-top', topPx + 'px');
+},
 openModal(id){
   this.hideMenu();
   ['editor','bgModal','tagPicker','cnameModal','tgModal'].forEach(mid=>{
@@ -5643,6 +6481,7 @@ openModal(id){
   const target = $('#'+id);
   if (target) target.style.display = 'block';
   document.body.classList.add('modal-open');
+  this.updateToastAnchor();
 },
 closeAllModals(){
   $('#mask').style.display = 'none';
@@ -5652,11 +6491,20 @@ closeAllModals(){
   });
   this.hideMenu();
   document.body.classList.remove('modal-open');
+  document.documentElement.style.setProperty('--toast-top', '18px');
 },
 splitTargetsText(v){
-  return String(v || '')
-    .split(/\\r?\\n|[;,，；|]+/g)
-    .map(s => s.trim())
+  const s = String(v || '');
+  const noCR = s.split(String.fromCharCode(13)).join('');
+  const withComma = noCR
+    .split(String.fromCharCode(10)).join(',')
+    .split('，').join(',')
+    .split('；').join(',')
+    .split(';').join(',')
+    .split('|').join(',');
+  return withComma
+    .split(',')
+    .map(x => x.trim())
     .filter(Boolean);
 },
 ensureTargetRows(min = 1){
@@ -5715,6 +6563,7 @@ openEditor(name){
   $('#inRenewDays').value = '';
   $('#inPass').value = '';
   $('#inDirectExternal').checked = false;
+  $('#inRealIpMode').value = 'smart';
   $('#inRemindBeforeDays').value = '';
   $('#inKeepaliveAt').value = '';
   $('#inKeepaliveMaxPerDay').value = '1';
@@ -5729,7 +6578,10 @@ openEditor(name){
       $('#inNote').value = n.note || '';
       this.setTargetInputsFromText(n.target || '');
       $('#inSec').value = n.secret || '';
+      $('#inUser').value = n.embyUser || '';
+      $('#inPass').value = n.embyPass || '';
       $('#inDirectExternal').checked = !!n.directExternal;
+      $('#inRealIpMode').value = n.realClientIpMode || 'smart';
       $('#inRenewDays').value = Number.isFinite(Number(n.renewDays)) ? String(Number(n.renewDays)) : '';
       $('#inRemindBeforeDays').value = Number.isFinite(Number(n.remindBeforeDays)) ? String(Number(n.remindBeforeDays)) : '';
       $('#inKeepaliveAt').value = n.keepaliveAt || '';
@@ -5760,6 +6612,7 @@ async save(){
   const embyUser = ($('#inUser').value || '').trim();
   const embyPass = ($('#inPass').value || '').trim();
   const directExternal = !!$('#inDirectExternal').checked;
+  const realClientIpMode = String($('#inRealIpMode').value || 'smart').trim().toLowerCase();
   const renewDaysRaw = ($('#inRenewDays').value || '').trim();
   const renewDays = renewDaysRaw === '' ? 0 : Number(renewDaysRaw);
   if (!Number.isFinite(renewDays) || renewDays < 0 || renewDays > 3650) {
@@ -5773,17 +6626,17 @@ async save(){
   const keepaliveAt = String($('#inKeepaliveAt').value || '').trim();
   const keepaliveMaxPerDayRaw = ($('#inKeepaliveMaxPerDay').value || '').trim();
   const keepaliveMaxPerDay = keepaliveMaxPerDayRaw === '' ? 1 : Number(keepaliveMaxPerDayRaw);
-  if (!Number.isFinite(keepaliveMaxPerDay) || keepaliveMaxPerDay < 1 || keepaliveMaxPerDay > 1440) {
-    return this.toast('保号每日提醒次数不合法（1~1440）', 'warn');
-  }
+  if (!Number.isFinite(keepaliveMaxPerDay) || keepaliveMaxPerDay < 1 || keepaliveMaxPerDay > 24) {
+  return this.toast('保号每日提醒次数不合法（1~24）', 'warn');
+}
   if(!name || !target) return this.toast('请求路径和目标地址必填','warn');
   const lower = name.toLowerCase();
   const existed = this.nodes.some(x => String(x.name || '').toLowerCase() === lower);
   if (!this.editingOldName && existed) {
-    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
+    return this.toast('请求路径重复:该节点已存在，请换一个路径', 'warn');
   }
   if (this.editingOldName && this.editingOldName.toLowerCase() !== lower && existed) {
-    return this.toast('请求路径重复：该节点已存在，请换一个路径', 'warn');
+    return this.toast('请求路径重复:该节点已存在，请换一个路径', 'warn');
   }
   const editingNode = this.editingOldName
     ? this.nodes.find(x => String(x.name || '').toLowerCase() === String(this.editingOldName).toLowerCase())
@@ -5797,6 +6650,7 @@ async save(){
     secret, tag, note, rank, fav,
     embyUser, embyPass,
     directExternal,
+    realClientIpMode,
     renewDays: Math.floor(renewDays),
     remindBeforeDays: Math.floor(remindBeforeDays),
     keepaliveAt,
@@ -5805,7 +6659,7 @@ async save(){
   });
   if(!r.success) return this.toast(r.error || '保存失败','error');
   if (r.failed > 0 && Array.isArray(r.errors) && r.errors[0]) {
-    return this.toast('保存失败：' + r.errors[0].error, 'error');
+    return this.toast('保存失败:' + r.errors[0].error, 'error');
   }
   API.clearListCache();
   this.closeAllModals();
@@ -5869,7 +6723,7 @@ async testKeepaliveNotify(){
         const nodes = JSON.parse(e.target.result);
         const r = await API.req({ action:'import', nodes });
         if(r.success){
-          if (r.failed > 0) this.toast('导入完成：成功 '+r.saved+'，失败 '+r.failed,'warn');
+          if (r.failed > 0) this.toast('导入完成:成功 '+r.saved+'，失败 '+r.failed,'warn');
           else this.toast('导入成功','success');
           await this.refresh();
         } else {
@@ -5911,27 +6765,37 @@ if (document.body.classList.contains('modal-open')) return;
       this.toast('复制失败','error');
     }
   },
-  toast(text, type){
-    const wrap = $('#toastWrap');
-    const el = document.createElement('div');
-    el.className = 'toast ' + (type || 'success');
-    el.textContent = text;
-    wrap.appendChild(el);
-    setTimeout(()=>el.remove(),2200);
-  }
+toast(text, type){
+  const wrap = $('#toastWrap');
+  if (!wrap) return;
+  while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'success');
+  el.textContent = String(text || '');
+  wrap.appendChild(el);
+  setTimeout(() => {
+    if (el && el.parentNode) el.remove();
+  }, 3000);
+},
 };
 window.Gate = Gate;
 window.App = App;
-Gate.boot();
+window.addEventListener('resize', () => App.updateToastAnchor && App.updateToastAnchor());
+window.addEventListener('orientationchange', () => App.updateToastAnchor && App.updateToastAnchor());
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => Gate.boot());
+} else {
+  Gate.boot();
+}
 </script>
 <div class="project-links">
-  <span class="label">项目地址：</span>
+  <span class="label">项目地址:</span>
   <a href="https://github.com/chenhr454/emby---worker" target="_blank" rel="noopener noreferrer">GitHub</a>
-  <span class="label">频道：</span>
-  <a href="https://t.me/+tdZEbQpmAktkZmY1" target="_blank" rel="noopener noreferrer">Telegram</a>
+  <span class="label">频道:</span>
+  <a href="https://t.me/embyfdgljl" target="_blank" rel="noopener noreferrer">Telegram</a>
 </div>
 <div class="disclaimer">
-  <strong>免责声明：</strong>
+  <strong>免责声明:</strong>
   本项目仅供学习与技术测试使用，请遵守当地法律法规。使用者对配置、转发内容与访问行为承担全部责任，开发者不对任何直接或间接损失负责。
 </div>
 </body>
@@ -5939,9 +6803,16 @@ Gate.boot();
     return new Response(html, {
       headers: {
         "Content-Type": "text/html;charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        Pragma: "no-cache",
+        Expires: "0",
         "Content-Security-Policy":
-          "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';",
-        "X-Frame-Options": "DENY",
+          "default-src 'self'; " +
+          "img-src 'self' data: https:; " +
+          "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; " +
+          "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com; " +
+          "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com https://cdnjs.cloudflare.com; " +
+          "connect-src 'self' https:;",
       },
     });
   },
@@ -6006,7 +6877,7 @@ export default {
               secret,
               env,
               "admin",
-              ctx
+              ctx,
             );
           }
           return new Response("Node Not Found", { status: 404 });
@@ -6028,6 +6899,7 @@ export default {
     cleanupTTLMaps();
     ctx.waitUntil(
       (async () => {
+        await Database.ensureProxyKvTable(env);
         const cfg = await Database.getTgConfig(env);
         const kv = Database.getKV(env);
         if (cfg && cfg.enabled && cfg.token && cfg.chat) {
@@ -6035,14 +6907,14 @@ export default {
           const shNow = new Date(
             new Date(now).toLocaleString("en-US", {
               timeZone: "Asia/Shanghai",
-            })
+            }),
           );
           const curMin = shNow.getHours() * 60 + shNow.getMinutes();
           const reportTimeRaw = String(cfg.reportTime || "00:00")
             .trim()
-            .replace(/[：﹕∶]/g, ":");
-          const m = /^(\d{1,2}):(\d{1,2})(?::\d{1,2}(?:\.\d+)?)?$/.exec(
-            reportTimeRaw
+            .replace(/[:﹕∶]/g, ":");
+          const m = /^(\d{1,2}):(\d{1,2})(:(\d{1,2})(\.\d+)?)?$/.exec(
+            reportTimeRaw,
           );
           let reportMin = 0;
           if (m) {
@@ -6052,33 +6924,54 @@ export default {
           }
           if (curMin >= reportMin) {
             const day = Database.getDayKey();
-            const everyMin = Math.max(0, Number(cfg.reportEveryMin || 0));
-            const maxPerDay = Math.max(1, Number(cfg.reportMaxPerDay || 1));
+            const everyMin = Math.max(60, Number(cfg.reportEveryMin || 60)); // 最低一小时
+            const maxPerDay = Math.max(
+              1,
+              Math.min(24, Number(cfg.reportMaxPerDay || 1)),
+            );
+            const changeOnly = cfg.reportChangeOnly !== false; // 默认开启
             const cntKey = "report:cnt:" + day;
             const lastKey = "report:last:" + day;
+            const digestKey = "report:digest:" + day;
             const sentCnt = kv ? Number((await kv.get(cntKey)) || 0) : 0;
             const lastTs = kv ? Number((await kv.get(lastKey)) || 0) : 0;
             let shouldSend = false;
             if (sentCnt < maxPerDay) {
-              if (everyMin <= 0) {
-                shouldSend = sentCnt === 0;
-              } else {
-                shouldSend = !lastTs || now - lastTs >= everyMin * 60 * 1000;
-              }
+              shouldSend = !lastTs || now - lastTs >= everyMin * 60 * 1000;
             }
             if (shouldSend) {
               const text = await Database.buildDailyReport(env);
-              await sendTG(cfg.token, cfg.chat, text);
-              if (kv) {
-                await kv.put(cntKey, String(sentCnt + 1));
-                await kv.put(lastKey, String(now));
+              if (changeOnly && kv) {
+                const digestBase = String(text || "")
+                  .replace(/\s+/g, " ")
+                  .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?/g, "")
+                  .trim();
+                let h = 2166136261 >>> 0;
+                for (let i = 0; i < digestBase.length; i++) {
+                  h ^= digestBase.charCodeAt(i);
+                  h = Math.imul(h, 16777619);
+                }
+                const digest = String(h >>> 0);
+                const oldDigest = String((await kv.get(digestKey)) || "");
+                if (!oldDigest || oldDigest !== digest) {
+                  await sendTG(cfg.token, cfg.chat, text);
+                  await kv.put(digestKey, digest);
+                  await kv.put(cntKey, String(sentCnt + 1));
+                  await kv.put(lastKey, String(now));
+                }
+              } else {
+                await sendTG(cfg.token, cfg.chat, text);
+                if (kv) {
+                  await kv.put(cntKey, String(sentCnt + 1));
+                  await kv.put(lastKey, String(now));
+                }
               }
             }
           }
           await Database.checkKeepaliveAndNotify(env);
         }
         await Database.cleanupOld(env);
-      })()
+      })(),
     );
   },
 };
